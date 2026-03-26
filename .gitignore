@@ -1,0 +1,18 @@
+node_modules/
+package-lock.json
+
+__pycache__/
+*.pyc
+
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Bridge runtime data (created by init.sh, lives at ~/.cc2cc)
+/tmp/

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cc2cc.inbox-watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <!--
+          Customize:
+          - Replace YOUR_USERNAME with your macOS username
+          - Replace "alpha" with your agent name
+          - Uncomment Option B to auto-launch Claude Code sessions
+        -->
+        <string>
+COUNT=$(find ~/.cc2cc/*-to-alpha/inbox -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+[ "$COUNT" -eq 0 ] &amp;&amp; exit 0
+
+# Option A: Just notify (default)
+osascript -e "display notification \"$COUNT message(s) waiting\" with title \"CC2CC\" sound name \"Submarine\""
+
+# Option B: Auto-launch Claude Code session (uncomment below)
+# claude --model opus "CC2CC wake-up: $COUNT messages in inbox. Read and process them."
+        </string>
+    </array>
+    <key>WatchPaths</key>
+    <array>
+        <!-- Watch all inboxes for this agent — edit path below -->
+        <string>/Users/YOUR_USERNAME/.cc2cc/beta-to-alpha/inbox</string>
+    </array>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

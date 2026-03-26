@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.9', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run smoke tests
+        run: ./tests/smoke.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: ShellCheck bash scripts
+        run: |
+          shellcheck scripts/*.sh hooks/*.sh tests/*.sh
+
+      - name: Python syntax check
+        run: |
+          python3 -m py_compile scripts/send.py
+          python3 -m py_compile scripts/reply.py
+          python3 -m py_compile scripts/task.py
+          python3 -m py_compile scripts/validate.py
+          python3 -m py_compile scripts/cleanup.py
