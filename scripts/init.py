@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from cc2cc.signing import generate_secret
+
 
 def main():
     if len(sys.argv) < 3:
@@ -26,30 +28,16 @@ def main():
         (bridge / f"{a}-to-{b}" / "inbox").mkdir(parents=True, exist_ok=True)
         (bridge / f"{a}-to-{b}" / "done").mkdir(parents=True, exist_ok=True)
 
-    # Status & agent cards
+    # Status
     (bridge / "status").mkdir(parents=True, exist_ok=True)
-    (bridge / "agent-cards").mkdir(parents=True, exist_ok=True)
 
-    for agent in [agent_a, agent_b]:
-        peer = agent_b if agent == agent_a else agent_a
-        card = {
-            "name": agent,
-            "version": "1.0.0",
-            "protocol": "cc2cc/1.1",
-            "identity": {
-                "agent_id": agent,
-                "runtime": "claude-cli",
-                "modes": {
-                    "session": "Interactive session with user",
-                    "heartbeat": "Autonomous periodic wake",
-                },
-            },
-            "capabilities": {"taskDelegation": True, "persistent": False},
-            "endpoint": f"file://{bridge}/{peer}-to-{agent}/inbox/",
-        }
-        (bridge / "agent-cards" / f"{agent}.json").write_text(
-            json.dumps(card, indent=2), encoding="utf-8"
-        )
+    # HMAC secret
+    secret_file = bridge / "secret.key"
+    if not secret_file.exists():
+        secret_file.write_text(generate_secret(), encoding="utf-8")
+        print(f"Generated HMAC secret: {secret_file}")
+    else:
+        print(f"HMAC secret exists: {secret_file}")
 
     # MCP channel servers
     for agent in [agent_a, agent_b]:

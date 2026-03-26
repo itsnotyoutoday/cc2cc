@@ -7,6 +7,15 @@ import shutil
 import sys
 from pathlib import Path
 
+from cc2cc.signing import verify_message
+
+
+def _load_secret(bridge: Path):
+    secret_file = bridge / "secret.key"
+    if secret_file.exists():
+        return secret_file.read_text(encoding="utf-8").strip()
+    return None
+
 
 def main():
     if len(sys.argv) < 2:
@@ -16,6 +25,7 @@ def main():
     agent = sys.argv[1]
     peek = "--peek" in sys.argv
     bridge = Path(os.environ.get("CC2CC_BRIDGE_DIR", os.path.expanduser("~/.cc2cc")))
+    secret = _load_secret(bridge)
 
     for inbox in bridge.glob(f"*-to-{agent}/inbox"):
         for fp in sorted(inbox.glob("*.json")):
@@ -24,7 +34,14 @@ def main():
             except (json.JSONDecodeError, OSError):
                 continue
 
-            print(f"From: {msg['from']}  Type: {msg['type']}  Priority: {msg.get('priority', 'normal')}")
+            sig_status = ""
+            if secret:
+                if verify_message(msg, secret):
+                    sig_status = " [verified]"
+                else:
+                    sig_status = " [SIGNATURE INVALID]"
+
+            print(f"From: {msg['from']}  Type: {msg['type']}  Priority: {msg.get('priority', 'normal')}{sig_status}")
             print(f"Time: {msg['timestamp']}")
             print(f"Content: {msg['content']['text'][:200]}")
             if msg.get("task"):

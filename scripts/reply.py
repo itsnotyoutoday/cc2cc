@@ -7,14 +7,25 @@ import os
 import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+
+from cc2cc.core import atomic_write, bridge_path
+from cc2cc.signing import sign_message
+
+
+def _load_secret(bridge: Path):
+    secret_file = bridge / "secret.key"
+    if secret_file.exists():
+        return secret_file.read_text(encoding="utf-8").strip()
+    return None
 
 
 def find_original(bridge, msg_id):
     """Search all dirs for the original message."""
     for pattern in [f"*/inbox/{msg_id}.json", f"*/done/{msg_id}.json"]:
-        matches = glob.glob(os.path.join(bridge, pattern))
+        matches = glob.glob(os.path.join(str(bridge), pattern))
         if matches:
-            with open(matches[0]) as f:
+            with open(matches[0], encoding="utf-8") as f:
                 return json.load(f)
     return None
 
@@ -32,7 +43,7 @@ def main():
     sender = sys.argv[3] if len(sys.argv) > 3 else None
     mode = sys.argv[4] if len(sys.argv) > 4 else "session"
 
-    bridge = os.environ.get("CC2CC_BRIDGE_DIR", os.path.expanduser("~/.cc2cc"))
+    bridge = bridge_path()
     original = find_original(bridge, original_id)
 
     if original:
@@ -50,7 +61,6 @@ def main():
             )
             sys.exit(1)
 
-    # Build task object if replying to a task
     task = None
     if original and original.get("type") == "task" and original.get("task"):
         task = dict(original["task"])
@@ -72,11 +82,13 @@ def main():
         "ttl": 3600,
     }
 
-    inbox = os.path.join(bridge, f"{sender}-to-{recipient}", "inbox")
-    os.makedirs(inbox, exist_ok=True)
-    path = os.path.join(inbox, f"{msg_id}.json")
-    with open(path, "w") as f:
-        json.dump(msg, f, indent=2, ensure_ascii=False)
+    secret = _load_secret(bridge)
+    if secret:
+        msg = sign_message(msg, secret)
+
+    inbox = bridge / f"{sender}-to-{recipient}" / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    atomic_write(inbox / f"{msg_id}.json", msg)
 
     print(
         f"Replied {msg_id} → {recipient}" + (" [task completed]" if task else "")

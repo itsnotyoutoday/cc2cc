@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Send a message through the CC2CC bridge."""
 
-import json
-import os
 import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+
+from cc2cc.core import atomic_write, bridge_path
+from cc2cc.signing import sign_message
+
+
+def _load_secret(bridge: Path):
+    secret_file = bridge / "secret.key"
+    if secret_file.exists():
+        return secret_file.read_text(encoding="utf-8").strip()
+    return None
 
 
 def main():
@@ -25,9 +34,9 @@ def main():
     priority = sys.argv[5] if len(sys.argv) > 5 else "normal"
     mode = sys.argv[6] if len(sys.argv) > 6 else "session"
 
-    bridge = os.environ.get("CC2CC_BRIDGE_DIR", os.path.expanduser("~/.cc2cc"))
-    inbox = os.path.join(bridge, f"{sender}-to-{recipient}", "inbox")
-    os.makedirs(inbox, exist_ok=True)
+    bridge = bridge_path()
+    inbox = bridge / f"{sender}-to-{recipient}" / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
 
     msg_id = f"msg-{uuid.uuid4()}"
     msg = {
@@ -44,10 +53,11 @@ def main():
         "ttl": 3600,
     }
 
-    path = os.path.join(inbox, f"{msg_id}.json")
-    with open(path, "w") as f:
-        json.dump(msg, f, indent=2, ensure_ascii=False)
+    secret = _load_secret(bridge)
+    if secret:
+        msg = sign_message(msg, secret)
 
+    atomic_write(inbox / f"{msg_id}.json", msg)
     print(f"Sent {msg_id} → {recipient}")
 
 
