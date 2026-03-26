@@ -35,13 +35,15 @@ For Agent Alpha with all features enabled:
     "SessionStart": [
       {
         "type": "command",
-        "command": "CC2CC_SELF=alpha CC2CC_BRIDGE_DIR=~/.cc2cc ~/.cc2cc/hooks/session-start.sh"
+        "command": "python /Users/you/.cc2cc/hooks/session_start.py",
+        "env": { "CC2CC_SELF": "alpha", "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc" }
       }
     ],
     "SessionEnd": [
       {
         "type": "command",
-        "command": "CC2CC_SELF=alpha CC2CC_BRIDGE_DIR=~/.cc2cc ~/.cc2cc/hooks/session-end.sh"
+        "command": "python /Users/you/.cc2cc/hooks/session_end.py",
+        "env": { "CC2CC_SELF": "alpha", "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc" }
       }
     ]
   }
@@ -51,43 +53,36 @@ For Agent Alpha with all features enabled:
 For Agent Beta — same structure, but:
 - Channel args: `beta-channel/server.mjs`
 - `SELF`: `"beta"`, `PEER`: `"alpha"`
-- Hook commands: `CC2CC_SELF=beta`
+- Hook env: `"CC2CC_SELF": "beta"`
 
 ---
 
-## Heartbeat / Auto-Wake (macOS only)
+## Auto-Wake Service (Optional)
 
-Use a LaunchAgent to watch the inbox and wake Claude Code when messages arrive.
+Install a background service that watches the inbox and notifies when messages arrive.
 
-Copy `launchd/com.cc2cc.inbox-watcher.plist` and edit the `WatchPaths` to match your agent name:
-
+**macOS (LaunchAgent):**
 ```bash
-cp launchd/com.cc2cc.inbox-watcher.plist ~/Library/LaunchAgents/
-# Edit the plist: replace YOUR_USERNAME and agent name
+cp services/macos/com.cc2cc.inbox-watcher.plist ~/Library/LaunchAgents/
+# Edit: replace YOUR_USERNAME and YOUR_AGENT
 launchctl load ~/Library/LaunchAgents/com.cc2cc.inbox-watcher.plist
 ```
 
-The LaunchAgent fires whenever a file is created in the watched inbox directory. It can either notify (default) or auto-launch a Claude Code session.
-
----
-
-## Linux Alternatives
-
-Linux doesn't support LaunchAgent or `osascript`. Alternatives:
-
-**Inbox watching** — replace `fswatch` with `inotifywait`:
+**Linux (systemd):**
 ```bash
-inotifywait -m -e create ~/.cc2cc/*-to-alpha/inbox/ | while read dir event file; do
-  echo "New message: $file"
-done
+cp services/linux/cc2cc-watcher.service ~/.config/systemd/user/
+# Edit: replace YOUR_AGENT
+systemctl --user enable cc2cc-watcher
+systemctl --user start cc2cc-watcher
 ```
 
-**Periodic checking** — use cron:
-```cron
-*/5 * * * * CC2CC_SELF=alpha CC2CC_BRIDGE_DIR=~/.cc2cc ~/.cc2cc/scripts/status.sh >> /tmp/cc2cc-cron.log 2>&1
+**Windows (Task Scheduler):**
+```powershell
+# Edit services/windows/cc2cc-watcher.xml: replace YOUR_USERNAME
+schtasks /create /tn "CC2CC Watcher" /xml services\windows\cc2cc-watcher.xml
 ```
 
-**Notifications** — replace `osascript` with `notify-send`:
+**Or run manually:**
 ```bash
-notify-send "CC2CC" "$COUNT message(s) in inbox"
+CC2CC_SELF=alpha CC2CC_BRIDGE_DIR=~/.cc2cc python hooks/inbox_watcher.py
 ```

@@ -42,8 +42,7 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (CLI)
 - Node.js ≥ 18 (for the MCP channel server)
 - Python 3.8+ (for scripts)
-- Bash 4+ (macOS ships with 3.2 — use `brew install bash` or the scripts work anyway)
-- *(Optional)* `fswatch` for real-time delivery (`brew install fswatch` / `apt install fswatch`)
+- *(Optional)* `watchdog` for real-time inbox watching (`pip install watchdog`)
 
 ## Quick Start
 
@@ -54,7 +53,7 @@ git clone https://github.com/non4me/cc2cc.git
 cd cc2cc
 
 # Create the bridge for two agents named "alpha" and "beta"
-./scripts/init.sh alpha beta ~/.cc2cc
+python scripts/init.py alpha beta ~/.cc2cc
 ```
 
 ### 2. Configure Claude Code (both instances)
@@ -79,13 +78,15 @@ cd cc2cc
     "SessionStart": [
       {
         "type": "command",
-        "command": "CC2CC_SELF=alpha CC2CC_BRIDGE_DIR=~/.cc2cc ~/.cc2cc/hooks/session-start.sh"
+        "command": "python ~/.cc2cc/hooks/session_start.py",
+        "env": { "CC2CC_SELF": "alpha", "CC2CC_BRIDGE_DIR": "~/.cc2cc" }
       }
     ],
     "SessionEnd": [
       {
         "type": "command",
-        "command": "CC2CC_SELF=alpha CC2CC_BRIDGE_DIR=~/.cc2cc ~/.cc2cc/hooks/session-end.sh"
+        "command": "python ~/.cc2cc/hooks/session_end.py",
+        "env": { "CC2CC_SELF": "alpha", "CC2CC_BRIDGE_DIR": "~/.cc2cc" }
       }
     ]
   }
@@ -100,7 +101,7 @@ cd cc2cc
 
 ```bash
 # From outside Claude Code
-./scripts/send.py alpha beta message "Deploy is ready, please review"
+python scripts/send.py alpha beta message "Deploy is ready, please review"
 
 # Or from inside a Claude Code session — the reply tool appears automatically
 reply(msg_id="msg-abc123", text="Got it, deploying now")
@@ -109,13 +110,13 @@ reply(msg_id="msg-abc123", text="Got it, deploying now")
 ### 4. Delegate a task
 
 ```bash
-./scripts/task.py alpha beta "Run tests" "Execute integration test suite, report failures"
+python scripts/task.py alpha beta "Run tests" "Execute integration test suite, report failures"
 ```
 
 ### 5. Check bridge status
 
 ```bash
-./scripts/status.sh
+python scripts/status.py
 # ● alpha: active (2m ago)
 # ● beta: active (45s ago)
 # alpha-to-beta: 0 pending, 12 processed
@@ -127,7 +128,7 @@ reply(msg_id="msg-abc123", text="Got it, deploying now")
 | Feature | Google A2A | CC2CC |
 |---------|-----------|-------|
 | Transport | HTTP | Filesystem |
-| Setup | Service discovery, auth, endpoints | `init.sh alpha beta` |
+| Setup | Service discovery, auth, endpoints | `init.py alpha beta` |
 | Dependencies | HTTP server per agent | Node.js (MCP server only) |
 | Offline delivery | Requires message broker | Built-in (files wait in inbox) |
 | Same-machine agents | Overkill | Purpose-built |
@@ -143,20 +144,24 @@ cc2cc/
 │   ├── server.mjs           # MCP channel server (polls inbox, pushes to session)
 │   └── package.json
 ├── scripts/
-│   ├── init.sh              # Bootstrap the bridge
+│   ├── init.py              # Bootstrap the bridge
 │   ├── send.py              # Send a message
-│   ├── receive.sh           # Read pending messages
+│   ├── receive.py           # Read pending messages
 │   ├── reply.py             # Reply to a message (completes tasks automatically)
 │   ├── task.py              # Delegate a task
-│   ├── status.sh            # Show bridge status
+│   ├── status.py            # Show bridge status
 │   ├── validate.py          # Validate message schema
 │   └── cleanup.py           # TTL-based cleanup
 ├── hooks/
-│   ├── session-start.sh     # SessionStart hook (heartbeat + inbox check)
-│   ├── session-end.sh       # SessionEnd hook (mark offline)
-│   └── inbox-watcher.sh     # Optional: fswatch-based real-time delivery (macOS)
-├── launchd/
-│   └── com.cc2cc.inbox-watcher.plist  # Optional: auto-wake on message (macOS)
+│   ├── session_start.py     # SessionStart hook (heartbeat + inbox check)
+│   ├── session_end.py       # SessionEnd hook (mark offline)
+│   └── inbox_watcher.py     # Optional: watchdog-based real-time delivery
+├── services/
+│   ├── macos/               # LaunchAgent template (macOS)
+│   ├── linux/               # systemd service template (Linux)
+│   └── windows/             # Task Scheduler template (Windows)
+├── tests/
+│   └── test_smoke.py        # Smoke tests
 ├── docs/
 │   ├── SPECIFICATION.md     # Protocol spec, schemas, message lifecycle
 │   └── CONFIGURATION.md     # Environment variables, full settings.json examples
@@ -168,9 +173,9 @@ cc2cc/
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| macOS | Full support | fswatch, LaunchAgent, osascript notifications |
-| Linux | Core features | No LaunchAgent/osascript — use cron + inotifywait instead |
-| Windows | Not supported | Bash scripts and MCP stdio transport require WSL |
+| macOS | Full support | watchdog or polling, LaunchAgent template |
+| Linux | Full support | watchdog or polling, systemd template |
+| Windows | Full support | watchdog or polling, Task Scheduler template |
 
 ## Limitations
 
@@ -178,7 +183,7 @@ cc2cc/
 - **No authentication** — any process that can write to the inbox can inject messages. See [Security](#security) below.
 - **No encryption** — messages are plaintext JSON
 - **No guaranteed ordering** — use `replyTo` for threading
-- **Polling latency** — up to 3s delivery delay (use fswatch for near-instant)
+- **Polling latency** — up to 3s delivery delay (use watchdog for near-instant)
 - **Experimental MCP feature** — `channelsEnabled` may change or be removed
 
 ## Security
