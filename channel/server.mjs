@@ -6,7 +6,7 @@
  * Polls the inbox for messages from a peer agent and pushes them
  * into the Claude Code session as channel notifications.
  *
- * Exposes a single "reply" tool so the agent can respond.
+ * Exposes a "reply" tool so the agent can respond.
  *
  * Environment:
  *   BRIDGE_DIR — path to bridge root (default: ~/.cc2cc)
@@ -17,7 +17,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { readdir, readFile, rename, mkdir, writeFile } from "fs/promises";
-import { join } from "path";
+import { join, dirname } from "path";
 import { randomUUID } from "crypto";
 
 const BRIDGE_DIR = process.env.BRIDGE_DIR || `${process.env.HOME || process.env.USERPROFILE}/.cc2cc`;
@@ -29,8 +29,30 @@ const INBOX = join(BRIDGE_DIR, `${PEER}-to-${SELF}`, "inbox");
 const DONE = join(BRIDGE_DIR, `${PEER}-to-${SELF}`, "done");
 const OUTBOX = join(BRIDGE_DIR, `${SELF}-to-${PEER}`, "inbox");
 
+// Logging helper — writes to stderr (stdout is MCP transport)
+function log(level, msg, data) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    server: SELF,
+    msg,
+    ...data,
+  };
+  process.stderr.write(JSON.stringify(entry) + "\n");
+}
+
+// --- Server setup with PUBLIC instructions API ---
 const server = new Server(
-  { name: "peer_channel", version: "1.1.0" },
+  {
+    name: "peer_channel",
+    version: "2.0.0",
+    instructions: [
+      `Messages from your peer agent "${PEER}" arrive as <channel> tags.`,
+      `Reply using the "reply" tool, passing the msg_id from the tag.`,
+      `If the message is a task (type=task), execute it and send the result.`,
+      `Always show A2A dialog to the user.`,
+    ].join(" "),
+  },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -39,18 +61,14 @@ const server = new Server(
   }
 );
 
-// Instructions injected into Claude Code's context
-// NOTE: _handleInitialize is a private SDK method — may break on SDK updates
-server.setRequestHandler({ method: "initialize" }, async (request) => {
-  const result = await server._handleInitialize(request);
-  result.instructions = [
-    `Messages from your peer agent "${PEER}" arrive as <channel> tags.`,
-    `Reply using the "reply" tool, passing the msg_id from the tag.`,
-    `If the message is a task (type=task), execute it and send the result.`,
-    `Always show A2A dialog to the user.`,
-  ].join(" ");
-  return result;
-});
+// Atomic write helper — write to temp, then rename
+async function atomicWrite(targetPath, data) {
+  const dir = dirname(targetPath);
+  await mkdir(dir, { recursive: true });
+  const tmpPath = join(dir, `.tmp-${randomUUID()}.json`);
+  await writeFile(tmpPath, JSON.stringify(data, null, 2));
+  await rename(tmpPath, targetPath);
+}
 
 // Reply tool — the only tool exposed
 server.setRequestHandler({ method: "tools/list" }, async () => ({
@@ -111,14 +129,22 @@ server.setRequestHandler({ method: "tools/call" }, async ({ params }) => {
     ttl: 3600,
   };
 
-  await mkdir(OUTBOX, { recursive: true });
-  await writeFile(join(OUTBOX, `${id}.json`), JSON.stringify(msg, null, 2));
-  return {
-    content: [{ type: "text", text: `Sent ${id} to ${PEER}` }],
-  };
+  try {
+    await atomicWrite(join(OUTBOX, `${id}.json`), msg);
+    log("info", "reply sent", { id, to: PEER });
+    return {
+      content: [{ type: "text", text: `Sent ${id} to ${PEER}` }],
+    };
+  } catch (err) {
+    log("error", "reply failed", { id, error: err.message });
+    return {
+      content: [{ type: "text", text: `Failed to send: ${err.message}` }],
+      isError: true,
+    };
+  }
 });
 
-// --- Polling loop: watch inbox, push to channel ---
+// --- Polling loop: watch inbox, push to channel, write receipts ---
 
 const seenFiles = new Set();
 
@@ -129,7 +155,8 @@ async function drainInbox() {
   let files;
   try {
     files = (await readdir(INBOX)).filter((f) => f.endsWith(".json"));
-  } catch {
+  } catch (err) {
+    log("warn", "inbox read failed", { error: err.message });
     return;
   }
 
@@ -158,10 +185,22 @@ async function drainInbox() {
         },
       });
 
+      log("info", "message delivered", { id: msg.id, from: msg.from, type: msg.type });
+
+      // Write delivery receipt
+      const receiptDir = join(BRIDGE_DIR, `${msg.from}-to-${SELF}`, "receipts");
+      await mkdir(receiptDir, { recursive: true });
+      const receipt = {
+        msg_id: msg.id,
+        delivered_at: new Date().toISOString(),
+        delivered_to: SELF,
+      };
+      await atomicWrite(join(receiptDir, `${msg.id}.receipt.json`), receipt);
+
       // Move to done/
       await rename(join(INBOX, file), join(DONE, file));
     } catch (err) {
-      // Skip malformed messages silently
+      log("error", "message processing failed", { file, error: err.message });
     }
   }
 
@@ -172,6 +211,7 @@ async function drainInbox() {
 // Start polling
 setInterval(drainInbox, POLL_MS);
 drainInbox();
+log("info", "server started", { self: SELF, peer: PEER, poll_ms: POLL_MS });
 
 // Connect via stdio
 const transport = new StdioServerTransport();
