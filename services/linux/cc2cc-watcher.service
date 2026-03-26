@@ -1,0 +1,14 @@
+[Unit]
+Description=CC2CC Inbox Watcher
+After=network.target
+
+[Service]
+Type=simple
+Environment=CC2CC_SELF=YOUR_AGENT
+Environment=CC2CC_BRIDGE_DIR=%h/.cc2cc
+ExecStart=/usr/bin/python3 %h/.cc2cc/hooks/inbox_watcher.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -20,7 +20,7 @@ import { readdir, readFile, rename, mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
 
-const BRIDGE_DIR = process.env.BRIDGE_DIR || `${process.env.HOME}/.cc2cc`;
+const BRIDGE_DIR = process.env.BRIDGE_DIR || `${process.env.HOME || process.env.USERPROFILE}/.cc2cc`;
 const SELF = process.env.SELF || "alpha";
 const PEER = process.env.PEER || "beta";
 const POLL_MS = 3000;
