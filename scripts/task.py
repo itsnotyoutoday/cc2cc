@@ -50,7 +50,7 @@ def main():
     }
 
     path = os.path.join(inbox, f"{msg_id}.json")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(msg, f, indent=2, ensure_ascii=False)
 
     print(f"Delegated {task_id} → {recipient}: {title}")

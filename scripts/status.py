@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Show CC2CC bridge status."""
 
+import io
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Ensure UTF-8 output on Windows (for Unicode indicators)
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
 def format_age(seconds: float) -> str:
