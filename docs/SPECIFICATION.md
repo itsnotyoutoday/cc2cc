@@ -4,18 +4,18 @@
 
 ```
 ~/.cc2cc/                          # Bridge root (configurable)
+├── secret.key                     # HMAC-SHA256 shared secret
 ├── alpha-to-beta/
 │   ├── inbox/                     # Pending messages: alpha → beta
-│   └── done/                      # Processed messages (archive)
+│   ├── done/                      # Processed messages (archive)
+│   └── receipts/                  # Delivery receipts
 ├── beta-to-alpha/
 │   ├── inbox/                     # Pending messages: beta → alpha
-│   └── done/                      # Processed messages (archive)
+│   ├── done/                      # Processed messages (archive)
+│   └── receipts/                  # Delivery receipts
 ├── status/
 │   ├── alpha-heartbeat.json       # Agent Alpha status
 │   └── beta-heartbeat.json        # Agent Beta status
-├── agent-cards/
-│   ├── alpha.json                 # Agent Alpha capabilities
-│   └── beta.json                  # Agent Beta capabilities
 ├── alpha-channel/
 │   ├── server.mjs                 # MCP server for Alpha
 │   └── package.json
@@ -23,16 +23,16 @@
 │   ├── server.mjs                 # MCP server for Beta
 │   └── package.json
 ├── hooks/
-│   ├── session-start.sh
-│   ├── session-end.sh
-│   └── inbox-watcher.sh
+│   ├── session-start.py
+│   ├── session-end.py
+│   └── inbox-watcher.py
 └── scripts/
-    ├── init.sh
+    ├── init.py
     ├── send.py
-    ├── receive.sh
+    ├── receive.py
     ├── reply.py
     ├── task.py
-    ├── status.sh
+    ├── status.py
     ├── validate.py
     └── cleanup.py
 ```
@@ -88,6 +88,7 @@ Every message is a single JSON file named `msg-<uuid>.json`.
 | `task` | object | `null` | Task details (required when type is `task`) |
 | `replyTo` | string | `null` | Original message ID for threading |
 | `ttl` | integer | `3600` | Seconds until message expires |
+| `hmac` | string | — | HMAC-SHA256 signature (auto-generated when secret.key exists) |
 
 ---
 
@@ -133,40 +134,6 @@ Written to `status/{agent}-heartbeat.json` by session hooks:
 ```
 
 Heartbeats are overwritten (not appended) on each session start/end. An agent is considered stale if its heartbeat is older than 10 minutes.
-
----
-
-## Agent Card Schema
-
-Written to `agent-cards/{agent}.json` by `init.sh`:
-
-```jsonc
-{
-  "name": "Alpha Agent",
-  "version": "1.0.0",
-  "protocol": "cc2cc/1.1",
-  "identity": {
-    "agent_id": "alpha",
-    "model": "claude-opus-4-6",
-    "runtime": "claude-cli",
-    "modes": {
-      "session": "Interactive session with user",
-      "heartbeat": "Autonomous periodic wake (LaunchAgent)"
-    }
-  },
-  "capabilities": {
-    "streaming": false,
-    "pushNotifications": false,
-    "taskDelegation": true,
-    "persistent": false
-  },
-  "skills": ["devops", "code", "monitoring"],
-  "availability": "session-based + heartbeat every 5 min",
-  "endpoint": "file://~/.cc2cc/beta-to-alpha/inbox/"
-}
-```
-
-Agent cards are informational — they help agents understand each other's capabilities but are not enforced by the protocol.
 
 ---
 
@@ -242,11 +209,37 @@ Agent cards are informational — they help agents understand each other's capab
 The bridge scales to any number of agents. For 3 agents (alpha, beta, gamma):
 
 ```bash
-./scripts/init.sh alpha beta ~/.cc2cc
-./scripts/init.sh alpha gamma ~/.cc2cc
-./scripts/init.sh beta gamma ~/.cc2cc
+python scripts/init.py alpha beta ~/.cc2cc
+python scripts/init.py alpha gamma ~/.cc2cc
+python scripts/init.py beta gamma ~/.cc2cc
 ```
 
 Each agent gets one MCP server that watches **all** inboxes addressed to it. The server env needs the primary peer for the `reply` tool, but it reads from all `*-to-{SELF}/inbox/` directories.
 
 For N agents, you need N×(N-1)/2 init calls (one per pair).
+
+---
+
+## Receipt Schema
+
+Written to `{sender}-to-{recipient}/receipts/{msg-id}.receipt.json` by the MCP server upon delivery:
+
+```json
+{
+  "msg_id": "msg-550e8400-...",
+  "delivered_at": "2026-03-27T10:30:00.000Z",
+  "delivered_to": "beta"
+}
+```
+
+Receipts confirm that the MCP server successfully pushed the message to the Claude Code session.
+
+---
+
+## Message Signing (HMAC-SHA256)
+
+When `secret.key` exists in the bridge root, all messages include an `hmac` field.
+The signature covers all fields except `hmac` itself, serialized as sorted JSON.
+
+Signing is opt-in: bridges initialized without `init.py` can omit the secret.
+Recipients that find `secret.key` will verify; those without will skip verification.

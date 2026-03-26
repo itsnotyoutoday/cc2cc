@@ -43,6 +43,7 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 - Node.js ≥ 18 (for the MCP channel server)
 - Python 3.8+ (for scripts)
 - *(Optional)* `watchdog` for real-time inbox watching (`pip install watchdog`)
+- *(Optional)* `pip install -e .` for the unified `cc2cc` CLI
 
 ## Quick Start
 
@@ -51,8 +52,18 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 ```bash
 git clone https://github.com/non4me/cc2cc.git
 cd cc2cc
+```
 
-# Create the bridge for two agents named "alpha" and "beta"
+**Option A: pip install (recommended)**
+
+```bash
+pip install -e .
+cc2cc init alpha beta ~/.cc2cc
+```
+
+**Option B: direct scripts**
+
+```bash
 python scripts/init.py alpha beta ~/.cc2cc
 ```
 
@@ -99,11 +110,20 @@ python scripts/init.py alpha beta ~/.cc2cc
 
 ### 3. Send a message
 
-```bash
-# From outside Claude Code
-python scripts/send.py alpha beta message "Deploy is ready, please review"
+**Option A: pip install**
 
-# Or from inside a Claude Code session — the reply tool appears automatically
+```bash
+cc2cc send alpha beta message "Deploy is ready, please review"
+```
+
+**Option B: direct scripts**
+
+```bash
+python scripts/send.py alpha beta message "Deploy is ready, please review"
+```
+
+Or from inside a Claude Code session — the reply tool appears automatically:
+```
 reply(msg_id="msg-abc123", text="Got it, deploying now")
 ```
 
@@ -115,12 +135,20 @@ python scripts/task.py alpha beta "Run tests" "Execute integration test suite, r
 
 ### 5. Check bridge status
 
+**Option A: pip install**
+
 ```bash
-python scripts/status.py
+cc2cc status
 # ● alpha: active (2m ago)
 # ● beta: active (45s ago)
 # alpha-to-beta: 0 pending, 12 processed
 # beta-to-alpha: 1 pending, 8 processed
+```
+
+**Option B: direct scripts**
+
+```bash
+python scripts/status.py
 ```
 
 ## CC2CC vs Google A2A
@@ -140,6 +168,12 @@ CC2CC is not a replacement for A2A. It's for the common case where you have mult
 
 ```
 cc2cc/
+├── cc2cc/                      # Python package
+│   ├── __init__.py
+│   ├── core.py                 # Atomic writes, bridge path, size limits
+│   ├── signing.py              # HMAC-SHA256 message signing
+│   └── cli.py                  # Unified CLI entry point
+├── pyproject.toml              # pip installable package
 ├── channel/
 │   ├── server.mjs           # MCP channel server (polls inbox, pushes to session)
 │   └── package.json
@@ -188,12 +222,17 @@ cc2cc/
 
 ## Security
 
-CC2CC has **no sender authentication**. Any process with write access to `~/.cc2cc` can drop a message into an inbox and it will be delivered to the Claude Code session. This is a prompt injection vector.
+CC2CC generates an HMAC-SHA256 shared secret during `cc2cc init`. All messages are signed automatically. Recipients verify signatures on read.
 
-Mitigations:
+The secret is stored at `~/.cc2cc/secret.key`. Protect it:
+- `chmod 600 ~/.cc2cc/secret.key` (macOS/Linux)
+- Restrict folder permissions (Windows)
+
+Messages from processes without the secret will show `[SIGNATURE INVALID]` in receive output. Unsigned messages still work (backwards compatible) but are not verified.
+
+Additional mitigations:
 - Set restrictive permissions: `chmod 700 ~/.cc2cc`
 - Only use on single-user machines where you trust all running processes
-- For higher security, add HMAC signatures to messages (not implemented — PRs welcome)
 
 ## Documentation
 

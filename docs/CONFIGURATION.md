@@ -57,6 +57,15 @@ For Agent Beta — same structure, but:
 
 ---
 
+## HMAC Secret
+
+Generated automatically by `cc2cc init`. Located at `$CC2CC_BRIDGE_DIR/secret.key`.
+Both agents must have access to the same secret file (same filesystem).
+
+To regenerate: delete `secret.key` and run `cc2cc init` again.
+
+---
+
 ## Auto-Wake Service (Optional)
 
 Install a background service that watches the inbox and notifies when messages arrive.
