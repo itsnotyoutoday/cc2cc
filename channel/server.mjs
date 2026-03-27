@@ -1,57 +1,169 @@
 #!/usr/bin/env node
 
 /**
- * CC2CC MCP Channel Server
+ * CC2CC MCP Channel Server v3.0
  *
- * Polls the inbox for messages from a peer agent and pushes them
- * into the Claude Code session as channel notifications.
- *
- * Exposes a "reply" tool so the agent can respond.
+ * Unified multi-agent communication server with dynamic identity.
+ * Auto-generates a unique name on startup, discovers peers via heartbeats,
+ * and exposes 6 MCP tools: whoami, list_agents, send, broadcast, reply, register.
  *
  * Environment:
- *   BRIDGE_DIR — path to bridge root (default: ~/.cc2cc)
- *   SELF       — this agent's ID (default: alpha)
- *   PEER       — peer agent's ID (default: beta)
+ *   CC2CC_BRIDGE_DIR / BRIDGE_DIR — path to bridge root (default: ~/.cc2cc)
+ *   SELF — override auto-generated agent name
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { readdir, readFile, rename, mkdir, writeFile } from "fs/promises";
-import { join, dirname } from "path";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { readdir, readFile, rename, mkdir, writeFile, stat } from "fs/promises";
+import { join, basename, dirname } from "path";
 import { randomUUID } from "crypto";
+import { generateUniqueName, validateName, takenNames } from "./names.mjs";
 
-const BRIDGE_DIR = process.env.BRIDGE_DIR || `${process.env.HOME || process.env.USERPROFILE}/.cc2cc`;
-const SELF = process.env.SELF || "alpha";
-const PEER = process.env.PEER || "beta";
+// ─── Constants ───────────────────────────────────────────────────────────────
+
 const POLL_MS = 3000;
+const HEARTBEAT_INTERVAL_MS = 15000;
+const HEARTBEAT_STALE_S = 30;
+const SEEN_FILES_CAP = 500;
+const DEFAULT_TTL = 3600;
 
-const INBOX = join(BRIDGE_DIR, `${PEER}-to-${SELF}`, "inbox");
-const DONE = join(BRIDGE_DIR, `${PEER}-to-${SELF}`, "done");
-const OUTBOX = join(BRIDGE_DIR, `${SELF}-to-${PEER}`, "inbox");
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const BRIDGE_DIR =
+  process.env.CC2CC_BRIDGE_DIR || process.env.BRIDGE_DIR || join(HOME, ".cc2cc");
 
-// Logging helper — writes to stderr (stdout is MCP transport)
-function log(level, msg, data) {
+// ─── State ───────────────────────────────────────────────────────────────────
+
+let agentName = null; // set during init
+const onlineSince = new Date().toISOString();
+const sessionId = String(process.pid);
+const seenFiles = new Set();
+let knownAgents = new Map(); // name → heartbeat data
+let pollTimer = null;
+let statusTimer = null;
+let heartbeatTimer = null;
+
+// ─── Logging (structured JSON → stderr; stdout is MCP transport) ─────────────
+
+function log(level, msg, data = {}) {
   const entry = {
     ts: new Date().toISOString(),
     level,
-    server: SELF,
+    server: agentName,
     msg,
     ...data,
   };
   process.stderr.write(JSON.stringify(entry) + "\n");
 }
 
-// --- Server setup with PUBLIC instructions API ---
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function inboxDir(name) {
+  return join(BRIDGE_DIR, `to-${name}`, "inbox");
+}
+function doneDir(name) {
+  return join(BRIDGE_DIR, `to-${name}`, "done");
+}
+function receiptsDir(name) {
+  return join(BRIDGE_DIR, `to-${name}`, "receipts");
+}
+function statusDir() {
+  return join(BRIDGE_DIR, "status");
+}
+
+/** Atomic write: tmp file → rename */
+async function atomicWrite(targetPath, data) {
+  const dir = dirname(targetPath);
+  await mkdir(dir, { recursive: true });
+  const tmpPath = join(dir, `.tmp-${randomUUID()}.json`);
+  await writeFile(tmpPath, JSON.stringify(data, null, 2));
+  await rename(tmpPath, targetPath);
+}
+
+/** Build a message object */
+function buildMessage({ from, to, text, type = "message", priority = "normal", replyTo = null, task = null }) {
+  return {
+    id: `msg-${randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    from,
+    to,
+    type,
+    priority,
+    identity: { agent: from, mode: "session" },
+    task,
+    content: { text, parts: [] },
+    replyTo,
+    ttl: DEFAULT_TTL,
+  };
+}
+
+/** Write heartbeat to status/{name}-heartbeat.json */
+async function writeHeartbeat(statusValue = "active", context = "session started") {
+  const hb = {
+    agent: agentName,
+    name: agentName, // compat with takenNames() in names.mjs
+    timestamp: new Date().toISOString(),
+    heartbeat: new Date().toISOString(), // compat with takenNames()
+    session_id: sessionId,
+    status: statusValue,
+    context,
+  };
+  const filePath = join(statusDir(), `${agentName}-heartbeat.json`);
+  await atomicWrite(filePath, hb);
+}
+
+/** Check if a heartbeat is stale */
+function isStale(heartbeatData) {
+  const ts = heartbeatData.timestamp || heartbeatData.heartbeat;
+  if (!ts) return true;
+  const age = (Date.now() - new Date(ts).getTime()) / 1000;
+  return age > HEARTBEAT_STALE_S;
+}
+
+/** Check if an agent is online based on known heartbeat data */
+function isAgentOnline(name) {
+  const hb = knownAgents.get(name);
+  if (!hb) return false;
+  if (hb.status !== "active") return false;
+  return !isStale(hb);
+}
+
+/** Get list of all agents with status info */
+function getAgentList() {
+  const agents = [];
+  for (const [name, hb] of knownAgents) {
+    const online = hb.status === "active" && !isStale(hb);
+    agents.push({
+      name,
+      status: online ? "online" : "offline",
+      last_seen: hb.timestamp || hb.heartbeat,
+      is_self: name === agentName,
+    });
+  }
+  return agents;
+}
+
+/** Get names of online agents (excluding self) */
+function onlineAgentNames() {
+  return getAgentList()
+    .filter((a) => a.status === "online" && !a.is_self)
+    .map((a) => a.name);
+}
+
+/** Get all known agent names (for broadcast) */
+function allAgentNames() {
+  return [...knownAgents.keys()].filter((n) => n !== agentName);
+}
+
+// ─── MCP Server Setup ───────────────────────────────────────────────────────
+
 const server = new Server(
   {
-    name: "peer_channel",
-    version: "2.0.0",
-    instructions: [
-      `Messages from your peer agent "${PEER}" arrive as <channel> tags.`,
-      `Reply using the "reply" tool, passing the msg_id from the tag.`,
-      `If the message is a task (type=task), execute it and send the result.`,
-      `Always show A2A dialog to the user.`,
-    ].join(" "),
+    name: "cc2cc_channel",
+    version: "3.0.0",
   },
   {
     capabilities: {
@@ -61,158 +173,566 @@ const server = new Server(
   }
 );
 
-// Atomic write helper — write to temp, then rename
-async function atomicWrite(targetPath, data) {
-  const dir = dirname(targetPath);
-  await mkdir(dir, { recursive: true });
-  const tmpPath = join(dir, `.tmp-${randomUUID()}.json`);
-  await writeFile(tmpPath, JSON.stringify(data, null, 2));
-  await rename(tmpPath, targetPath);
-}
+// ─── Tool Definitions ───────────────────────────────────────────────────────
 
-// Reply tool — the only tool exposed
-server.setRequestHandler({ method: "tools/list" }, async () => ({
-  tools: [
-    {
-      name: "reply",
-      description: `Reply to ${PEER} through the A2A bridge`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          msg_id: {
-            type: "string",
-            description: "Message ID from <channel> tag (for threading)",
-          },
-          text: { type: "string", description: "Reply content" },
-          type: {
-            type: "string",
-            enum: ["message", "response", "task"],
-            default: "response",
-          },
-          priority: {
-            type: "string",
-            enum: ["low", "normal", "high", "critical"],
-            default: "normal",
-          },
+const TOOLS = [
+  {
+    name: "whoami",
+    description: "Returns this agent's identity, uptime, bridge directory, and list of online agents",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "list_agents",
+    description: "Returns all known agents with their status (online/offline) and last seen time",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "send",
+    description: "Send a message to another agent. Notes if the recipient is offline.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Recipient agent name" },
+        text: { type: "string", description: "Message content" },
+        type: {
+          type: "string",
+          enum: ["message", "task", "response", "status"],
+          default: "message",
+          description: "Message type",
         },
-        required: ["msg_id", "text"],
+        priority: {
+          type: "string",
+          enum: ["low", "normal", "high", "critical"],
+          default: "normal",
+          description: "Message priority",
+        },
       },
+      required: ["to", "text"],
     },
-  ],
+  },
+  {
+    name: "broadcast",
+    description: "Send a message to all known agents",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Message content" },
+        priority: {
+          type: "string",
+          enum: ["low", "normal", "high", "critical"],
+          default: "normal",
+          description: "Message priority",
+        },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "reply",
+    description: "Reply to a received message by msg_id. Auto-completes tasks when replying to task messages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        msg_id: {
+          type: "string",
+          description: "Message ID to reply to (from channel notification)",
+        },
+        text: { type: "string", description: "Reply content" },
+      },
+      required: ["msg_id", "text"],
+    },
+  },
+  {
+    name: "register",
+    description: "Change this agent's name. Validates, renames directories, updates heartbeat, and notifies other agents.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "New agent name (lowercase alphanumeric with hyphens, max 31 chars)",
+        },
+      },
+      required: ["name"],
+    },
+  },
+];
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
 }));
 
-// Handle reply tool calls
-server.setRequestHandler({ method: "tools/call" }, async ({ params }) => {
-  if (params.name !== "reply") {
-    return { content: [{ type: "text", text: "Unknown tool" }] };
-  }
+// ─── Tool Handlers ──────────────────────────────────────────────────────────
 
-  const {
-    msg_id,
-    text,
-    type = "response",
-    priority = "normal",
-  } = params.arguments;
-
-  const id = `msg-${randomUUID()}`;
-  const msg = {
-    id,
-    timestamp: new Date().toISOString(),
-    from: SELF,
-    to: PEER,
-    type,
-    priority,
-    identity: { agent: SELF, mode: "session" },
-    task: null,
-    content: { text, parts: [] },
-    replyTo: msg_id || null,
-    ttl: 3600,
-  };
+server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+  const { name: toolName, arguments: args } = params;
 
   try {
-    await atomicWrite(join(OUTBOX, `${id}.json`), msg);
-    log("info", "reply sent", { id, to: PEER });
-    return {
-      content: [{ type: "text", text: `Sent ${id} to ${PEER}` }],
-    };
+    switch (toolName) {
+      case "whoami":
+        return handleWhoami();
+      case "list_agents":
+        return handleListAgents();
+      case "send":
+        return await handleSend(args);
+      case "broadcast":
+        return await handleBroadcast(args);
+      case "reply":
+        return await handleReply(args);
+      case "register":
+        return await handleRegister(args);
+      default:
+        return textResult(`Unknown tool: ${toolName}`, true);
+    }
   } catch (err) {
-    log("error", "reply failed", { id, error: err.message });
-    return {
-      content: [{ type: "text", text: `Failed to send: ${err.message}` }],
-      isError: true,
-    };
+    log("error", `tool ${toolName} failed`, { error: err.message });
+    return textResult(`Error: ${err.message}`, true);
   }
 });
 
-// --- Polling loop: watch inbox, push to channel, write receipts ---
+function textResult(text, isError = false) {
+  const result = { content: [{ type: "text", text }] };
+  if (isError) result.isError = true;
+  return result;
+}
 
-const seenFiles = new Set();
+function jsonResult(data) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+  };
+}
 
-async function drainInbox() {
-  await mkdir(INBOX, { recursive: true });
-  await mkdir(DONE, { recursive: true });
+// ── whoami ──
 
-  let files;
-  try {
-    files = (await readdir(INBOX)).filter((f) => f.endsWith(".json"));
-  } catch (err) {
-    log("warn", "inbox read failed", { error: err.message });
-    return;
+function handleWhoami() {
+  return jsonResult({
+    name: agentName,
+    online_since: onlineSince,
+    bridge_dir: BRIDGE_DIR,
+    online_agents: onlineAgentNames(),
+  });
+}
+
+// ── list_agents ──
+
+function handleListAgents() {
+  return jsonResult(getAgentList());
+}
+
+// ── send ──
+
+async function handleSend({ to, text, type = "message", priority = "normal" }) {
+  if (!to || !text) return textResult("Missing required fields: to, text", true);
+
+  const msg = buildMessage({ from: agentName, to, text, type, priority });
+  const targetInbox = inboxDir(to);
+  await mkdir(targetInbox, { recursive: true });
+  await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
+
+  const online = isAgentOnline(to);
+  log("info", "message sent", { id: msg.id, to, online });
+
+  const status = online ? "delivered to inbox" : "queued (recipient offline)";
+  return textResult(`Sent ${msg.id} to ${to} — ${status}`);
+}
+
+// ── broadcast ──
+
+async function handleBroadcast({ text, priority = "normal" }) {
+  if (!text) return textResult("Missing required field: text", true);
+
+  const targets = allAgentNames();
+  if (targets.length === 0) {
+    return textResult("No other agents known. Nobody to broadcast to.");
   }
 
-  for (const file of files) {
-    if (seenFiles.has(file)) continue;
-    seenFiles.add(file);
+  const results = [];
+  for (const to of targets) {
+    const msg = buildMessage({ from: agentName, to, text, type: "message", priority });
+    const targetInbox = inboxDir(to);
+    await mkdir(targetInbox, { recursive: true });
+    await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
+    results.push({ to, id: msg.id, online: isAgentOnline(to) });
+  }
 
+  log("info", "broadcast sent", { count: results.length });
+  return jsonResult({ broadcast: true, recipients: results });
+}
+
+// ── reply ──
+
+async function handleReply({ msg_id, text }) {
+  if (!msg_id || !text) return textResult("Missing required fields: msg_id, text", true);
+
+  // Try to find the original message in done dirs to get sender info
+  let originalMsg = null;
+  const myDone = doneDir(agentName);
+
+  try {
+    const files = await readdir(myDone);
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const raw = await readFile(join(myDone, f), "utf8");
+        const m = JSON.parse(raw);
+        if (m.id === msg_id) {
+          originalMsg = m;
+          break;
+        }
+      } catch { /* skip */ }
+    }
+  } catch { /* done dir may not exist */ }
+
+  // Also check legacy inbox paths
+  if (!originalMsg) {
     try {
-      const raw = await readFile(join(INBOX, file), "utf8");
-      const msg = JSON.parse(raw);
+      const topDirs = await readdir(BRIDGE_DIR);
+      for (const d of topDirs) {
+        if (!d.endsWith(`-to-${agentName}`)) continue;
+        const legacyDone = join(BRIDGE_DIR, d, "done");
+        try {
+          const files = await readdir(legacyDone);
+          for (const f of files) {
+            if (!f.endsWith(".json")) continue;
+            try {
+              const raw = await readFile(join(legacyDone, f), "utf8");
+              const m = JSON.parse(raw);
+              if (m.id === msg_id) {
+                originalMsg = m;
+                break;
+              }
+            } catch { /* skip */ }
+          }
+          if (originalMsg) break;
+        } catch { /* skip */ }
+      }
+    } catch { /* skip */ }
+  }
 
-      const taskTitle = msg.task?.title ? `[${msg.task.title}] ` : "";
-      const content = `${taskTitle}${msg.content?.text || ""}`;
+  const to = originalMsg?.from;
+  if (!to) {
+    return textResult(`Cannot find original message ${msg_id}. Unable to determine recipient.`, true);
+  }
 
-      // Push channel notification to Claude Code
-      await server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content,
-          meta: {
-            msg_id: msg.id,
-            priority: msg.priority || "normal",
-            type: msg.type || "message",
-            from: msg.from,
-          },
-        },
-      });
+  // Auto-complete task type: if original was a task, reply as response
+  const replyType = originalMsg.type === "task" ? "response" : "message";
 
-      log("info", "message delivered", { id: msg.id, from: msg.from, type: msg.type });
+  const msg = buildMessage({
+    from: agentName,
+    to,
+    text,
+    type: replyType,
+    replyTo: msg_id,
+  });
 
-      // Write delivery receipt
-      const receiptDir = join(BRIDGE_DIR, `${msg.from}-to-${SELF}`, "receipts");
-      await mkdir(receiptDir, { recursive: true });
-      const receipt = {
-        msg_id: msg.id,
-        delivered_at: new Date().toISOString(),
-        delivered_to: SELF,
-      };
-      await atomicWrite(join(receiptDir, `${msg.id}.receipt.json`), receipt);
+  const targetInbox = inboxDir(to);
+  await mkdir(targetInbox, { recursive: true });
+  await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
 
-      // Move to done/
-      await rename(join(INBOX, file), join(DONE, file));
+  log("info", "reply sent", { id: msg.id, to, replyTo: msg_id });
+  return textResult(`Reply ${msg.id} sent to ${to}` + (replyType === "response" ? " (task response)" : ""));
+}
+
+// ── register ──
+
+async function handleRegister({ name: newName }) {
+  if (!newName) return textResult("Missing required field: name", true);
+  if (!validateName(newName)) {
+    return textResult(`Invalid name "${newName}". Use lowercase a-z, 0-9, hyphens, max 31 chars.`, true);
+  }
+
+  // Check if name is taken
+  const taken = await takenNames(BRIDGE_DIR);
+  if (taken.has(newName) && newName !== agentName) {
+    return textResult(`Name "${newName}" is already taken by an active agent.`, true);
+  }
+
+  const oldName = agentName;
+  if (oldName === newName) {
+    return textResult(`Already registered as "${newName}".`);
+  }
+
+  // Write offline heartbeat for old name
+  await writeHeartbeat("offline", `renamed to ${newName}`);
+
+  // Update agent name
+  agentName = newName;
+
+  // Create new directories
+  await mkdir(inboxDir(agentName), { recursive: true });
+  await mkdir(doneDir(agentName), { recursive: true });
+  await mkdir(receiptsDir(agentName), { recursive: true });
+
+  // Write active heartbeat with new name
+  await writeHeartbeat("active", `renamed from ${oldName}`);
+
+  // Notify other agents about the name change
+  const targets = allAgentNames();
+  for (const to of targets) {
+    const msg = buildMessage({
+      from: agentName,
+      to,
+      text: `Agent "${oldName}" is now "${agentName}"`,
+      type: "status",
+    });
+    const targetInbox = inboxDir(to);
+    await mkdir(targetInbox, { recursive: true });
+    try {
+      await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
     } catch (err) {
-      log("error", "message processing failed", { file, error: err.message });
+      log("warn", "register notify failed", { to, error: err.message });
     }
   }
 
-  // Prevent memory leak on long-running sessions
-  if (seenFiles.size > 500) seenFiles.clear();
+  log("info", "agent renamed", { from: oldName, to: newName });
+  return textResult(`Renamed from "${oldName}" to "${agentName}". ${targets.length} agents notified.`);
 }
 
-// Start polling
-setInterval(drainInbox, POLL_MS);
-drainInbox();
-log("info", "server started", { self: SELF, peer: PEER, poll_ms: POLL_MS });
+// ─── Inbox Polling ──────────────────────────────────────────────────────────
 
-// Connect via stdio
-const transport = new StdioServerTransport();
-await server.connect(transport);
+async function drainInbox() {
+  // Collect files from primary inbox: to-{name}/inbox/
+  const primary = inboxDir(agentName);
+  await mkdir(primary, { recursive: true });
+  await mkdir(doneDir(agentName), { recursive: true });
+
+  const inboxPaths = [primary];
+
+  // Also check legacy format: *-to-{name}/inbox/
+  try {
+    const topDirs = await readdir(BRIDGE_DIR);
+    for (const d of topDirs) {
+      if (d.endsWith(`-to-${agentName}`) && d !== `to-${agentName}`) {
+        const legacyInbox = join(BRIDGE_DIR, d, "inbox");
+        inboxPaths.push(legacyInbox);
+      }
+    }
+  } catch { /* bridge dir may not exist yet */ }
+
+  for (const inbox of inboxPaths) {
+    let files;
+    try {
+      files = (await readdir(inbox)).filter((f) => f.endsWith(".json") && !f.startsWith(".tmp-"));
+    } catch {
+      continue; // dir may not exist
+    }
+
+    for (const file of files) {
+      if (seenFiles.has(file)) continue;
+      seenFiles.add(file);
+
+      try {
+        const filePath = join(inbox, file);
+        const raw = await readFile(filePath, "utf8");
+        const msg = JSON.parse(raw);
+
+        // TTL expiration check
+        if (msg.timestamp && msg.ttl) {
+          const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
+          if (age > msg.ttl) {
+            // Expired — move to done, notify sender
+            const done = doneDir(agentName);
+            await mkdir(done, { recursive: true });
+            await rename(filePath, join(done, file));
+
+            if (msg.from && msg.from !== agentName) {
+              const expNotice = buildMessage({
+                from: agentName,
+                to: msg.from,
+                text: `Message ${msg.id} expired (TTL ${msg.ttl}s)`,
+                type: "status",
+                replyTo: msg.id,
+              });
+              const senderInbox = inboxDir(msg.from);
+              await mkdir(senderInbox, { recursive: true });
+              try {
+                await atomicWrite(join(senderInbox, `${expNotice.id}.json`), expNotice);
+              } catch { /* best effort */ }
+            }
+
+            log("info", "message expired", { id: msg.id, from: msg.from, ttl: msg.ttl });
+            continue;
+          }
+        }
+
+        // Push channel notification
+        const taskTitle = msg.task?.title ? `[${msg.task.title}] ` : "";
+        const content = `[from: ${msg.from}] [type: ${msg.type || "message"}] ${taskTitle}${msg.content?.text || ""}`;
+
+        await server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content,
+            meta: {
+              msg_id: msg.id,
+              priority: msg.priority || "normal",
+              type: msg.type || "message",
+              from: msg.from,
+            },
+          },
+        });
+
+        log("info", "message delivered", { id: msg.id, from: msg.from, type: msg.type });
+
+        // Write delivery receipt
+        const receiptPath = receiptsDir(agentName);
+        await mkdir(receiptPath, { recursive: true });
+        const receipt = {
+          msg_id: msg.id,
+          delivered_at: new Date().toISOString(),
+          delivered_to: agentName,
+        };
+        await atomicWrite(join(receiptPath, `${msg.id}.receipt.json`), receipt);
+
+        // Move to done/
+        const done = doneDir(agentName);
+        await mkdir(done, { recursive: true });
+        await rename(filePath, join(done, file));
+      } catch (err) {
+        log("error", "message processing failed", { file, error: err.message });
+      }
+    }
+  }
+
+  // Prevent memory leak
+  if (seenFiles.size > SEEN_FILES_CAP) seenFiles.clear();
+}
+
+// ─── Status Polling (join/leave detection) ───────────────────────────────────
+
+async function pollStatus() {
+  const sDir = statusDir();
+  let files;
+  try {
+    files = (await readdir(sDir)).filter((f) => f.endsWith("-heartbeat.json"));
+  } catch {
+    return;
+  }
+
+  const newAgents = new Map();
+
+  for (const file of files) {
+    try {
+      const raw = await readFile(join(sDir, file), "utf8");
+      const hb = JSON.parse(raw);
+      const name = hb.agent || hb.name;
+      if (!name) continue;
+      newAgents.set(name, hb);
+    } catch { /* skip */ }
+  }
+
+  // Detect joins
+  for (const [name, hb] of newAgents) {
+    if (name === agentName) continue;
+    const wasKnown = knownAgents.has(name);
+    const wasOnline = wasKnown && knownAgents.get(name).status === "active" && !isStale(knownAgents.get(name));
+    const isOnline = hb.status === "active" && !isStale(hb);
+
+    if (isOnline && !wasOnline) {
+      log("info", "agent joined", { agent: name });
+      try {
+        await server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: `[system] Agent "${name}" is now online`,
+            meta: { type: "status", from: "system" },
+          },
+        });
+      } catch { /* notification may fail if transport not ready */ }
+    }
+  }
+
+  // Detect leaves
+  for (const [name, hb] of knownAgents) {
+    if (name === agentName) continue;
+    const wasOnline = hb.status === "active" && !isStale(hb);
+    const stillExists = newAgents.has(name);
+    const nowOnline = stillExists && newAgents.get(name).status === "active" && !isStale(newAgents.get(name));
+
+    if (wasOnline && !nowOnline) {
+      log("info", "agent left", { agent: name });
+      try {
+        await server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: `[system] Agent "${name}" went offline`,
+            meta: { type: "status", from: "system" },
+          },
+        });
+      } catch { /* notification may fail */ }
+    }
+  }
+
+  knownAgents = newAgents;
+}
+
+// ─── Graceful Shutdown ──────────────────────────────────────────────────────
+
+async function shutdown(signal) {
+  log("info", "shutting down", { signal });
+
+  clearInterval(pollTimer);
+  clearInterval(statusTimer);
+  clearInterval(heartbeatTimer);
+
+  try {
+    await writeHeartbeat("offline", `shutdown via ${signal}`);
+  } catch (err) {
+    log("error", "failed to write offline heartbeat", { error: err.message });
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+// ─── Initialization ─────────────────────────────────────────────────────────
+
+async function init() {
+  // 1. Determine agent name
+  if (process.env.SELF) {
+    agentName = process.env.SELF;
+    log("info", "using SELF env name", { name: agentName });
+  } else {
+    agentName = await generateUniqueName(BRIDGE_DIR);
+    log("info", "generated unique name", { name: agentName });
+  }
+
+  // 2. Create directories
+  await mkdir(inboxDir(agentName), { recursive: true });
+  await mkdir(doneDir(agentName), { recursive: true });
+  await mkdir(receiptsDir(agentName), { recursive: true });
+  await mkdir(statusDir(), { recursive: true });
+
+  // 3. Write initial heartbeat
+  await writeHeartbeat("active", "session started");
+
+  // 4. Initial status poll to discover existing agents
+  await pollStatus();
+
+  // 5. Start polling loops
+  pollTimer = setInterval(drainInbox, POLL_MS);
+  statusTimer = setInterval(pollStatus, POLL_MS);
+  heartbeatTimer = setInterval(() => writeHeartbeat("active", "heartbeat"), HEARTBEAT_INTERVAL_MS);
+
+  // 6. Initial inbox drain
+  await drainInbox();
+
+  log("info", "server started", {
+    name: agentName,
+    bridge_dir: BRIDGE_DIR,
+    poll_ms: POLL_MS,
+    heartbeat_ms: HEARTBEAT_INTERVAL_MS,
+    online_agents: onlineAgentNames(),
+  });
+
+  // 7. Connect MCP transport
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+init().catch((err) => {
+  log("error", "init failed", { error: err.message, stack: err.stack });
+  process.exit(1);
+});
