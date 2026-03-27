@@ -1,7 +1,7 @@
 {
-  "name": "cc2cc-channel",
-  "version": "1.1.0",
-  "description": "CC2CC MCP Channel Server — polls inbox, pushes to Claude Code session",
+  "name": "cc2cc-server",
+  "version": "3.0.0",
+  "description": "CC2CC Unified MCP Server — dynamic identity, multi-agent",
   "type": "module",
   "main": "server.mjs",
   "dependencies": {

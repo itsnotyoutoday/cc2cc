@@ -2,7 +2,7 @@
 """Unified CC2CC command-line interface.
 
 Usage:
-    cc2cc init <agent-a> <agent-b> [bridge-dir]
+    cc2cc init [bridge-dir]
     cc2cc send <from> <to> <type> <content> [--priority P] [--mode M]
     cc2cc task <from> <to> <title> <description> [--priority P]
     cc2cc reply <msg-id> <text> [--from AGENT]
@@ -13,75 +13,78 @@ Usage:
 """
 
 import argparse
+import subprocess
 import sys
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+
+
+def _run_script(name: str, args: list):
+    """Run a script from the repo's scripts/ or hooks/ directory."""
+    script = REPO_DIR / name
+    if not script.exists():
+        print(f"Error: script not found: {script}", file=sys.stderr)
+        sys.exit(1)
+    cmd = [sys.executable, str(script)] + args
+    sys.exit(subprocess.run(cmd).returncode)
 
 
 def cmd_init(args):
-    from scripts.init import main as _init_main
-    sys.argv = ["init.py", args.agent_a, args.agent_b] + ([args.bridge_dir] if args.bridge_dir else [])
-    _init_main()
+    argv = []
+    if args.bridge_dir:
+        argv.append(args.bridge_dir)
+    _run_script("scripts/init.py", argv)
 
 
 def cmd_send(args):
-    from scripts.send import main as _send_main
-    sys.argv = ["send.py", args.sender, args.recipient, args.type, args.content]
+    argv = [args.sender, args.recipient, args.type, args.content]
     if args.priority:
-        sys.argv.append(args.priority)
+        argv.append(args.priority)
     if args.mode:
-        sys.argv.append(args.mode)
-    _send_main()
+        argv.append(args.mode)
+    _run_script("scripts/send.py", argv)
 
 
 def cmd_task(args):
-    from scripts.task import main as _task_main
-    sys.argv = ["task.py", args.sender, args.recipient, args.title, args.description]
+    argv = [args.sender, args.recipient, args.title, args.description]
     if args.priority:
-        sys.argv.append(args.priority)
-    _task_main()
+        argv.append(args.priority)
+    _run_script("scripts/task.py", argv)
 
 
 def cmd_reply(args):
-    from scripts.reply import main as _reply_main
-    sys.argv = ["reply.py", args.msg_id, args.text]
+    argv = [args.msg_id, args.text]
     if args.sender:
-        sys.argv.append(args.sender)
-    _reply_main()
+        argv.append(args.sender)
+    _run_script("scripts/reply.py", argv)
 
 
 def cmd_receive(args):
-    from scripts.receive import main as _receive_main
-    sys.argv = ["receive.py", args.agent]
+    argv = [args.agent]
     if args.peek:
-        sys.argv.append("--peek")
-    _receive_main()
+        argv.append("--peek")
+    _run_script("scripts/receive.py", argv)
 
 
 def cmd_status(args):
-    from scripts.status import main as _status_main
-    sys.argv = ["status.py"]
-    _status_main()
+    _run_script("scripts/status.py", [])
 
 
 def cmd_validate(args):
-    import subprocess
-    from pathlib import Path
-    script = Path(__file__).resolve().parent.parent / "scripts" / "validate.py"
-    cmd = [sys.executable, str(script)]
+    argv = []
     if args.fix:
-        cmd.append("--fix")
-    sys.exit(subprocess.run(cmd).returncode)
+        argv.append("--fix")
+    _run_script("scripts/validate.py", argv)
 
 
 def cmd_cleanup(args):
-    import subprocess
-    from pathlib import Path
-    script = Path(__file__).resolve().parent.parent / "scripts" / "cleanup.py"
-    cmd = [sys.executable, str(script)]
+    argv = []
     if args.max_age_hours:
-        cmd.extend(["--max-age-hours", str(args.max_age_hours)])
+        argv.extend(["--max-age-hours", str(args.max_age_hours)])
     if args.dry_run:
-        cmd.append("--dry-run")
-    sys.exit(subprocess.run(cmd).returncode)
+        argv.append("--dry-run")
+    _run_script("scripts/cleanup.py", argv)
 
 
 def main():
@@ -92,9 +95,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     # init
-    p = sub.add_parser("init", help="Initialize bridge between two agents")
-    p.add_argument("agent_a")
-    p.add_argument("agent_b")
+    p = sub.add_parser("init", help="Initialize bridge")
     p.add_argument("bridge_dir", nargs="?", default=None)
     p.set_defaults(func=cmd_init)
 
