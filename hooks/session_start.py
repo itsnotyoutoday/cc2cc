@@ -30,9 +30,22 @@ def main():
         json.dumps(heartbeat, indent=2), encoding="utf-8"
     )
 
-    # Check inbox
+    # Check inbox — new format + legacy
     pending = 0
     output_lines = []
+    new_inbox = bridge / f"to-{self_id}" / "inbox"
+    if new_inbox.exists():
+        for fp in new_inbox.glob("*.json"):
+            pending += 1
+            try:
+                msg = json.loads(fp.read_text(encoding="utf-8"))
+                sender = msg["from"]
+                mtype = msg["type"]
+                text = msg["content"]["text"][:80]
+                output_lines.append(f"  - [{mtype}] from {sender}: {text}")
+            except (json.JSONDecodeError, KeyError, OSError):
+                output_lines.append("  - [unknown] unreadable message")
+    # Legacy format
     for fp in bridge.glob(f"*-to-{self_id}/inbox/*.json"):
         pending += 1
         try:
