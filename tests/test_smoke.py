@@ -15,12 +15,11 @@ REPO_DIR = Path(__file__).resolve().parent.parent
 
 @pytest.fixture
 def bridge(tmp_path):
-    """Create a temporary bridge directory with basic structure."""
-    for pair in [("alpha", "beta"), ("beta", "alpha")]:
-        (tmp_path / f"{pair[0]}-to-{pair[1]}" / "inbox").mkdir(parents=True)
-        (tmp_path / f"{pair[0]}-to-{pair[1]}" / "done").mkdir(parents=True)
+    """Create a temporary bridge directory with new format."""
+    for agent in ["alpha", "beta"]:
+        (tmp_path / f"to-{agent}" / "inbox").mkdir(parents=True)
+        (tmp_path / f"to-{agent}" / "done").mkdir(parents=True)
     (tmp_path / "status").mkdir()
-    (tmp_path / "agent-cards").mkdir()
     return tmp_path
 
 
@@ -37,12 +36,12 @@ def run_script(name: str, args: list, bridge_dir: Path, env_extra: dict = None) 
 class TestSend:
     def test_creates_message_file(self, bridge):
         run_script("scripts/send.py", ["alpha", "beta", "message", "Hello from alpha"], bridge)
-        files = list((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        files = list((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         assert len(files) == 1
 
     def test_message_fields(self, bridge):
         run_script("scripts/send.py", ["alpha", "beta", "message", "Hello from alpha"], bridge)
-        fp = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        fp = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         msg = json.loads(fp.read_text(encoding="utf-8"))
         assert msg["from"] == "alpha"
         assert msg["to"] == "beta"
@@ -55,23 +54,23 @@ class TestReceive:
         run_script("scripts/send.py", ["alpha", "beta", "message", "Hello"], bridge)
         result = run_script("scripts/receive.py", ["beta", "--peek"], bridge)
         assert "alpha" in result.stdout
-        assert len(list((bridge / "alpha-to-beta" / "inbox").glob("*.json"))) == 1
+        assert len(list((bridge / "to-beta" / "inbox").glob("*.json"))) == 1
 
     def test_consume_moves_to_done(self, bridge):
         run_script("scripts/send.py", ["alpha", "beta", "message", "Hello"], bridge)
         run_script("scripts/receive.py", ["beta"], bridge)
-        assert len(list((bridge / "alpha-to-beta" / "inbox").glob("*.json"))) == 0
-        assert len(list((bridge / "alpha-to-beta" / "done").glob("*.json"))) == 1
+        assert len(list((bridge / "to-beta" / "inbox").glob("*.json"))) == 0
+        assert len(list((bridge / "to-beta" / "done").glob("*.json"))) == 1
 
 
 class TestReply:
     def test_reply_creates_response(self, bridge):
         run_script("scripts/send.py", ["alpha", "beta", "message", "Hello"], bridge)
-        msg_file = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        msg_file = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         msg = json.loads(msg_file.read_text(encoding="utf-8"))
         msg_id = msg["id"]
         run_script("scripts/reply.py", [msg_id, "Got it!", "beta"], bridge)
-        replies = list((bridge / "beta-to-alpha" / "inbox").glob("msg-*.json"))
+        replies = list((bridge / "to-alpha" / "inbox").glob("msg-*.json"))
         assert len(replies) == 1
         reply = json.loads(replies[0].read_text(encoding="utf-8"))
         assert reply["replyTo"] == msg_id
@@ -81,7 +80,7 @@ class TestReply:
 class TestTask:
     def test_task_creation(self, bridge):
         run_script("scripts/task.py", ["alpha", "beta", "Run tests", "Execute integration tests"], bridge)
-        files = list((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        files = list((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         assert len(files) == 1
         msg = json.loads(files[0].read_text(encoding="utf-8"))
         assert msg["type"] == "task"
@@ -90,13 +89,13 @@ class TestTask:
 
     def test_task_reply_completes(self, bridge):
         run_script("scripts/task.py", ["alpha", "beta", "Run tests", "Execute tests"], bridge)
-        task_file = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        task_file = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         task_msg = json.loads(task_file.read_text(encoding="utf-8"))
         # Move to done so reply can find it
-        done_dir = bridge / "alpha-to-beta" / "done"
+        done_dir = bridge / "to-beta" / "done"
         task_file.rename(done_dir / task_file.name)
         run_script("scripts/reply.py", [task_msg["id"], "All 42 tests passed", "beta"], bridge)
-        replies = list((bridge / "beta-to-alpha" / "inbox").glob("msg-*.json"))
+        replies = list((bridge / "to-alpha" / "inbox").glob("msg-*.json"))
         assert len(replies) == 1
         reply = json.loads(replies[0].read_text(encoding="utf-8"))
         assert reply["task"]["status"] == "completed"
@@ -147,7 +146,7 @@ class TestCleanup:
             "content": {"text": "old", "parts": []},
             "ttl": 3600,
         }
-        done_dir = bridge / "alpha-to-beta" / "done"
+        done_dir = bridge / "to-beta" / "done"
         (done_dir / "msg-expired.json").write_text(json.dumps(expired), encoding="utf-8")
         before = len(list(done_dir.glob("*.json")))
         run_script("scripts/cleanup.py", ["--max-age-hours", "1"], bridge)
@@ -160,7 +159,7 @@ class TestAtomicWriteIntegration:
 
     def test_send_creates_complete_json(self, bridge):
         run_script("scripts/send.py", ["alpha", "beta", "message", "Atomic test"], bridge)
-        fp = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        fp = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         msg = json.loads(fp.read_text(encoding="utf-8"))
         assert all(k in msg for k in ("id", "timestamp", "from", "to", "type", "content"))
 
@@ -171,14 +170,14 @@ class TestHMACSigning:
     def test_signed_message_has_hmac(self, bridge):
         (bridge / "secret.key").write_text("a" * 64, encoding="utf-8")
         run_script("scripts/send.py", ["alpha", "beta", "message", "Signed msg"], bridge)
-        fp = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        fp = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         msg = json.loads(fp.read_text(encoding="utf-8"))
         assert "hmac" in msg
         assert len(msg["hmac"]) == 64
 
     def test_unsigned_when_no_secret(self, bridge):
         run_script("scripts/send.py", ["alpha", "beta", "message", "Unsigned"], bridge)
-        fp = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        fp = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         msg = json.loads(fp.read_text(encoding="utf-8"))
         assert "hmac" not in msg
 
@@ -191,7 +190,7 @@ class TestHMACSigning:
     def test_receive_shows_invalid_for_tampered(self, bridge):
         (bridge / "secret.key").write_text("c" * 64, encoding="utf-8")
         run_script("scripts/send.py", ["alpha", "beta", "message", "Will tamper"], bridge)
-        fp = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        fp = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         msg = json.loads(fp.read_text(encoding="utf-8"))
         msg["content"]["text"] = "TAMPERED"
         fp.write_text(json.dumps(msg), encoding="utf-8")
@@ -208,7 +207,7 @@ class TestSizeLimit:
 
     def test_oversized_message_rejected(self, bridge):
         from cc2cc.core import atomic_write, MAX_MESSAGE_SIZE
-        inbox = bridge / "alpha-to-beta" / "inbox"
+        inbox = bridge / "to-beta" / "inbox"
         msg = {"id": "msg-big", "content": {"text": "x" * 1_100_000}}
         with pytest.raises(ValueError, match="exceeds maximum"):
             atomic_write(inbox / "msg-big.json", msg)
@@ -242,7 +241,7 @@ class TestTaskWithHMAC:
     def test_task_signed_when_secret_exists(self, bridge):
         (bridge / "secret.key").write_text("d" * 64, encoding="utf-8")
         run_script("scripts/task.py", ["alpha", "beta", "Run tests", "Execute all tests"], bridge)
-        fp = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        fp = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         msg = json.loads(fp.read_text(encoding="utf-8"))
         assert "hmac" in msg
         assert msg["type"] == "task"
@@ -255,11 +254,32 @@ class TestReplyWithHMAC:
     def test_reply_signed_when_secret_exists(self, bridge):
         (bridge / "secret.key").write_text("e" * 64, encoding="utf-8")
         run_script("scripts/send.py", ["alpha", "beta", "message", "Hello"], bridge)
-        msg_file = next((bridge / "alpha-to-beta" / "inbox").glob("msg-*.json"))
+        msg_file = next((bridge / "to-beta" / "inbox").glob("msg-*.json"))
         msg = json.loads(msg_file.read_text(encoding="utf-8"))
         run_script("scripts/reply.py", [msg["id"], "Got it!", "beta"], bridge)
-        replies = list((bridge / "beta-to-alpha" / "inbox").glob("msg-*.json"))
+        replies = list((bridge / "to-alpha" / "inbox").glob("msg-*.json"))
         assert len(replies) == 1
         reply = json.loads(replies[0].read_text(encoding="utf-8"))
         assert "hmac" in reply
         assert reply["type"] == "response"
+
+
+class TestLegacyCompat:
+    """Verify backwards compatibility with old alpha-to-beta/ format."""
+
+    def test_receive_reads_legacy_inbox(self, bridge):
+        """Messages in old format dirs are still found by receive.py."""
+        legacy_inbox = bridge / "alpha-to-beta" / "inbox"
+        legacy_inbox.mkdir(parents=True, exist_ok=True)
+        (bridge / "alpha-to-beta" / "done").mkdir(parents=True, exist_ok=True)
+        msg = {
+            "id": "msg-legacy-1", "timestamp": "2026-03-27T10:00:00Z",
+            "from": "alpha", "to": "beta", "type": "message",
+            "content": {"text": "legacy message", "parts": []},
+            "priority": "normal",
+        }
+        (legacy_inbox / "msg-legacy-1.json").write_text(
+            json.dumps(msg), encoding="utf-8"
+        )
+        result = run_script("scripts/receive.py", ["beta", "--peek"], bridge)
+        assert "legacy message" in result.stdout
