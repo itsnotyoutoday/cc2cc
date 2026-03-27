@@ -11,41 +11,64 @@
 
 ---
 
-## Full settings.json Example
+## MCP Server Configuration
 
-Add a single MCP server entry — no per-agent copies needed:
+MCP servers are configured in `~/.claude.json` (NOT `~/.claude/settings.json`).
+
+Add the `cc2cc` entry to the `mcpServers` object:
 
 ```json
 {
   "mcpServers": {
     "cc2cc": {
       "command": "node",
-      "args": ["/Users/you/.cc2cc/server.mjs"],
+      "args": ["~/.cc2cc/server.mjs"],
       "env": {
-        "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc"
+        "CC2CC_BRIDGE_DIR": "~/.cc2cc"
       }
     }
-  },
+  }
+}
+```
+
+> **Important:** On Windows, use full paths with escaped backslashes: `"C:\\Users\\YOU\\.cc2cc\\server.mjs"`
+
+This same configuration is used by every Claude Code instance. Each instance auto-registers with a unique name (e.g. `brave-fox`, `calm-owl`) on startup.
+
+## Hooks (Optional)
+
+Hooks are configured in `~/.claude/settings.json`:
+
+```json
+{
   "hooks": {
     "SessionStart": [
       {
-        "type": "command",
-        "command": "python /Users/you/.cc2cc/hooks/session_start.py",
-        "env": { "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc" }
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.cc2cc/hooks/session_start.py",
+            "env": { "CC2CC_BRIDGE_DIR": "~/.cc2cc" }
+          }
+        ]
       }
     ],
     "SessionEnd": [
       {
-        "type": "command",
-        "command": "python /Users/you/.cc2cc/hooks/session_end.py",
-        "env": { "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc" }
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.cc2cc/hooks/session_end.py",
+            "env": { "CC2CC_BRIDGE_DIR": "~/.cc2cc" }
+          }
+        ]
       }
     ]
   }
 }
 ```
-
-This same configuration is used by every Claude Code instance. Each instance auto-registers with a unique name (e.g. `brave-fox`, `calm-owl`) on startup.
 
 ---
 

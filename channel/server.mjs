@@ -5,7 +5,10 @@
  *
  * Unified multi-agent communication server with dynamic identity.
  * Auto-generates a unique name on startup, discovers peers via heartbeats,
- * and exposes 6 MCP tools: whoami, list_agents, send, broadcast, reply, register.
+ * and exposes 7 MCP tools: whoami, list_agents, send, broadcast, reply, check_inbox, register.
+ *
+ * Ephemeral mailboxes: on startup, stale agent directories are cleaned up.
+ * Sending to offline agents is rejected — mailboxes only exist for active sessions.
  *
  * Environment:
  *   CC2CC_BRIDGE_DIR / BRIDGE_DIR — path to bridge root (default: ~/.cc2cc)
@@ -18,7 +21,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readdir, readFile, rename, mkdir, writeFile, stat } from "fs/promises";
+import { readdir, readFile, rename, mkdir, writeFile, stat, rm } from "fs/promises";
 import { join, basename, dirname } from "path";
 import { randomUUID } from "crypto";
 import { generateUniqueName, validateName, takenNames } from "./names.mjs";
@@ -164,6 +167,14 @@ const server = new Server(
   {
     name: "cc2cc_channel",
     version: "3.0.0",
+    instructions: [
+      "You are connected to CC2CC — an agent-to-agent communication bridge.",
+      "Other agents can send you messages. Incoming messages appear as INCOMING MESSAGES blocks in tool responses.",
+      "IMPORTANT: When you see INCOMING MESSAGES, you MUST react to them — read, respond, or act on tasks.",
+      "Use check_inbox periodically (every few interactions) to see if anyone sent you something.",
+      "Use send/reply/broadcast to communicate. Use list_agents to see who is online.",
+      "If a message is a task, execute it and reply with the result.",
+    ].join(" "),
   },
   {
     capabilities: {
@@ -243,6 +254,11 @@ const TOOLS = [
     },
   },
   {
+    name: "check_inbox",
+    description: "Check for new incoming messages. Also happens automatically on every other tool call.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
     name: "register",
     description: "Change this agent's name. Validates, renames directories, updates heartbeat, and notifies other agents.",
     inputSchema: {
@@ -268,22 +284,39 @@ server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
   const { name: toolName, arguments: args } = params;
 
   try {
+    let result;
     switch (toolName) {
       case "whoami":
-        return handleWhoami();
+        result = handleWhoami(); break;
       case "list_agents":
-        return handleListAgents();
+        result = handleListAgents(); break;
       case "send":
-        return await handleSend(args);
+        result = await handleSend(args); break;
       case "broadcast":
-        return await handleBroadcast(args);
+        result = await handleBroadcast(args); break;
       case "reply":
-        return await handleReply(args);
+        result = await handleReply(args); break;
+      case "check_inbox":
+        result = textResult("Inbox checked."); break;
       case "register":
-        return await handleRegister(args);
+        result = await handleRegister(args); break;
       default:
         return textResult(`Unknown tool: ${toolName}`, true);
     }
+
+    // Piggyback: consume inbox and append any pending messages to the response
+    const pending = await consumeInbox();
+    if (pending.length > 0) {
+      const pendingText = formatPendingMessages(pending);
+      // Append pending messages to the first text content block
+      if (result.content && result.content.length > 0 && result.content[0].type === "text") {
+        result.content[0].text += pendingText;
+      } else {
+        result.content.push({ type: "text", text: pendingText });
+      }
+    }
+
+    return result;
   } catch (err) {
     log("error", `tool ${toolName} failed`, { error: err.message });
     return textResult(`Error: ${err.message}`, true);
@@ -324,16 +357,17 @@ function handleListAgents() {
 async function handleSend({ to, text, type = "message", priority = "normal" }) {
   if (!to || !text) return textResult("Missing required fields: to, text", true);
 
+  if (!isAgentOnline(to)) {
+    return textResult(`Agent "${to}" is offline. Message not sent. Use list_agents to see who is online.`, true);
+  }
+
   const msg = buildMessage({ from: agentName, to, text, type, priority });
   const targetInbox = inboxDir(to);
   await mkdir(targetInbox, { recursive: true });
   await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
 
-  const online = isAgentOnline(to);
-  log("info", "message sent", { id: msg.id, to, online });
-
-  const status = online ? "delivered to inbox" : "queued (recipient offline)";
-  return textResult(`Sent ${msg.id} to ${to} — ${status}`);
+  log("info", "message sent", { id: msg.id, to });
+  return textResult(`Sent ${msg.id} to ${to} — delivered to inbox`);
 }
 
 // ── broadcast ──
@@ -341,9 +375,9 @@ async function handleSend({ to, text, type = "message", priority = "normal" }) {
 async function handleBroadcast({ text, priority = "normal" }) {
   if (!text) return textResult("Missing required field: text", true);
 
-  const targets = allAgentNames();
+  const targets = onlineAgentNames();
   if (targets.length === 0) {
-    return textResult("No other agents known. Nobody to broadcast to.");
+    return textResult("No other agents online. Nobody to broadcast to.");
   }
 
   const results = [];
@@ -488,10 +522,13 @@ async function handleRegister({ name: newName }) {
   return textResult(`Renamed from "${oldName}" to "${agentName}". ${targets.length} agents notified.`);
 }
 
-// ─── Inbox Polling ──────────────────────────────────────────────────────────
+// ─── Inbox: consume pending messages ────────────────────────────────────────
 
-async function drainInbox() {
-  // Collect files from primary inbox: to-{name}/inbox/
+/**
+ * Read all pending messages from inbox, move to done, return array of messages.
+ * Called on every tool invocation so the agent sees new messages immediately.
+ */
+async function consumeInbox() {
   const primary = inboxDir(agentName);
   await mkdir(primary, { recursive: true });
   await mkdir(doneDir(agentName), { recursive: true });
@@ -503,24 +540,22 @@ async function drainInbox() {
     const topDirs = await readdir(BRIDGE_DIR);
     for (const d of topDirs) {
       if (d.endsWith(`-to-${agentName}`) && d !== `to-${agentName}`) {
-        const legacyInbox = join(BRIDGE_DIR, d, "inbox");
-        inboxPaths.push(legacyInbox);
+        inboxPaths.push(join(BRIDGE_DIR, d, "inbox"));
       }
     }
   } catch { /* bridge dir may not exist yet */ }
+
+  const consumed = [];
 
   for (const inbox of inboxPaths) {
     let files;
     try {
       files = (await readdir(inbox)).filter((f) => f.endsWith(".json") && !f.startsWith(".tmp-"));
     } catch {
-      continue; // dir may not exist
+      continue;
     }
 
     for (const file of files) {
-      if (seenFiles.has(file)) continue;
-      seenFiles.add(file);
-
       try {
         const filePath = join(inbox, file);
         const raw = await readFile(filePath, "utf8");
@@ -530,7 +565,6 @@ async function drainInbox() {
         if (msg.timestamp && msg.ttl) {
           const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
           if (age > msg.ttl) {
-            // Expired — move to done, notify sender
             const done = doneDir(agentName);
             await mkdir(done, { recursive: true });
             await rename(filePath, join(done, file));
@@ -549,15 +583,109 @@ async function drainInbox() {
                 await atomicWrite(join(senderInbox, `${expNotice.id}.json`), expNotice);
               } catch { /* best effort */ }
             }
-
             log("info", "message expired", { id: msg.id, from: msg.from, ttl: msg.ttl });
             continue;
           }
         }
 
-        // Push channel notification
+        // Write delivery receipt
+        const receiptPath = receiptsDir(agentName);
+        await mkdir(receiptPath, { recursive: true });
+        await atomicWrite(join(receiptPath, `${msg.id}.receipt.json`), {
+          msg_id: msg.id,
+          delivered_at: new Date().toISOString(),
+          delivered_to: agentName,
+        });
+
+        // Move to done/
+        const done = doneDir(agentName);
+        await mkdir(done, { recursive: true });
+        await rename(filePath, join(done, file));
+
+        consumed.push(msg);
+        log("info", "message consumed", { id: msg.id, from: msg.from, type: msg.type });
+      } catch (err) {
+        log("error", "message processing failed", { file, error: err.message });
+      }
+    }
+  }
+
+  return consumed;
+}
+
+/**
+ * Format consumed messages as a text block to append to tool responses.
+ */
+function formatPendingMessages(messages) {
+  if (messages.length === 0) return "";
+
+  const lines = [
+    "",
+    "━━━ INCOMING MESSAGES ━━━",
+  ];
+  for (const msg of messages) {
+    const taskInfo = msg.task?.title ? ` [task: ${msg.task.title}]` : "";
+    const replyInfo = msg.replyTo ? ` (reply to ${msg.replyTo})` : "";
+    lines.push(`[${msg.id}] from ${msg.from} (${msg.type}${taskInfo}${replyInfo}):`);
+    lines.push(`  ${msg.content?.text || "(empty)"}`);
+  }
+  lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━");
+  lines.push("Reply using: reply(msg_id=\"...\", text=\"...\")");
+  return lines.join("\n");
+}
+
+// ─── Inbox Polling (real-time channel notifications) ─────────────────────────
+
+/**
+ * Poll inbox and push channel notifications for each new message.
+ * This runs on a timer so the agent sees messages immediately,
+ * without waiting for the next tool call (piggyback).
+ */
+async function pollInbox() {
+  const primary = inboxDir(agentName);
+  const inboxPaths = [primary];
+
+  // Also check legacy format
+  try {
+    const topDirs = await readdir(BRIDGE_DIR);
+    for (const d of topDirs) {
+      if (d.endsWith(`-to-${agentName}`) && d !== `to-${agentName}`) {
+        inboxPaths.push(join(BRIDGE_DIR, d, "inbox"));
+      }
+    }
+  } catch { /* bridge dir may not exist */ }
+
+  for (const inbox of inboxPaths) {
+    let files;
+    try {
+      files = (await readdir(inbox)).filter((f) => f.endsWith(".json") && !f.startsWith(".tmp-"));
+    } catch {
+      continue;
+    }
+
+    for (const file of files) {
+      if (seenFiles.has(file)) continue;
+      seenFiles.add(file);
+
+      try {
+        const filePath = join(inbox, file);
+        const raw = await readFile(filePath, "utf8");
+        const msg = JSON.parse(raw);
+
+        // TTL check
+        if (msg.timestamp && msg.ttl) {
+          const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
+          if (age > msg.ttl) {
+            await rename(filePath, join(doneDir(agentName), file));
+            log("info", "message expired (poll)", { id: msg.id });
+            continue;
+          }
+        }
+
+        // Push channel notification — this is what makes the agent react in real time
         const taskTitle = msg.task?.title ? `[${msg.task.title}] ` : "";
-        const content = `[from: ${msg.from}] [type: ${msg.type || "message"}] ${taskTitle}${msg.content?.text || ""}`;
+        const replyInfo = msg.replyTo ? ` (reply to ${msg.replyTo})` : "";
+        const content = `[${msg.id}] from ${msg.from} (${msg.type}${replyInfo}): ${taskTitle}${msg.content?.text || "(empty)"}`;
 
         await server.notification({
           method: "notifications/claude/channel",
@@ -572,24 +700,21 @@ async function drainInbox() {
           },
         });
 
-        log("info", "message delivered", { id: msg.id, from: msg.from, type: msg.type });
-
-        // Write delivery receipt
-        const receiptPath = receiptsDir(agentName);
-        await mkdir(receiptPath, { recursive: true });
-        const receipt = {
+        // Write receipt
+        await mkdir(receiptsDir(agentName), { recursive: true });
+        await atomicWrite(join(receiptsDir(agentName), `${msg.id}.receipt.json`), {
           msg_id: msg.id,
           delivered_at: new Date().toISOString(),
           delivered_to: agentName,
-        };
-        await atomicWrite(join(receiptPath, `${msg.id}.receipt.json`), receipt);
+        });
 
-        // Move to done/
-        const done = doneDir(agentName);
-        await mkdir(done, { recursive: true });
-        await rename(filePath, join(done, file));
+        // Move to done
+        await mkdir(doneDir(agentName), { recursive: true });
+        await rename(filePath, join(doneDir(agentName), file));
+
+        log("info", "message delivered via poll", { id: msg.id, from: msg.from });
       } catch (err) {
-        log("error", "message processing failed", { file, error: err.message });
+        log("error", "poll message failed", { file, error: err.message });
       }
     }
   }
@@ -666,6 +791,82 @@ async function pollStatus() {
   knownAgents = newAgents;
 }
 
+// ─── Stale Mailbox Cleanup ───────────────────────────────────────────────────
+
+/**
+ * Remove mailbox directories and heartbeat files for all inactive agents.
+ * Called once at startup to prevent unbounded directory growth.
+ */
+async function cleanupStaleMailboxes() {
+  const sDir = statusDir();
+  let heartbeatFiles;
+  try {
+    heartbeatFiles = (await readdir(sDir)).filter((f) => f.endsWith("-heartbeat.json"));
+  } catch {
+    return; // no status dir yet
+  }
+
+  for (const file of heartbeatFiles) {
+    try {
+      const raw = await readFile(join(sDir, file), "utf8");
+      const hb = JSON.parse(raw);
+      const name = hb.agent || hb.name;
+      if (!name) continue;
+
+      // Skip our own name (not yet written, but could match SELF env)
+      if (name === agentName) continue;
+
+      // Only clean up inactive agents
+      const active = hb.status === "active" && !isStale(hb);
+      if (active) continue;
+
+      // Remove mailbox directory
+      const mailboxPath = join(BRIDGE_DIR, `to-${name}`);
+      try {
+        await rm(mailboxPath, { recursive: true, force: true });
+        log("info", "cleaned up stale mailbox", { agent: name, path: mailboxPath });
+      } catch { /* already gone */ }
+
+      // Remove heartbeat file
+      try {
+        await rm(join(sDir, file), { force: true });
+        log("info", "cleaned up stale heartbeat", { agent: name });
+      } catch { /* already gone */ }
+    } catch (err) {
+      log("warn", "cleanup error", { file, error: err.message });
+    }
+  }
+
+  // Also clean up orphan mailbox dirs with no heartbeat
+  try {
+    const topDirs = await readdir(BRIDGE_DIR);
+    const activeNames = new Set();
+    for (const file of heartbeatFiles) {
+      try {
+        const raw = await readFile(join(sDir, file), "utf8");
+        const hb = JSON.parse(raw);
+        const name = hb.agent || hb.name;
+        if (name && hb.status === "active" && !isStale(hb)) {
+          activeNames.add(name);
+        }
+      } catch { /* skip */ }
+    }
+    activeNames.add(agentName);
+
+    for (const d of topDirs) {
+      if (!d.startsWith("to-")) continue;
+      const name = d.slice(3); // strip "to-" prefix
+      if (activeNames.has(name)) continue;
+
+      const mailboxPath = join(BRIDGE_DIR, d);
+      try {
+        await rm(mailboxPath, { recursive: true, force: true });
+        log("info", "cleaned up orphan mailbox", { dir: d });
+      } catch { /* skip */ }
+    }
+  } catch { /* bridge dir may not exist */ }
+}
+
 // ─── Graceful Shutdown ──────────────────────────────────────────────────────
 
 async function shutdown(signal) {
@@ -699,25 +900,28 @@ async function init() {
     log("info", "generated unique name", { name: agentName });
   }
 
-  // 2. Create directories
+  // 2. Clean up stale mailboxes from previous sessions
+  await cleanupStaleMailboxes();
+
+  // 3. Create directories
   await mkdir(inboxDir(agentName), { recursive: true });
   await mkdir(doneDir(agentName), { recursive: true });
   await mkdir(receiptsDir(agentName), { recursive: true });
   await mkdir(statusDir(), { recursive: true });
 
-  // 3. Write initial heartbeat
+  // 4. Write initial heartbeat
   await writeHeartbeat("active", "session started");
 
-  // 4. Initial status poll to discover existing agents
+  // 5. Initial status poll to discover existing agents
   await pollStatus();
 
-  // 5. Start polling loops
-  pollTimer = setInterval(drainInbox, POLL_MS);
+  // 6. Start polling loops
+  pollTimer = setInterval(pollInbox, POLL_MS);
   statusTimer = setInterval(pollStatus, POLL_MS);
   heartbeatTimer = setInterval(() => writeHeartbeat("active", "heartbeat"), HEARTBEAT_INTERVAL_MS);
 
-  // 6. Initial inbox drain
-  await drainInbox();
+  // 7. Initial inbox drain
+  await pollInbox();
 
   log("info", "server started", {
     name: agentName,
@@ -727,7 +931,7 @@ async function init() {
     online_agents: onlineAgentNames(),
   });
 
-  // 7. Connect MCP transport
+  // 8. Connect MCP transport
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
