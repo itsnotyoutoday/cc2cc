@@ -603,6 +603,9 @@ async function consumeInbox() {
         await mkdir(done, { recursive: true });
         await rename(filePath, join(done, file));
 
+        // Mark as seen so pollInbox won't re-notify
+        seenFiles.add(file);
+
         consumed.push(msg);
         log("info", "message consumed", { id: msg.id, from: msg.from, type: msg.type });
       } catch (err) {
@@ -704,17 +707,22 @@ async function pollInbox() {
         const raw = await readFile(filePath, "utf8");
         const msg = JSON.parse(raw);
 
-        // TTL check
+        // TTL check — expired messages are moved to done immediately
         if (msg.timestamp && msg.ttl) {
           const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
           if (age > msg.ttl) {
+            await mkdir(doneDir(agentName), { recursive: true });
             await rename(filePath, join(doneDir(agentName), file));
             log("info", "message expired (poll)", { id: msg.id });
             continue;
           }
         }
 
-        // Push channel notification — this is what makes the agent react in real time
+        // Push channel notification — real-time delivery attempt.
+        // NOTE: Do NOT move to done here. consumeInbox() handles
+        // the actual consumption (move to done, receipts) on the next
+        // tool call, so the piggyback mechanism always works even if
+        // channel notifications are not supported by the client.
         const content = formatNotification(msg);
 
         await server.notification({
@@ -730,21 +738,9 @@ async function pollInbox() {
           },
         });
 
-        // Write receipt
-        await mkdir(receiptsDir(agentName), { recursive: true });
-        await atomicWrite(join(receiptsDir(agentName), `${msg.id}.receipt.json`), {
-          msg_id: msg.id,
-          delivered_at: new Date().toISOString(),
-          delivered_to: agentName,
-        });
-
-        // Move to done
-        await mkdir(doneDir(agentName), { recursive: true });
-        await rename(filePath, join(doneDir(agentName), file));
-
-        log("info", "message delivered via poll", { id: msg.id, from: msg.from });
+        log("info", "notification pushed (file stays in inbox for piggyback)", { id: msg.id, from: msg.from });
       } catch (err) {
-        log("error", "poll message failed", { file, error: err.message });
+        log("error", "poll notification failed", { file, error: err.message });
       }
     }
   }
