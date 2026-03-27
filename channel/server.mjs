@@ -41,6 +41,7 @@ const BRIDGE_DIR =
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let agentName = null; // set during init
+let notificationRules = null; // loaded from rules.json
 const onlineSince = new Date().toISOString();
 const sessionId = String(process.pid);
 const seenFiles = new Set();
@@ -634,6 +635,37 @@ function formatPendingMessages(messages) {
   return lines.join("\n");
 }
 
+// ─── Notification Rules ──────────────────────────────────────────────────────
+
+/** Load notification rules from BRIDGE_DIR/rules.json */
+async function loadRules() {
+  const rulesPath = join(BRIDGE_DIR, "rules.json");
+  try {
+    const raw = await readFile(rulesPath, "utf8");
+    notificationRules = JSON.parse(raw);
+    log("info", "loaded notification rules", { version: notificationRules.version });
+  } catch {
+    log("info", "no rules.json found, notifications will have no instructions");
+  }
+}
+
+/** Format a channel notification from a message and rules */
+function formatNotification(msg) {
+  const type = msg.type || "message";
+  const text = msg.content?.text || "(empty)";
+  const taskTitle = msg.task?.title ? `\nTask: ${msg.task.title}` : "";
+  const replyInfo = msg.replyTo ? ` (reply to ${msg.replyTo})` : "";
+
+  let content = `📨 CC2CC Message\nFrom: ${msg.from}\nType: ${type}${replyInfo}${taskTitle}\nContent: ${text}`;
+
+  const rule = notificationRules?.default;
+  if (rule?.instruction) {
+    content += `\n\n>> ${rule.instruction} Use msg_id: ${msg.id}`;
+  }
+
+  return content;
+}
+
 // ─── Inbox Polling (real-time channel notifications) ─────────────────────────
 
 /**
@@ -683,9 +715,7 @@ async function pollInbox() {
         }
 
         // Push channel notification — this is what makes the agent react in real time
-        const taskTitle = msg.task?.title ? `[${msg.task.title}] ` : "";
-        const replyInfo = msg.replyTo ? ` (reply to ${msg.replyTo})` : "";
-        const content = `[${msg.id}] from ${msg.from} (${msg.type}${replyInfo}): ${taskTitle}${msg.content?.text || "(empty)"}`;
+        const content = formatNotification(msg);
 
         await server.notification({
           method: "notifications/claude/channel",
@@ -900,27 +930,30 @@ async function init() {
     log("info", "generated unique name", { name: agentName });
   }
 
-  // 2. Clean up stale mailboxes from previous sessions
+  // 2. Load notification rules
+  await loadRules();
+
+  // 3. Clean up stale mailboxes from previous sessions
   await cleanupStaleMailboxes();
 
-  // 3. Create directories
+  // 4. Create directories
   await mkdir(inboxDir(agentName), { recursive: true });
   await mkdir(doneDir(agentName), { recursive: true });
   await mkdir(receiptsDir(agentName), { recursive: true });
   await mkdir(statusDir(), { recursive: true });
 
-  // 4. Write initial heartbeat
+  // 5. Write initial heartbeat
   await writeHeartbeat("active", "session started");
 
-  // 5. Initial status poll to discover existing agents
+  // 6. Initial status poll to discover existing agents
   await pollStatus();
 
-  // 6. Start polling loops
+  // 7. Start polling loops
   pollTimer = setInterval(pollInbox, POLL_MS);
   statusTimer = setInterval(pollStatus, POLL_MS);
   heartbeatTimer = setInterval(() => writeHeartbeat("active", "heartbeat"), HEARTBEAT_INTERVAL_MS);
 
-  // 7. Initial inbox drain
+  // 8. Initial inbox drain
   await pollInbox();
 
   log("info", "server started", {
@@ -931,7 +964,7 @@ async function init() {
     online_agents: onlineAgentNames(),
   });
 
-  // 8. Connect MCP transport
+  // 9. Connect MCP transport
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

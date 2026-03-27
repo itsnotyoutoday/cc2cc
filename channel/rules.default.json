@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "default": {
+    "instruction": "Reply to this message as soon as possible using the reply tool.",
+    "priority": "normal"
+  }
+}
