@@ -18,21 +18,18 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 ```
 ┌─────────────────┐                              ┌─────────────────┐
 │  Claude Code A   │                              │  Claude Code B   │
-│  (e.g. "alpha")  │                              │  (e.g. "beta")   │
-│                  │   ┌──────────────────────┐   │                  │
-│  MCP Channel ◄───┼───┤  alpha-channel/      │   │                  │
-│  Server (polls)  │   │  server.mjs          │   │                  │
-│                  │   └──────────────────────┘   │                  │
+│  (auto: brave-fox)│                             │  (auto: calm-owl)│
 │                  │                              │                  │
-│  send.py ────────┼──► alpha-to-beta/inbox/ ─────┼──► receive.sh   │
-│                  │                              │  MCP Channel ◄──┤
-│  receive.sh ◄────┼─── beta-to-alpha/inbox/ ◄────┼─── send.py     │
-│                  │                              │                  │
-│  Hooks:          │   ┌──────────────────────┐   │  Hooks:          │
-│  SessionStart    │   │  status/             │   │  SessionStart    │
-│  SessionEnd      │   │  alpha-heartbeat.json│   │  SessionEnd      │
-│                  │   │  beta-heartbeat.json │   │                  │
-└─────────────────┘   └──────────────────────┘   └─────────────────┘
+│  MCP Server ◄────┼─── to-brave-fox/inbox/ ◄─────┼── send tool     │
+│  (polls inbox)   │                              │                  │
+│  send tool ──────┼──► to-calm-owl/inbox/ ───────┼──► MCP Server   │
+│                  │                              │  (polls inbox)   │
+│  Tools:          │    status/                   │  Tools:          │
+│  send, broadcast │    brave-fox-heartbeat.json  │  send, broadcast │
+│  reply, register │    calm-owl-heartbeat.json   │  reply, register │
+│  list_agents     │                              │  list_agents     │
+│  whoami          │                              │  whoami          │
+└─────────────────┘                              └─────────────────┘
 ```
 
 **How it works:** Agent A drops a JSON file into an inbox directory. Agent B's MCP server polls that directory, reads the message, and pushes it into B's session as a channel notification. B replies using an MCP tool, which writes a response back into A's inbox. Messages for offline agents wait in the inbox and get delivered on the next session start.
@@ -43,7 +40,6 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 - Node.js ≥ 18 (for the MCP channel server)
 - Python 3.8+ (for scripts)
 - *(Optional)* `watchdog` for real-time inbox watching (`pip install watchdog`)
-- *(Optional)* `pip install -e .` for the unified `cc2cc` CLI
 
 ## Quick Start
 
@@ -52,111 +48,59 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 ```bash
 git clone https://github.com/non4me/cc2cc.git
 cd cc2cc
-```
-
-**Option A: pip install (recommended)**
-
-```bash
 pip install -e .
-cc2cc init alpha beta ~/.cc2cc
+cc2cc init
 ```
 
-**Option B: direct scripts**
+### 2. Configure Claude Code
 
-```bash
-python scripts/init.py alpha beta ~/.cc2cc
-```
-
-### 2. Configure Claude Code (both instances)
-
-**Agent Alpha** — add to `~/.claude/settings.json`:
+Add to `~/.claude/settings.json`:
 
 ```json
 {
   "mcpServers": {
-    "peer_channel": {
+    "cc2cc": {
       "command": "node",
-      "args": ["~/.cc2cc/alpha-channel/server.mjs"],
+      "args": ["~/.cc2cc/server.mjs"],
       "env": {
-        "BRIDGE_DIR": "~/.cc2cc",
-        "SELF": "alpha",
-        "PEER": "beta"
+        "CC2CC_BRIDGE_DIR": "~/.cc2cc"
       }
     }
-  },
-  "channelsEnabled": true,
-  "hooks": {
-    "SessionStart": [
-      {
-        "type": "command",
-        "command": "python ~/.cc2cc/hooks/session_start.py",
-        "env": { "CC2CC_SELF": "alpha", "CC2CC_BRIDGE_DIR": "~/.cc2cc" }
-      }
-    ],
-    "SessionEnd": [
-      {
-        "type": "command",
-        "command": "python ~/.cc2cc/hooks/session_end.py",
-        "env": { "CC2CC_SELF": "alpha", "CC2CC_BRIDGE_DIR": "~/.cc2cc" }
-      }
-    ]
   }
 }
 ```
 
-**Agent Beta** — same config but swap `SELF`/`PEER` and channel path.
+That's it. Every Claude Code instance you open will auto-register with a unique name and discover other agents automatically.
 
-> **Note:** `channelsEnabled` is an experimental Claude Code feature. If it's not available in your version, messages still accumulate in the inbox and get reported via the SessionStart hook.
-
-### 3. Send a message
-
-**Option A: pip install**
+### 3. Open two terminals
 
 ```bash
-cc2cc send alpha beta message "Deploy is ready, please review"
+# Terminal 1
+claude
+# You'll see: [cc2cc] You are brave-fox. No other agents online
+
+# Terminal 2
+claude
+# You'll see: [cc2cc] You are calm-owl. Online agents: brave-fox
+# Terminal 1 sees: [cc2cc] calm-owl joined
 ```
 
-**Option B: direct scripts**
+### 4. Communicate (from inside Claude Code)
 
-```bash
-python scripts/send.py alpha beta message "Deploy is ready, please review"
-```
-
-Or from inside a Claude Code session — the reply tool appears automatically:
-```
-reply(msg_id="msg-abc123", text="Got it, deploying now")
-```
-
-### 4. Delegate a task
-
-```bash
-python scripts/task.py alpha beta "Run tests" "Execute integration test suite, report failures"
-```
-
-### 5. Check bridge status
-
-**Option A: pip install**
-
-```bash
-cc2cc status
-# ● alpha: active (2m ago)
-# ● beta: active (45s ago)
-# alpha-to-beta: 0 pending, 12 processed
-# beta-to-alpha: 1 pending, 8 processed
-```
-
-**Option B: direct scripts**
-
-```bash
-python scripts/status.py
-```
+The agent can use MCP tools directly:
+- `send(to="brave-fox", text="Hello!")` — send to specific agent
+- `broadcast(text="Deploy starting")` — send to all
+- `reply(msg_id="msg-xxx", text="Got it")` — reply to a message
+- `list_agents()` — see who's online
+- `whoami()` — check your name
+- `register(name="devops")` — change your name
 
 ## CC2CC vs Google A2A
 
 | Feature | Google A2A | CC2CC |
 |---------|-----------|-------|
 | Transport | HTTP | Filesystem |
-| Setup | Service discovery, auth, endpoints | `init.py alpha beta` |
+| Setup | Service discovery, auth, endpoints | `cc2cc init` |
 | Dependencies | HTTP server per agent | Node.js (MCP server only) |
 | Offline delivery | Requires message broker | Built-in (files wait in inbox) |
 | Same-machine agents | Overkill | Purpose-built |
@@ -175,7 +119,8 @@ cc2cc/
 │   └── cli.py                  # Unified CLI entry point
 ├── pyproject.toml              # pip installable package
 ├── channel/
-│   ├── server.mjs           # MCP channel server (polls inbox, pushes to session)
+│   ├── server.mjs           # Unified MCP server (dynamic identity, multi-agent)
+│   ├── names.mjs            # Name generation (adjective-animal dictionary)
 │   └── package.json
 ├── scripts/
 │   ├── init.py              # Bootstrap the bridge

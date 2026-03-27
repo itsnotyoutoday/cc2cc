@@ -5,23 +5,18 @@
 ```
 ~/.cc2cc/                          # Bridge root (configurable)
 ├── secret.key                     # HMAC-SHA256 shared secret
-├── alpha-to-beta/
-│   ├── inbox/                     # Pending messages: alpha → beta
+├── server.mjs                     # Unified MCP server (single copy, shared by all agents)
+├── to-brave-fox/
+│   ├── inbox/                     # Pending messages addressed to brave-fox
 │   ├── done/                      # Processed messages (archive)
 │   └── receipts/                  # Delivery receipts
-├── beta-to-alpha/
-│   ├── inbox/                     # Pending messages: beta → alpha
+├── to-calm-owl/
+│   ├── inbox/                     # Pending messages addressed to calm-owl
 │   ├── done/                      # Processed messages (archive)
 │   └── receipts/                  # Delivery receipts
 ├── status/
-│   ├── alpha-heartbeat.json       # Agent Alpha status
-│   └── beta-heartbeat.json        # Agent Beta status
-├── alpha-channel/
-│   ├── server.mjs                 # MCP server for Alpha
-│   └── package.json
-├── beta-channel/
-│   ├── server.mjs                 # MCP server for Beta
-│   └── package.json
+│   ├── brave-fox-heartbeat.json   # Agent brave-fox status
+│   └── calm-owl-heartbeat.json    # Agent calm-owl status
 ├── hooks/
 │   ├── session-start.py
 │   ├── session-end.py
@@ -36,6 +31,8 @@
     ├── validate.py
     └── cleanup.py
 ```
+
+> **Backwards compatibility:** The old `alpha-to-beta/` directory format (v1.x) is no longer created by `cc2cc init`. Existing bridges using the old format will continue to work if the directories are present, but new installs use the `to-{name}/` format.
 
 ---
 
@@ -206,17 +203,13 @@ Heartbeats are overwritten (not appended) on each session start/end. An agent is
 
 ## Scaling to N Agents
 
-The bridge scales to any number of agents. For 3 agents (alpha, beta, gamma):
+The bridge scales to any number of agents with a single init call:
 
 ```bash
-python scripts/init.py alpha beta ~/.cc2cc
-python scripts/init.py alpha gamma ~/.cc2cc
-python scripts/init.py beta gamma ~/.cc2cc
+cc2cc init
 ```
 
-Each agent gets one MCP server that watches **all** inboxes addressed to it. The server env needs the primary peer for the `reply` tool, but it reads from all `*-to-{SELF}/inbox/` directories.
-
-For N agents, you need N×(N-1)/2 init calls (one per pair).
+Each Claude Code instance runs the same `server.mjs` and auto-registers with a unique name on startup. The server polls `to-{self}/inbox/` for incoming messages and discovers peers by scanning `status/*-heartbeat.json` files. Adding a new agent requires no reconfiguration — just open a new Claude Code session.
 
 ---
 

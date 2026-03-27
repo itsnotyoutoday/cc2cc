@@ -5,55 +5,47 @@
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CC2CC_BRIDGE_DIR` | `~/.cc2cc` | Bridge root directory |
-| `CC2CC_SELF` | `$(hostname -s)` | This agent's ID |
-| `CC2CC_PEER` | — | Peer agent's ID |
-| `BRIDGE_DIR` | `~/.cc2cc` | Used by MCP server |
-| `SELF` | `alpha` | Used by MCP server |
-| `PEER` | `beta` | Used by MCP server |
+| `CC2CC_SELF` | — | This agent's name (used by hooks). Optional — if set, the server uses it instead of auto-generating a name. |
+
+> **Note:** `SELF`, `PEER`, and `CC2CC_PEER` are no longer used. The unified MCP server auto-generates agent names and discovers peers dynamically.
 
 ---
 
 ## Full settings.json Example
 
-For Agent Alpha with all features enabled:
+Add a single MCP server entry — no per-agent copies needed:
 
 ```json
 {
   "mcpServers": {
-    "peer_channel": {
+    "cc2cc": {
       "command": "node",
-      "args": ["/Users/you/.cc2cc/alpha-channel/server.mjs"],
+      "args": ["/Users/you/.cc2cc/server.mjs"],
       "env": {
-        "BRIDGE_DIR": "/Users/you/.cc2cc",
-        "SELF": "alpha",
-        "PEER": "beta"
+        "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc"
       }
     }
   },
-  "channelsEnabled": true,
   "hooks": {
     "SessionStart": [
       {
         "type": "command",
         "command": "python /Users/you/.cc2cc/hooks/session_start.py",
-        "env": { "CC2CC_SELF": "alpha", "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc" }
+        "env": { "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc" }
       }
     ],
     "SessionEnd": [
       {
         "type": "command",
         "command": "python /Users/you/.cc2cc/hooks/session_end.py",
-        "env": { "CC2CC_SELF": "alpha", "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc" }
+        "env": { "CC2CC_BRIDGE_DIR": "/Users/you/.cc2cc" }
       }
     ]
   }
 }
 ```
 
-For Agent Beta — same structure, but:
-- Channel args: `beta-channel/server.mjs`
-- `SELF`: `"beta"`, `PEER`: `"alpha"`
-- Hook env: `"CC2CC_SELF": "beta"`
+This same configuration is used by every Claude Code instance. Each instance auto-registers with a unique name (e.g. `brave-fox`, `calm-owl`) on startup.
 
 ---
 
