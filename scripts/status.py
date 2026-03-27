@@ -39,7 +39,7 @@ def main():
 
             ts = datetime.fromisoformat(hb["timestamp"].replace("Z", "+00:00"))
             age = (datetime.now(timezone.utc) - ts).total_seconds()
-            indicator = "\u25cf" if age < 600 else "\u25cb"
+            indicator = "\u25cf" if age < 30 else "\u25cb"
             print(f"{indicator} {hb['agent']}: {hb['status']} ({format_age(age)})")
             if hb.get("context"):
                 print(f"  Context: {hb['context']}")

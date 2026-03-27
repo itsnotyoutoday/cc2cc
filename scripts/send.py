@@ -35,7 +35,7 @@ def main():
     mode = sys.argv[6] if len(sys.argv) > 6 else "session"
 
     bridge = bridge_path()
-    inbox = bridge / f"{sender}-to-{recipient}" / "inbox"
+    inbox = bridge / f"to-{recipient}" / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
 
     msg_id = f"msg-{uuid.uuid4()}"
@@ -58,7 +58,7 @@ def main():
         msg = sign_message(msg, secret)
 
     atomic_write(inbox / f"{msg_id}.json", msg)
-    print(f"Sent {msg_id} → {recipient}")
+    print(f"Sent {msg_id} -> {recipient}")
 
 
 if __name__ == "__main__":

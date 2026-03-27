@@ -33,7 +33,7 @@ def main():
     mode = sys.argv[6] if len(sys.argv) > 6 else "session"
 
     bridge = bridge_path()
-    inbox = bridge / f"{sender}-to-{recipient}" / "inbox"
+    inbox = bridge / f"to-{recipient}" / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
 
     msg_id = f"msg-{uuid.uuid4()}"

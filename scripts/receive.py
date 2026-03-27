@@ -27,7 +27,13 @@ def main():
     bridge = Path(os.environ.get("CC2CC_BRIDGE_DIR", os.path.expanduser("~/.cc2cc")))
     secret = _load_secret(bridge)
 
-    for inbox in bridge.glob(f"*-to-{agent}/inbox"):
+    inboxes = []
+    new_inbox = bridge / f"to-{agent}" / "inbox"
+    if new_inbox.is_dir():
+        inboxes.append(new_inbox)
+    inboxes.extend(bridge.glob(f"*-to-{agent}/inbox"))
+
+    for inbox in inboxes:
         for fp in sorted(inbox.glob("*.json")):
             try:
                 msg = json.loads(fp.read_text(encoding="utf-8"))

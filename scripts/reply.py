@@ -86,12 +86,12 @@ def main():
     if secret:
         msg = sign_message(msg, secret)
 
-    inbox = bridge / f"{sender}-to-{recipient}" / "inbox"
+    inbox = bridge / f"to-{recipient}" / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     atomic_write(inbox / f"{msg_id}.json", msg)
 
     print(
-        f"Replied {msg_id} → {recipient}" + (" [task completed]" if task else "")
+        f"Replied {msg_id} -> {recipient}" + (" [task completed]" if task else "")
     )
 
 
