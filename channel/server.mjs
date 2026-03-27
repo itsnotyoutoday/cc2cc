@@ -29,8 +29,8 @@ import { generateUniqueName, validateName, takenNames } from "./names.mjs";
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const POLL_MS = 3000;
-const HEARTBEAT_INTERVAL_MS = 15000;
-const HEARTBEAT_STALE_S = 30;
+const HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_STALE_S = 15;
 const SEEN_FILES_CAP = 500;
 const DEFAULT_TTL = 3600;
 
