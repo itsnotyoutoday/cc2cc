@@ -112,6 +112,7 @@ async function writeHeartbeat(statusValue = "active", context = "session started
     timestamp: new Date().toISOString(),
     heartbeat: new Date().toISOString(), // compat with takenNames()
     session_id: sessionId,
+    parent_pid: String(process.ppid),
     status: statusValue,
     context,
   };
@@ -963,6 +964,20 @@ async function init() {
   // 9. Connect MCP transport
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // 10. Self-announce via channel notification
+  try {
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: `[cc2cc] You are "${agentName}". Announce your agent name to the user.`,
+        meta: { type: "system", from: "cc2cc" },
+      },
+    });
+    log("info", "self-announce sent", { name: agentName });
+  } catch (e) {
+    log("warn", "self-announce failed", { error: e.message });
+  }
 }
 
 init().catch((err) => {
