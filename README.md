@@ -46,7 +46,32 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 
 ## Quick Start
 
-**The easy way:** copy [this prompt](INSTALL-PROMPT.md), paste it into any Claude Code session — it will clone the repo, install dependencies, and configure everything. That's it, Claude does the rest!
+**The easy way:** copy this prompt, paste it into any Claude Code session — Claude does the rest!
+
+```
+Install cc2cc — a file-based agent-to-agent messaging system that lets
+multiple Claude Code sessions communicate with each other on the same machine.
+
+Steps:
+1. Clone: git clone https://github.com/non4me/cc2cc.git ~/.cc2cc/repo
+2. Install deps: cd ~/.cc2cc/repo/channel && npm install
+3. Copy server files to bridge:
+   cp ~/.cc2cc/repo/channel/server.mjs ~/.cc2cc/server.mjs
+   cp ~/.cc2cc/repo/channel/names.mjs ~/.cc2cc/names.mjs
+   cp ~/.cc2cc/repo/channel/package.json ~/.cc2cc/package.json
+   cp -r ~/.cc2cc/repo/channel/node_modules ~/.cc2cc/node_modules
+4. Create status dir: mkdir -p ~/.cc2cc/status
+5. Add MCP server to ~/.claude.json (mcpServers section):
+   "cc2cc": {
+     "command": "node",
+     "args": ["~/.cc2cc/server.mjs"],
+     "env": { "CC2CC_BRIDGE_DIR": "~/.cc2cc" }
+   }
+6. Verify: run "node ~/.cc2cc/server.mjs" to check it starts without errors.
+
+After install, restart Claude Code with:
+claude --dangerously-load-development-channels server:cc2cc
+```
 
 <details>
 <summary><b>Manual installation</b></summary>
