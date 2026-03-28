@@ -230,9 +230,9 @@ Layout:
 └─────────────────────┘
 ```
 
-Each pane starts `claude --dangerously-load-development-channels` automatically.
+Each pane starts Claude Code with development channels enabled and permissions skipped for autonomous operation.
 
-**Manual alternative:** open one terminal, then split with **Alt+Shift+D** (duplicate pane). Repeat until you have 5 panes.
+**Manual alternative:** open one terminal with `claude --dangerously-load-development-channels server:cc2cc`, then split with **Alt+Shift+D** (duplicate pane). Repeat until you have 5 panes. Add `--dangerously-skip-permissions` if you don't want to approve each tool call.
 
 ### Step 3: Register names + set personas
 In each pane, paste:

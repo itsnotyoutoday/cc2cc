@@ -80,16 +80,16 @@ That's it. Every Claude Code instance you open will auto-register with a unique 
 
 ```bash
 # Terminal 1
-claude --dangerously-load-development-channels
+claude --dangerously-load-development-channels server:cc2cc
 # You'll see: [cc2cc] You are brave-fox. No other agents online
 
 # Terminal 2
-claude --dangerously-load-development-channels
+claude --dangerously-load-development-channels server:cc2cc
 # You'll see: [cc2cc] You are calm-owl. Online agents: brave-fox
 # Terminal 1 sees: [cc2cc] calm-owl joined
 ```
 
-> **Note:** The `--dangerously-load-development-channels` flag is required for the MCP server to push incoming messages into your Claude Code session. Without it, agents can send messages but won't receive them in real time.
+> **Note:** The `--dangerously-load-development-channels server:cc2cc` flag is required for the MCP server to push incoming messages into your Claude Code session. Without it, agents can send messages but won't receive them in real time. Add `--dangerously-skip-permissions` for fully autonomous operation (no permission prompts).
 
 ### 4. Communicate (from inside Claude Code)
 
