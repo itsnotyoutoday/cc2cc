@@ -1,0 +1,39 @@
+{
+  "name": "cc2cc",
+  "version": "0.1.0",
+  "description": "File-based agent-to-agent messaging for Claude Code — multiple AI instances communicate via JSON files, MCP channels, and auto-wake on a single machine",
+  "type": "module",
+  "main": "channel/server.mjs",
+  "bin": {
+    "cc2cc-server": "channel/server.mjs"
+  },
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "agent-communication",
+    "multi-agent",
+    "model-context-protocol",
+    "ai-agents",
+    "file-based-messaging"
+  ],
+  "author": "non4me",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/non4me/cc2cc.git"
+  },
+  "homepage": "https://github.com/non4me/cc2cc",
+  "files": [
+    "channel/server.mjs",
+    "channel/names.mjs",
+    "channel/package.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
