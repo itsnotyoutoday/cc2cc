@@ -61,6 +61,12 @@ runs `whoami`, announces itself — all autonomously.
 - **Fallback noise**: both wake stages fire, fallback creates a redundant
   system message in chat (cosmetic, not functional)
 
+### Orphan Cleanup (added 2026-03-28)
+- MCP reconnects (e.g., context pressure) spawn a new server with a new name
+- Old heartbeat + mailbox remain as ghosts in `status/` and `to-{name}/`
+- `cleanupStaleMailboxes()` now detects same `parent_pid` → removes orphans
+- Reported by proud-deer (4 incarnations in one session: proud-wasp → pure-crow → clear-moth → proud-deer)
+
 ## Ideas & Future Directions
 
 ### Offline Message Queue
@@ -150,3 +156,21 @@ and completes the full boot sequence. No external process needed.
 - Both stages fired — fallback created redundant message (cosmetic issue)
 - StatusLine immediately correct: `▸pure-crab, clear-swan`
 - **Status: WORKING** — deployed to `~/.cc2cc/server.mjs` and `channel/server.mjs`
+
+### 2026-03-28 — Cross-Platform Fixes & Orphan Cleanup
+- **Windows compatibility:** 4 critical + 5 moderate fixes
+  - `retryRename()` in server.mjs — handles AV file locking (EPERM/EACCES)
+  - `process.on("exit")` — sync offline heartbeat when SIGTERM never fires
+  - `shutil.which("npm")` — resolves npm.cmd on Windows
+  - `os.replace` instead of `os.rename` in cleanup.py
+  - `retry_replace()` in core.py — same retry pattern for Python
+  - `encoding="utf-8"` on all `open()` calls
+  - Proper file handle closing in validate.py
+  - `os.homedir()` fallback in server.mjs
+  - `os.replace` with retry in receive.py
+- **Orphan cleanup (parent_pid):** proud-deer reported 4 MCP reconnects in one
+  session, each leaving ghost heartbeat + mailbox. `cleanupStaleMailboxes()` now
+  detects heartbeats with same `parent_pid` as current process and removes them.
+- **Multi-agent discussion:** 4 agents (sharp-deer, bright-dove, free-newt,
+  proud-deer) held 5 topic rounds with unanimous consensus — validated real-time
+  multi-agent deliberation over cc2cc channel push.

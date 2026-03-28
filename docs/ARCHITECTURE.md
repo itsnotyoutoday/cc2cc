@@ -392,6 +392,17 @@ Written by MCP server after successful push to Claude Code session.
 - Agent online/offline events are **not** pushed to chat
 - Presence is reflected only in the statusline (reads heartbeat files from disk)
 
+**Orphan Cleanup (parent_pid-based):**
+- On startup, `cleanupStaleMailboxes()` scans all heartbeat files
+- Heartbeats sharing the same `parent_pid` as the current process are orphans from MCP reconnects (same Claude Code session spawned a new server)
+- Orphan heartbeats and their mailbox directories are removed even if not yet stale by time
+- Also cleans up stale heartbeats (>15s old) and orphan mailbox dirs with no heartbeat
+
+**Cross-Platform (Windows):**
+- `retryRename()` wrapper handles EPERM/EACCES from antivirus file locking (5 retries, 50ms backoff)
+- `process.on("exit")` writes offline heartbeat synchronously when SIGTERM is not emitted
+- `os.homedir()` fallback when HOME/USERPROFILE are both undefined
+
 **Logging:**
 - Structured JSON to stderr (stdout is MCP transport)
 - Fields: `ts`, `level`, `server`, `msg`, plus contextual data
