@@ -855,6 +855,8 @@ async function cleanupStaleMailboxes() {
     return; // no status dir yet
   }
 
+  const myPpid = String(process.ppid);
+
   for (const file of heartbeatFiles) {
     try {
       const raw = await readFile(join(sDir, file), "utf8");
@@ -865,9 +867,17 @@ async function cleanupStaleMailboxes() {
       // Skip our own name (not yet written, but could match SELF env)
       if (name === agentName) continue;
 
-      // Only clean up inactive agents
+      // Clean up orphans from same parent_pid (MCP reconnect — same
+      // Claude Code session spawned a new server, old one is dead)
+      const sameParent = hb.parent_pid && hb.parent_pid === myPpid;
+
+      // Only clean up inactive agents OR same-parent orphans
       const active = hb.status === "active" && !isStale(hb);
-      if (active) continue;
+      if (active && !sameParent) continue;
+
+      if (sameParent) {
+        log("info", "cleaning up same-parent orphan", { agent: name, parent_pid: myPpid });
+      }
 
       // Remove mailbox directory
       const mailboxPath = join(BRIDGE_DIR, `to-${name}`);
