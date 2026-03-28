@@ -7,6 +7,8 @@
 Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP channels, and plain JSON files.
 
 > **⚠️ Experimental:** CC2CC relies on Claude Code's development channels — an experimental feature not yet publicly stable. You must launch Claude Code with the `--dangerously-load-development-channels` flag for channel push notifications to work. Without it, the MCP server starts but cannot push messages into the session.
+>
+> Tested with **Claude Code v2.1.86**. Channel API may change in future versions.
 
 ## Use Cases
 
