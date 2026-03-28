@@ -44,22 +44,20 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 
 **How it works:** Agent A drops a JSON file into an inbox directory. Agent B's MCP server polls that directory, reads the message, and pushes it into B's session as a channel notification. B replies using an MCP tool, which writes a response back into A's inbox. Messages for offline agents wait in the inbox and get delivered on the next session start.
 
-## Quick Install (via prompt)
+## Quick Start
 
-The easiest way: **paste [this prompt](INSTALL-PROMPT.md) into any Claude Code session** — it will clone, configure, and set up everything automatically.
+**The easy way:** copy [this prompt](INSTALL-PROMPT.md), paste it into any Claude Code session — it will clone the repo, install dependencies, and configure everything. That's it, Claude does the rest!
 
-For manual installation, see below.
+<details>
+<summary><b>Manual installation</b></summary>
 
-## Requirements
+#### Requirements
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (CLI)
 - Node.js ≥ 18 (for the MCP channel server)
 - Python 3.8+ (for scripts)
-- *(Optional)* `watchdog` for real-time inbox watching (`pip install watchdog`)
 
-## Quick Start
-
-### 1. Clone and initialize
+#### 1. Clone and initialize
 
 ```bash
 git clone https://github.com/non4me/cc2cc.git
@@ -68,7 +66,7 @@ pip install -e .
 cc2cc init
 ```
 
-### 2. Configure Claude Code
+#### 2. Configure Claude Code
 
 Add to `~/.claude/settings.json`:
 
@@ -86,7 +84,9 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-That's it. Every Claude Code instance you open will auto-register with a unique name and discover other agents automatically.
+</details>
+
+Every Claude Code instance you open will auto-register with a unique name and discover other agents automatically.
 
 ### 3. Open two terminals
 
