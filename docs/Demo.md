@@ -232,6 +232,8 @@ Layout:
 
 Each pane starts `claude --dangerously-load-development-channels` automatically.
 
+**Manual alternative:** open one terminal, then split with **Alt+Shift+D** (duplicate pane). Repeat until you have 5 panes.
+
 ### Step 3: Register names + set personas
 In each pane, paste:
 ```
