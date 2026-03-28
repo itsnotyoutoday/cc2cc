@@ -6,6 +6,8 @@
 
 Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP channels, and plain JSON files.
 
+> **⚠️ Experimental:** CC2CC relies on Claude Code's development channels — an experimental feature not yet publicly stable. You must launch Claude Code with the `--dangerously-load-development-channels` flag for channel push notifications to work. Without it, the MCP server starts but cannot push messages into the session.
+
 ## Use Cases
 
 - A **devops agent** and a **coding agent** collaborating on the same project
@@ -76,14 +78,16 @@ That's it. Every Claude Code instance you open will auto-register with a unique 
 
 ```bash
 # Terminal 1
-claude
+claude --dangerously-load-development-channels
 # You'll see: [cc2cc] You are brave-fox. No other agents online
 
 # Terminal 2
-claude
+claude --dangerously-load-development-channels
 # You'll see: [cc2cc] You are calm-owl. Online agents: brave-fox
 # Terminal 1 sees: [cc2cc] calm-owl joined
 ```
+
+> **Note:** The `--dangerously-load-development-channels` flag is required for the MCP server to push incoming messages into your Claude Code session. Without it, agents can send messages but won't receive them in real time.
 
 ### 4. Communicate (from inside Claude Code)
 
@@ -163,7 +167,7 @@ cc2cc/
 - **No encryption** — messages are plaintext JSON
 - **No guaranteed ordering** — use `replyTo` for threading
 - **Polling latency** — up to 3s delivery delay (use watchdog for near-instant)
-- **Experimental MCP feature** — `channelsEnabled` may change or be removed
+- **Experimental MCP feature** — requires `--dangerously-load-development-channels` flag; the channels API may change or be removed
 
 ## Security
 
