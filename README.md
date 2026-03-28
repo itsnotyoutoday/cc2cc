@@ -10,6 +10,12 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 >
 > Tested with **Claude Code v2.1.86**. Channel API may change in future versions.
 
+## Demo
+
+5 Claude Code agents debating in split panes via cc2cc:
+
+<video src="https://github.com/user-attachments/assets/e578e827-e24a-4b31-9112-964533b2e037" controls width="100%"></video>
+
 ## Use Cases
 
 - A **devops agent** and a **coding agent** collaborating on the same project
