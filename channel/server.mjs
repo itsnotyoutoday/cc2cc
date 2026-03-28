@@ -24,7 +24,7 @@ import {
 import { readdir, readFile, rename, mkdir, writeFile, stat, rm } from "fs/promises";
 import { writeFileSync } from "fs";
 import { join, basename, dirname } from "path";
-import { randomUUID } from "crypto";
+import { randomUUID, createCipheriv, createDecipheriv, scryptSync } from "crypto";
 import { homedir } from "os";
 import { generateUniqueName, validateName, takenNames } from "./names.mjs";
 
@@ -51,6 +51,44 @@ let knownAgents = new Map(); // name → heartbeat data
 let pollTimer = null;
 let statusTimer = null;
 let heartbeatTimer = null;
+let wakeAcknowledged = false; // set true when direct push succeeds
+
+// ─── Encryption (optional, enabled via CC2CC_ENCRYPT=1) ─────────────────────
+
+const ENCRYPT_ENABLED = process.env.CC2CC_ENCRYPT === "1";
+let encryptionKey = null; // derived from secret.key via scrypt
+
+async function loadEncryptionKey() {
+  if (!ENCRYPT_ENABLED) return;
+  try {
+    const secretPath = join(BRIDGE_DIR, "secret.key");
+    const secret = (await readFile(secretPath, "utf8")).trim();
+    encryptionKey = scryptSync(secret, "cc2cc-aes", 32);
+  } catch {
+    encryptionKey = null;
+  }
+}
+
+function encryptText(plaintext) {
+  if (!encryptionKey) return plaintext;
+  const iv = Buffer.from(randomUUID().replace(/-/g, ""), "hex").subarray(0, 12);
+  const cipher = createCipheriv("aes-256-gcm", encryptionKey, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `ENC:${iv.toString("hex")}:${tag.toString("hex")}:${encrypted.toString("hex")}`;
+}
+
+function decryptText(data) {
+  if (!encryptionKey || !data.startsWith("ENC:")) return data;
+  try {
+    const [, ivHex, tagHex, encHex] = data.split(":");
+    const decipher = createDecipheriv("aes-256-gcm", encryptionKey, Buffer.from(ivHex, "hex"));
+    decipher.setAuthTag(Buffer.from(tagHex, "hex"));
+    return decipher.update(Buffer.from(encHex, "hex"), null, "utf8") + decipher.final("utf8");
+  } catch {
+    return data; // return as-is if decryption fails (unencrypted message)
+  }
+}
 
 // ─── Logging (structured JSON → stderr; stdout is MCP transport) ─────────────
 
@@ -105,7 +143,7 @@ async function atomicWrite(targetPath, data) {
   await retryRename(tmpPath, targetPath);
 }
 
-/** Build a message object */
+/** Build a message object (encrypts content.text if encryption enabled) */
 function buildMessage({ from, to, text, type = "message", priority = "normal", replyTo = null, task = null }) {
   return {
     id: `msg-${randomUUID()}`,
@@ -116,10 +154,18 @@ function buildMessage({ from, to, text, type = "message", priority = "normal", r
     priority,
     identity: { agent: from, mode: "session" },
     task,
-    content: { text, parts: [] },
+    content: { text: encryptText(text), parts: [] },
     replyTo,
     ttl: DEFAULT_TTL,
   };
+}
+
+/** Decrypt content.text if encrypted */
+function decryptMessage(msg) {
+  if (msg?.content?.text) {
+    msg.content.text = decryptText(msg.content.text);
+  }
+  return msg;
 }
 
 /** Write heartbeat to status/{name}-heartbeat.json */
@@ -599,7 +645,7 @@ async function consumeInbox() {
       try {
         const filePath = join(inbox, file);
         const raw = await readFile(filePath, "utf8");
-        const msg = JSON.parse(raw);
+        const msg = decryptMessage(JSON.parse(raw));
 
         // TTL expiration check
         if (msg.timestamp && msg.ttl) {
@@ -744,7 +790,7 @@ async function pollInbox() {
       try {
         const filePath = join(inbox, file);
         const raw = await readFile(filePath, "utf8");
-        const msg = JSON.parse(raw);
+        const msg = decryptMessage(JSON.parse(raw));
 
         // TTL check — expired messages are moved to done immediately
         if (msg.timestamp && msg.ttl) {
@@ -985,8 +1031,12 @@ async function init() {
     log("info", "generated unique name", { name: agentName });
   }
 
-  // 2. Load notification rules
+  // 2. Load notification rules + encryption key
   await loadRules();
+  await loadEncryptionKey();
+  if (ENCRYPT_ENABLED) {
+    log("info", "encryption enabled", { hasKey: !!encryptionKey });
+  }
 
   // 3. Clean up stale mailboxes from previous sessions
   await cleanupStaleMailboxes();
@@ -1051,6 +1101,7 @@ async function init() {
         method: "notifications/claude/channel",
         params: { content: wakeContent, meta: wakeMeta },
       });
+      wakeAcknowledged = true;
       log("info", "self-wake direct push sent");
     } catch (e) {
       log("warn", "self-wake direct push failed", { error: e.message });
@@ -1060,6 +1111,11 @@ async function init() {
   // Fallback: inbox file picked up by pollInbox (in case direct push was too early)
   setTimeout(async () => {
     try {
+      // Skip if direct push already succeeded
+      if (wakeAcknowledged) {
+        log("info", "self-wake fallback skipped — direct push succeeded");
+        return;
+      }
       // Skip if agent already active (done/ has files = LLM consumed messages)
       const doneFiles = await readdir(doneDir(agentName)).catch(() => []);
       if (doneFiles.length > 0) {
