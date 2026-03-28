@@ -1082,6 +1082,20 @@ async function init() {
   }, 3000);
 }
 
+// ─── Global Error Handlers ──────────────────────────────────────────────────
+// Without these, any unhandled error silently kills the Node.js process,
+// dropping the MCP connection with no trace.
+
+process.on("uncaughtException", (err) => {
+  log("error", "uncaughtException", { error: err.message, stack: err.stack });
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  log("error", "unhandledRejection", { error: msg, stack });
+});
+
 init().catch((err) => {
   log("error", "init failed", { error: err.message, stack: err.stack });
   process.exit(1);
