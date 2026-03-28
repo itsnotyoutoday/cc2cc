@@ -130,7 +130,7 @@ Written to `status/{agent}-heartbeat.json` by session hooks:
 }
 ```
 
-Heartbeats are overwritten (not appended) on each session start/end. An agent is considered stale if its heartbeat is older than 10 minutes.
+Heartbeats are overwritten (not appended) every **5 seconds** by the MCP server. An agent is considered stale if its heartbeat is older than **15 seconds**.
 
 ---
 

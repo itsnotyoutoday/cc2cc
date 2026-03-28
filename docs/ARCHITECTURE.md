@@ -237,7 +237,7 @@ File: `status/{agent}-heartbeat.json`. Overwritten (not appended).
 }
 ```
 
-Agent considered stale if heartbeat > 10 minutes old.
+Agent considered stale if heartbeat > **15 seconds** old (server writes every 5s).
 
 ### 5.5 Receipt Schema
 
@@ -378,8 +378,19 @@ Written by MCP server after successful push to Claude Code session.
 **Reply Tool:**
 - Name: `reply`
 - Input: `{ msg_id: string, text: string, type?: string, priority?: string }`
+- Lookup: searches agent's **inbox first**, then **done/** (fixes race where channel push arrives before consumeInbox moves the file)
 - Action: builds response message, atomic-writes to `{SELF}-to-{PEER}/inbox/`
 - Returns: `"Sent {id} to {PEER}"` or error
+
+**Self-Wake (init step 11):**
+- Two-stage mechanism to activate the LLM without user input
+- **Fast path (500ms):** direct `server.notification()` channel push
+- **Fallback (3000ms):** writes system message to own inbox (skipped if agent already active)
+- Result: agent boots ~1s after session start, autonomously calls `check_inbox` / `whoami`
+
+**Silent Agent Status:**
+- Agent online/offline events are **not** pushed to chat
+- Presence is reflected only in the statusline (reads heartbeat files from disk)
 
 **Logging:**
 - Structured JSON to stderr (stdout is MCP transport)

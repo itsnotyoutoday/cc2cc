@@ -14,5 +14,11 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Claude Code
+.claude/
+
+# Python build artifacts
+*.egg-info/
+
 # Bridge runtime data (created by init.sh, lives at ~/.cc2cc)
 /tmp/

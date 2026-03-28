@@ -400,16 +400,17 @@ async function handleBroadcast({ text, priority = "normal" }) {
 async function handleReply({ msg_id, text }) {
   if (!msg_id || !text) return textResult("Missing required fields: msg_id, text", true);
 
-  // Try to find the original message in done dirs to get sender info
+  // Try to find the original message — check inbox first (channel push
+  // may arrive before consumeInbox moves the file to done/)
   let originalMsg = null;
-  const myDone = doneDir(agentName);
+  const myInbox = inboxDir(agentName);
 
   try {
-    const files = await readdir(myDone);
+    const files = await readdir(myInbox);
     for (const f of files) {
       if (!f.endsWith(".json")) continue;
       try {
-        const raw = await readFile(join(myDone, f), "utf8");
+        const raw = await readFile(join(myInbox, f), "utf8");
         const m = JSON.parse(raw);
         if (m.id === msg_id) {
           originalMsg = m;
@@ -417,7 +418,26 @@ async function handleReply({ msg_id, text }) {
         }
       } catch { /* skip */ }
     }
-  } catch { /* done dir may not exist */ }
+  } catch { /* inbox may not exist */ }
+
+  // Then check done dir
+  if (!originalMsg) {
+    const myDone = doneDir(agentName);
+    try {
+      const files = await readdir(myDone);
+      for (const f of files) {
+        if (!f.endsWith(".json")) continue;
+        try {
+          const raw = await readFile(join(myDone, f), "utf8");
+          const m = JSON.parse(raw);
+          if (m.id === msg_id) {
+            originalMsg = m;
+            break;
+          }
+        } catch { /* skip */ }
+      }
+    } catch { /* done dir may not exist */ }
+  }
 
   // Also check legacy inbox paths
   if (!originalMsg) {
@@ -782,15 +802,7 @@ async function pollStatus() {
 
     if (isOnline && !wasOnline) {
       log("info", "agent joined", { agent: name });
-      try {
-        await server.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: `[system] Agent "${name}" is now online`,
-            meta: { type: "status", from: "system" },
-          },
-        });
-      } catch { /* notification may fail if transport not ready */ }
+      // No channel push — statusline already reflects online agents
     }
   }
 
@@ -803,15 +815,7 @@ async function pollStatus() {
 
     if (wasOnline && !nowOnline) {
       log("info", "agent left", { agent: name });
-      try {
-        await server.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: `[system] Agent "${name}" went offline`,
-            meta: { type: "status", from: "system" },
-          },
-        });
-      } catch { /* notification may fail */ }
+      // No channel push — statusline already reflects online agents
     }
   }
 
@@ -978,6 +982,50 @@ async function init() {
   } catch (e) {
     log("warn", "self-announce failed", { error: e.message });
   }
+
+  // 11. Self-wake: activate the LLM without user input.
+  // Strategy: fast direct channel notification + slower inbox fallback.
+  // The direct push is fastest but may miss if Claude Code isn't ready yet;
+  // the inbox write guarantees delivery via pollInbox on next cycle.
+  const wakeContent = `[cc2cc] You are "${agentName}". Run whoami to confirm your identity and check for online agents.`;
+  const wakeMeta = { type: "system", from: "cc2cc-self-wake" };
+
+  // Fast path: direct channel notification after minimal delay
+  setTimeout(async () => {
+    try {
+      await server.notification({
+        method: "notifications/claude/channel",
+        params: { content: wakeContent, meta: wakeMeta },
+      });
+      log("info", "self-wake direct push sent");
+    } catch (e) {
+      log("warn", "self-wake direct push failed", { error: e.message });
+    }
+  }, 500);
+
+  // Fallback: inbox file picked up by pollInbox (in case direct push was too early)
+  setTimeout(async () => {
+    try {
+      // Skip if agent already active (done/ has files = LLM consumed messages)
+      const doneFiles = await readdir(doneDir(agentName)).catch(() => []);
+      if (doneFiles.length > 0) {
+        log("info", "self-wake fallback skipped — agent already active");
+        return;
+      }
+      const wakeMsg = buildMessage({
+        from: "system",
+        to: agentName,
+        text: wakeContent,
+        type: "status",
+        priority: "low",
+      });
+      wakeMsg.ttl = 30;
+      await atomicWrite(join(inboxDir(agentName), `${wakeMsg.id}.json`), wakeMsg);
+      log("info", "self-wake fallback written", { id: wakeMsg.id });
+    } catch (e) {
+      log("warn", "self-wake fallback failed", { error: e.message });
+    }
+  }, 3000);
 }
 
 init().catch((err) => {
