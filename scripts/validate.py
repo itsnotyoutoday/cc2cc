@@ -27,7 +27,8 @@ total = valid = invalid = 0
 for path in glob.glob(os.path.join(str(bridge_dir), "*/*/*.json")):
     total += 1
     try:
-        raw = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as _f:
+            raw = _f.read()
 
         if len(raw.encode("utf-8")) > MAX_MESSAGE_SIZE:
             invalid += 1

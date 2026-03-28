@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure UTF-8 output on Windows (for Unicode indicators)
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 

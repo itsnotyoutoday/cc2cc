@@ -22,8 +22,10 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { readdir, readFile, rename, mkdir, writeFile, stat, rm } from "fs/promises";
+import { writeFileSync } from "fs";
 import { join, basename, dirname } from "path";
 import { randomUUID } from "crypto";
+import { homedir } from "os";
 import { generateUniqueName, validateName, takenNames } from "./names.mjs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -34,7 +36,7 @@ const HEARTBEAT_STALE_S = 15;
 const SEEN_FILES_CAP = 500;
 const DEFAULT_TTL = 3600;
 
-const HOME = process.env.HOME || process.env.USERPROFILE;
+const HOME = process.env.HOME || process.env.USERPROFILE || homedir();
 const BRIDGE_DIR =
   process.env.CC2CC_BRIDGE_DIR || process.env.BRIDGE_DIR || join(HOME, ".cc2cc");
 
@@ -78,13 +80,29 @@ function statusDir() {
   return join(BRIDGE_DIR, "status");
 }
 
+/** Retry-aware rename: handles Windows AV file locking (EPERM/EACCES). */
+async function retryRename(src, dst, retries = 5, delayMs = 50) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await rename(src, dst);
+      return;
+    } catch (err) {
+      if ((err.code === "EPERM" || err.code === "EACCES") && i < retries - 1) {
+        await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 /** Atomic write: tmp file → rename */
 async function atomicWrite(targetPath, data) {
   const dir = dirname(targetPath);
   await mkdir(dir, { recursive: true });
   const tmpPath = join(dir, `.tmp-${randomUUID()}.json`);
   await writeFile(tmpPath, JSON.stringify(data, null, 2));
-  await rename(tmpPath, targetPath);
+  await retryRename(tmpPath, targetPath);
 }
 
 /** Build a message object */
@@ -589,7 +607,7 @@ async function consumeInbox() {
           if (age > msg.ttl) {
             const done = doneDir(agentName);
             await mkdir(done, { recursive: true });
-            await rename(filePath, join(done, file));
+            await retryRename(filePath, join(done, file));
 
             if (msg.from && msg.from !== agentName) {
               const expNotice = buildMessage({
@@ -622,7 +640,7 @@ async function consumeInbox() {
         // Move to done/
         const done = doneDir(agentName);
         await mkdir(done, { recursive: true });
-        await rename(filePath, join(done, file));
+        await retryRename(filePath, join(done, file));
 
         // Mark as seen so pollInbox won't re-notify
         seenFiles.add(file);
@@ -733,7 +751,7 @@ async function pollInbox() {
           const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
           if (age > msg.ttl) {
             await mkdir(doneDir(agentName), { recursive: true });
-            await rename(filePath, join(doneDir(agentName), file));
+            await retryRename(filePath, join(doneDir(agentName), file));
             log("info", "message expired (poll)", { id: msg.id });
             continue;
           }
@@ -916,8 +934,34 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+let cleanShutdown = false;
+
+async function gracefulShutdown(signal) {
+  cleanShutdown = true;
+  await shutdown(signal);
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+// Windows: SIGTERM is never emitted when the parent kills us.
+// Synchronous "exit" handler writes offline heartbeat as a last resort.
+process.on("exit", () => {
+  if (cleanShutdown || !agentName) return;
+  try {
+    writeFileSync(
+      join(statusDir(), `${agentName}-heartbeat.json`),
+      JSON.stringify({
+        agent: agentName,
+        timestamp: new Date().toISOString(),
+        session_id: "none",
+        parent_pid: process.ppid,
+        status: "offline",
+        context: "process exit (unclean)",
+      }, null, 2),
+    );
+  } catch { /* best effort */ }
+});
 
 // ─── Initialization ─────────────────────────────────────────────────────────
 

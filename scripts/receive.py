@@ -3,8 +3,8 @@
 
 import json
 import os
-import shutil
 import sys
+import time
 from pathlib import Path
 
 from cc2cc.signing import verify_message
@@ -57,7 +57,16 @@ def main():
             if not peek:
                 done_dir = inbox.parent / "done"
                 done_dir.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(fp), str(done_dir / fp.name))
+                dst = str(done_dir / fp.name)
+                for _attempt in range(5):
+                    try:
+                        os.replace(str(fp), dst)
+                        break
+                    except PermissionError:
+                        if _attempt < 4:
+                            time.sleep(0.05 * (_attempt + 1))
+                        else:
+                            raise
 
 
 if __name__ == "__main__":

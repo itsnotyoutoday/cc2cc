@@ -49,7 +49,8 @@ def main():
 
     print("Installing MCP dependencies...")
     try:
-        subprocess.run(["npm", "install", "--silent"], cwd=str(bridge), check=True, capture_output=True)
+        npm = shutil.which("npm") or ("npm.cmd" if sys.platform == "win32" else "npm")
+        subprocess.run([npm, "install", "--silent"], cwd=str(bridge), check=True, capture_output=True)
         print("MCP dependencies installed.")
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Warning: npm install failed (is Node.js installed?)")

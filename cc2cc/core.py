@@ -2,7 +2,9 @@
 
 import json
 import os
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 MAX_MESSAGE_SIZE = 1_000_000  # 1 MB
@@ -11,6 +13,19 @@ MAX_MESSAGE_SIZE = 1_000_000  # 1 MB
 def bridge_path() -> Path:
     """Resolve the bridge directory from env or default."""
     return Path(os.environ.get("CC2CC_BRIDGE_DIR", os.path.expanduser("~/.cc2cc")))
+
+
+def retry_replace(src: str, dst: str, retries: int = 5, delay: float = 0.05) -> None:
+    """os.replace with retry for Windows AV file locking (PermissionError)."""
+    for i in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i < retries - 1:
+                time.sleep(delay * (i + 1))
+            else:
+                raise
 
 
 def atomic_write(target: Path, data: dict) -> None:
@@ -29,8 +44,7 @@ def atomic_write(target: Path, data: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(raw)
-        # Atomic rename (same filesystem guaranteed — same dir)
-        os.replace(tmp, str(target))
+        retry_replace(tmp, str(target))
     except BaseException:
         try:
             os.unlink(tmp)
