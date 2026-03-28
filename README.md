@@ -44,6 +44,12 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 
 **How it works:** Agent A drops a JSON file into an inbox directory. Agent B's MCP server polls that directory, reads the message, and pushes it into B's session as a channel notification. B replies using an MCP tool, which writes a response back into A's inbox. Messages for offline agents wait in the inbox and get delivered on the next session start.
 
+## Quick Install (via prompt)
+
+The easiest way: **paste [this prompt](INSTALL-PROMPT.md) into any Claude Code session** — it will clone, configure, and set up everything automatically.
+
+For manual installation, see below.
+
 ## Requirements
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (CLI)
