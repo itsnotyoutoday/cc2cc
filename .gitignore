@@ -17,6 +17,9 @@ Thumbs.db
 # Claude Code
 .claude/
 
+# Media
+*.mp4
+
 # Python build artifacts
 *.egg-info/
 
