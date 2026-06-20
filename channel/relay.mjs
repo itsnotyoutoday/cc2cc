@@ -7,7 +7,7 @@
  * before starting this client.
  */
 
-import { readFile, mkdir, writeFile, readdir } from "fs/promises";
+import { readFile, mkdir, writeFile, readdir, rm } from "fs/promises";
 import { join, basename } from "path";
 import { randomUUID } from "crypto";
 
@@ -57,14 +57,38 @@ const HEARTBEAT_STALE_S = 15; // v3.6: max age for agent roster entries
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
+const CONNECTIONS_FILE = "connections.json";
+
 export async function loadRelayConfig(bridgeDir) {
+  // Prefer connections.json (self identity + connection registry); fall back to relay.json.
+  // self.id = this instance's UUID (distinct from host → many daemons per machine);
+  // self.name = human label. Active hub = the first enabled "server" connection.
+  try {
+    const conns = JSON.parse(await readFile(join(bridgeDir, CONNECTIONS_FILE), "utf8"));
+    const self = conns.self || {};
+    const server = (conns.connections || []).find((c) => c.type === "server" && c.enabled !== false);
+    config = {
+      machine_id: self.id || randomUUID(),
+      name: self.name || self.id || "node",
+      self_type: self.type || "client",
+      connections: conns.connections || [],
+      hub_url: server ? `http://${server.address}:${server.port}`.replace(/\/$/, "") : null,
+      token: server ? server.token : null,
+      hub_id: server ? server.id : null,
+      // a node with no outbound server connection (a pure server) has nothing to poll
+      enabled: server ? (conns.enabled !== false) : false,
+    };
+    return config;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  // Legacy single-hub relay.json
   const path = join(bridgeDir, RELAY_CONFIG_FILE);
   try {
     const raw = await readFile(path, "utf8");
     config = JSON.parse(raw);
-    if (!config.machine_id) {
-      config.machine_id = randomUUID();
-    }
+    if (!config.machine_id) config.machine_id = randomUUID();
+    if (!config.name) config.name = config.machine_id;
     return config;
   } catch (err) {
     if (err.code === "ENOENT") return null;
@@ -177,8 +201,8 @@ export async function relayKeepalive(hubUrl, token, machineId, teamName) {
   return await apiPost(`${hubUrl}/api/keepalive`, { token, machine_id: machineId, team: teamName });
 }
 
-export async function relayHeartbeat(hubUrl, token, machineId, teamName, agents) {
-  return await apiPost(`${hubUrl}/api/heartbeat`, { token, machine_id: machineId, team: teamName, agents });
+export async function relayHeartbeat(hubUrl, token, machineId, teamName, agents, teamPolicies) {
+  return await apiPost(`${hubUrl}/api/heartbeat`, { token, machine_id: machineId, team: teamName, agents, team_policies: teamPolicies });
 }
 
 // ─── Remote Team/Agent Queries ──────────────────────────────────────────────
@@ -292,6 +316,38 @@ async function loadRemoteState(dir) {
 
 // ─── Poll Cycle ─────────────────────────────────────────────────────────────
 
+/** Drain the local outbox: re-send spooled messages (hub-was-down), remove on success,
+ *  bounce to the sender's inbox once a message exceeds REMOTE_EXPIRE_MS undelivered. */
+async function drainOutbox(bridgeDir) {
+  const dir = join(bridgeDir, "outbox");
+  let files = [];
+  try { files = (await readdir(dir)).filter((f) => f.endsWith(".json")); } catch { return; }
+  for (const f of files) {
+    const p = join(dir, f);
+    let item;
+    try { item = JSON.parse(await readFile(p, "utf8")); } catch { continue; }
+    const ageMs = Date.now() - new Date(item.created || 0).getTime();
+    if (ageMs > REMOTE_EXPIRE_MS) {
+      // Expired undelivered → bounce to the sender's own inbox.
+      const sender = item.msg?.from;
+      if (sender) {
+        const inbox = join(bridgeDir, `to-${sender}`, "inbox");
+        await mkdir(inbox, { recursive: true }).catch(() => {});
+        await writeFile(join(inbox, `bounce-${randomUUID()}.json`), JSON.stringify({
+          id: `bounce-${randomUUID()}`, timestamp: new Date().toISOString(), from: "system", to: sender,
+          type: "status", content: { text: `Undeliverable: your message to "${item.to_team}" expired after ${Math.floor(ageMs/86400000)}d.` },
+        }, null, 2)).catch(() => {});
+      }
+      await rm(p, { force: true }).catch(() => {});
+      continue;
+    }
+    try {
+      await sendViaRelay(config.hub_url, config.token, config.machine_id, item.from_team, item.to_team, item.msg);
+      await rm(p, { force: true }).catch(() => {}); // delivered
+    } catch { /* hub still down — retry next poll */ }
+  }
+}
+
 async function pollCycle(bridgeDir, teamName) {
   if (!config || !relayEnabled) return;
 
@@ -299,6 +355,8 @@ async function pollCycle(bridgeDir, teamName) {
   const token = config.token;
   const machineId = config.machine_id;
   const team = teamName;
+
+  await drainOutbox(bridgeDir); // resilience: flush any spooled messages first
 
   try {
     const result = await relayPoll(hubUrl, token, machineId, team);
@@ -323,6 +381,15 @@ async function pollCycle(bridgeDir, teamName) {
     }
     pruneExpiredRemoteTeams();
     if (changed || remoteTeams.size) saveRemoteState();
+
+    // Persist replicated remote team policies (federation): teams owned by OTHER machines,
+    // cached locally so a disconnected node still knows the leader/rules of its remote teams.
+    if (result.team_policies && Object.keys(result.team_policies).length) {
+      try {
+        await writeFile(join(bridgeDir, "teams-remote.json"),
+          JSON.stringify({ teams: result.team_policies }, null, 2), "utf8");
+      } catch { /* best effort */ }
+    }
 
     // B3: Write incoming messages to BRIDGE_DIR/to-{agent_name}/inbox/
     //     so pollInbox naturally finds them.
@@ -480,9 +547,18 @@ export async function doHeartbeat(bridgeDir, teamName) {
     // Status directory may not exist — non-fatal
   }
 
-  // Fold agents into /api/heartbeat (keepalive is separate)
+  // Federate the team policies THIS machine owns (teams.json entries owner_machine == us).
+  let ownedPolicies = {};
   try {
-    await relayHeartbeat(config.hub_url, config.token, config.machine_id, teamName, agents);
+    const reg = JSON.parse(await readFile(join(bridgeDir, "teams.json"), "utf8"));
+    for (const [tname, pol] of Object.entries(reg.teams || {})) {
+      if (pol && pol.owner_machine === config.machine_id) ownedPolicies[tname] = pol;
+    }
+  } catch { /* no teams.json */ }
+
+  // Fold agents + owned team policies into /api/heartbeat (keepalive is separate)
+  try {
+    await relayHeartbeat(config.hub_url, config.token, config.machine_id, teamName, agents, ownedPolicies);
   } catch (err) {
     // hub might be down
   }
@@ -494,6 +570,7 @@ export function getRelayStatus() {
     enabled: relayEnabled,
     hub_url: config.hub_url,
     machine_id: config.machine_id,
+    name: config.name || config.machine_id, // human label for this instance
     remote_teams: getRemoteTeams().map((t) => t.name),
   };
 }

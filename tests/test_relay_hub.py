@@ -531,3 +531,27 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
+
+
+class TestTeamPolicySync:
+    """Task 15: the hub federates team policies — a machine's OWNED team policies are
+    shared to other machines on poll, but not echoed back to their owner."""
+
+    def test_owned_policy_propagates_to_other_machine(self):
+        reset_state()
+        register(MACHINE_A, TEAM_X)   # m1 owns team-x
+        register(MACHINE_B, TEAM_Y)   # m2 is elsewhere
+        client.post("/api/heartbeat", json={
+            "token": TOKEN, "machine_id": MACHINE_A, "team": TEAM_X, "agents": {},
+            "team_policies": {"team-x": {"name": "team-x", "owner_machine": MACHINE_A, "leader": "alpha-lead"}},
+        })
+        # m2 polls → receives team-x policy (replica)
+        r = client.post("/api/poll", json={"machine_id": MACHINE_B, "team": TEAM_Y},
+                        headers={"Authorization": f"Bearer {TOKEN}"})
+        tp = r.json().get("team_policies", {})
+        assert "team-x" in tp and tp["team-x"]["leader"] == "alpha-lead"
+
+        # m1 polling its own team should NOT get its own policy echoed back
+        r2 = client.post("/api/poll", json={"machine_id": MACHINE_A, "team": TEAM_X},
+                         headers={"Authorization": f"Bearer {TOKEN}"})
+        assert "team-x" not in r2.json().get("team_policies", {})

@@ -53,6 +53,7 @@ class HeartbeatRequest(BaseModel):
     machine_id: str
     team: str
     agents: dict[str, dict]   # agent_name → { status_text: "..." } for v3.6
+    team_policies: Optional[dict] = None  # teams this machine OWNS → policy (federated)
 
 
 # ─── Application Setup ───────────────────────────────────────────────────────
@@ -67,7 +68,8 @@ tokens: set[str] = set()
 REGISTRATION_TTL = 30
 LEASE_TTL = 30
 MAX_QUEUED_PER_TEAM = 1000
-MESSAGE_MAX_AGE_SECONDS = 86400  # 24h
+MESSAGE_MAX_AGE_SECONDS = 5 * 86400  # 5 days (matches default policy messages.max_age_days);
+# undelivered messages are held this long, not dropped at 24h, so offline peers still get them.
 
 
 def init_tokens():
@@ -104,6 +106,7 @@ async def api_register(req: RegisterRequest):
         "last_seen": datetime.now(timezone.utc).isoformat(),
         "ttl": REGISTRATION_TTL,
         "agents": {},
+        "team_policies": {},
     }
     return {"status": "registered", "ttl_seconds": REGISTRATION_TTL}
 
@@ -169,6 +172,7 @@ async def api_poll(req: PollRequest, request: Request):
     now = datetime.now(timezone.utc)
 
     online_teams = {}
+    team_policies = {}  # teams OWNED by other machines → policy (federated replica)
     for key, reg in registrations.items():
         if _is_registration_active(reg):
             team = reg["team"]
@@ -177,6 +181,10 @@ async def api_poll(req: PollRequest, request: Request):
                     "machine_id": reg["machine_id"],
                     "agents": reg.get("agents", {}),
                 }
+            # Share team policies this registration owns — except back to their owner.
+            if reg["machine_id"] != req.machine_id:
+                for tname, pol in (reg.get("team_policies") or {}).items():
+                    team_policies[tname] = pol
 
     # B4: Poll only own (machine_id, team) queue
     poll_key = _team_key(req.machine_id, req.team)
@@ -212,7 +220,7 @@ async def api_poll(req: PollRequest, request: Request):
         }
         available_messages.append({**entry["msg"], "lease_id": lease_id})
 
-    return {"messages": available_messages, "online_teams": online_teams}
+    return {"messages": available_messages, "online_teams": online_teams, "team_policies": team_policies}
 
 
 @app.post("/api/ack")
@@ -248,6 +256,8 @@ async def api_heartbeat(req: HeartbeatRequest):
     if key not in registrations:
         raise HTTPException(status_code=404, detail="Not registered")
     registrations[key]["agents"] = req.agents
+    if req.team_policies is not None:
+        registrations[key]["team_policies"] = req.team_policies
     registrations[key]["last_seen"] = datetime.now(timezone.utc).isoformat()
     return {"status": "ok"}
 

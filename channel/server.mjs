@@ -956,8 +956,16 @@ async function handleSendTeam({ team, text, intent = "message", priority = "norm
         : tpl("relay_queued_dark", { team, id: msg.id, lastSeenSuffix: st.last_seen ? ` (last seen ${new Date(st.last_seen).toISOString()})` : "" });
       return textResult(out);
     } catch (err) {
-      log("error", "relay send failed", { to_team: team, error: err.message });
-      return textResult(tpl("relay_unreachable", { team, error: err.message, retryNote: "Retry shortly (outbound spool/backoff is being added)." }), true);
+      // Hub unreachable → spool locally; the relay client drains the outbox with retry.
+      try {
+        await atomicWrite(join(BRIDGE_DIR, "outbox", `${msg.id}.json`),
+          { id: msg.id, from_team: fromTeam, to_team: team, msg, created: new Date().toISOString() });
+        log("info", "relay send spooled", { id: msg.id, to_team: team, error: err.message });
+        return textResult(tpl("relay_spooled", { team, id: msg.id }));
+      } catch (e2) {
+        log("error", "relay send failed (spool failed)", { to_team: team, error: err.message });
+        return textResult(tpl("relay_unreachable", { team, error: err.message, retryNote: "" }), true);
+      }
     }
   }
 
@@ -1170,6 +1178,24 @@ async function consumeInbox() {
 /**
  * Format consumed messages as a text block to append to tool responses.
  */
+function humanAge(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 3600) return `${Math.max(1, Math.floor(s / 60))}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+/** If a delivered message is older than policy.messages.stale_after_hours, return an
+ *  "this may be stale" note (template msg_old_on_read); else "". */
+function staleNote(msg) {
+  const ts = msg.timestamp;
+  if (!ts) return "";
+  const ageMs = Date.now() - new Date(ts).getTime();
+  const thresholdMs = (policy.messages?.stale_after_hours || 24) * 3600 * 1000;
+  if (!(ageMs >= thresholdMs)) return "";
+  return tpl("msg_old_on_read", { age: humanAge(ageMs), sentAt: ts, readAt: new Date().toISOString(), from: msg.from });
+}
+
 function formatPendingMessages(messages) {
   if (messages.length === 0) return "";
 
@@ -1182,6 +1208,8 @@ function formatPendingMessages(messages) {
     const replyInfo = msg.replyTo ? ` (reply to ${msg.replyTo})` : "";
     lines.push(`[${msg.id}] from ${msg.from} (${msg.type}${taskInfo}${replyInfo}):`);
     lines.push(`  ${msg.content?.text || "(empty)"}`);
+    const stale = staleNote(msg);
+    if (stale) lines.push(`  ${stale}`);
   }
   lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━");
   lines.push("Reply using: reply(msg_id=\"...\", text=\"...\")");
@@ -1407,11 +1435,21 @@ async function saveTeamFile(t) {
 
 /** Refresh operatorLeaders + teamRevoked from the central teams.json registry.
  *  These are the operator/governance authority; the GAB policy governs. */
+async function loadTeamsReplica() {
+  // teams-remote.json = teams owned by OTHER machines, replicated via the relay (federation).
+  // Cached locally so a disconnected node still knows the leader/rules of its remote teams.
+  try {
+    const o = JSON.parse(await readFile(join(BRIDGE_DIR, "teams-remote.json"), "utf8"));
+    return (o && o.teams) || {};
+  } catch { return {}; }
+}
+
 async function loadTeamPolicies() {
   const nextLeaders = new Map();
   const nextRevoked = new Map();
-  const reg = await loadTeamsRegistry();
-  for (const [name, t] of Object.entries(reg)) {
+  // Remote replica first, then local teams.json overrides (a team we own wins).
+  const merged = { ...(await loadTeamsReplica()), ...(await loadTeamsRegistry()) };
+  for (const [name, t] of Object.entries(merged)) {
     if (t && t.leader) nextLeaders.set(name, t.leader);
     if (t && Array.isArray(t.revoked) && t.revoked.length) nextRevoked.set(name, new Set(t.revoked));
   }
