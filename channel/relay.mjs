@@ -59,6 +59,45 @@ const HEARTBEAT_STALE_S = 15; // v3.6: max age for agent roster entries
 
 const CONNECTIONS_FILE = "connections.json";
 
+/**
+ * Build the hub base URL for a server connection. Supports proxied deployments behind a path
+ * prefix and HTTPS:
+ *   - `url`        full base, takes precedence  → "https://relay.example.com/bridge/cc2cc"
+ *   - else         `${scheme||http}://${address}:${port}${base_path||""}`
+ * Trailing slashes are stripped so `${hub_url}/api/...` never produces "//api".
+ * (Endpoints all concatenate `${hub_url}/api/X`; the hub emits no URLs/redirects, so a path
+ *  prefix flows through transparently — the proxy just rewrites `/bridge/cc2cc/api/*`→`/api/*`.)
+ */
+export function buildHubUrl(server) {
+  if (!server) return null;
+  if (server.url) return server.url.replace(/\/+$/, "");
+  const scheme = server.scheme || "http";
+  const base = server.base_path ? `/${String(server.base_path).replace(/^\/+|\/+$/g, "")}` : "";
+  return `${scheme}://${server.address}:${server.port}${base}`.replace(/\/+$/, "");
+}
+
+/**
+ * Normalize either config methodology into ONE internal shape. Both connections.json (rich:
+ * self-identity + connection registry) and legacy relay.json (flat single-hub) funnel through
+ * here, so downstream code sees identical fields regardless of source. The hub is always a
+ * full base URL (hub_url) — proxy/path-prefix/https aware.
+ */
+function normalizeConfig(c) {
+  const hub_url = c.hub_url ? String(c.hub_url).replace(/\/+$/, "") : null;
+  return {
+    machine_id: c.machine_id || randomUUID(),
+    name: c.name || c.machine_id || "node",
+    self_type: c.self_type || "client",
+    hub_url,
+    token: c.token ?? null,
+    hub_id: c.hub_id ?? null,
+    // a node with no outbound hub (a pure server) has nothing to poll
+    enabled: hub_url ? (c.enabled !== false) : false,
+    poll_interval_ms: c.poll_interval_ms || POLL_MS,
+    connections: c.connections || [],
+  };
+}
+
 export async function loadRelayConfig(bridgeDir) {
   // Prefer connections.json (self identity + connection registry); fall back to relay.json.
   // self.id = this instance's UUID (distinct from host → many daemons per machine);
@@ -67,28 +106,34 @@ export async function loadRelayConfig(bridgeDir) {
     const conns = JSON.parse(await readFile(join(bridgeDir, CONNECTIONS_FILE), "utf8"));
     const self = conns.self || {};
     const server = (conns.connections || []).find((c) => c.type === "server" && c.enabled !== false);
-    config = {
-      machine_id: self.id || randomUUID(),
-      name: self.name || self.id || "node",
-      self_type: self.type || "client",
+    config = normalizeConfig({
+      machine_id: self.id,
+      name: self.name || self.id,
+      self_type: self.type,
       connections: conns.connections || [],
-      hub_url: server ? `http://${server.address}:${server.port}`.replace(/\/$/, "") : null,
+      hub_url: server ? buildHubUrl(server) : null,
       token: server ? server.token : null,
       hub_id: server ? server.id : null,
-      // a node with no outbound server connection (a pure server) has nothing to poll
       enabled: server ? (conns.enabled !== false) : false,
-    };
+      poll_interval_ms: conns.poll_interval_ms,
+    });
     return config;
   } catch (err) {
     if (err.code !== "ENOENT") throw err;
   }
-  // Legacy single-hub relay.json
+  // Legacy single-hub relay.json — mapped into the SAME shape (incl. a synthesized
+  // connections[] view) so the two methodologies are one downstream.
   const path = join(bridgeDir, RELAY_CONFIG_FILE);
   try {
-    const raw = await readFile(path, "utf8");
-    config = JSON.parse(raw);
-    if (!config.machine_id) config.machine_id = randomUUID();
-    if (!config.name) config.name = config.machine_id;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    const hub_url = raw.hub_url ? String(raw.hub_url).replace(/\/+$/, "") : null;
+    config = normalizeConfig({
+      ...raw,
+      hub_url,
+      connections: raw.connections || (hub_url
+        ? [{ id: raw.hub_id || "hub", type: "server", url: hub_url, token: raw.token, enabled: raw.enabled !== false }]
+        : []),
+    });
     return config;
   } catch (err) {
     if (err.code === "ENOENT") return null;

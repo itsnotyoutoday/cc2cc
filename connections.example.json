@@ -1,0 +1,34 @@
+{
+  "_comment": "Canonical cc2cc connection config (~/.cc2cc/connections.json). Supersedes the flat relay.json — legacy relay.json is still read and mapped into this same shape. 'self' identifies this instance; 'connections' lists hubs to dial (type:server) and is extensible to peers. The active hub is the first enabled type:server entry. Encryption is independent of transport (E2E AES); the hub only ever sees ciphertext.",
+
+  "self": {
+    "id": "machine-2e916ec8",
+    "name": "agent-coord",
+    "type": "client"
+  },
+
+  "enabled": true,
+  "poll_interval_ms": 3000,
+
+  "connections": [
+    {
+      "id": "primary-hub",
+      "type": "server",
+      "url": "https://relay.example.com/bridge/cc2cc",
+      "_url_note": "Full base URL — scheme + host + optional path prefix. The client appends /api/* (e.g. .../bridge/cc2cc/api/register); the reverse proxy rewrites /bridge/cc2cc/api/* -> /api/* on the hub's localhost bind. HTTPS terminates at the proxy. Trailing slashes are stripped automatically.",
+      "token": "PEERTEST",
+      "enabled": true
+    },
+
+    {
+      "id": "local-hub-example",
+      "type": "server",
+      "_alt_form": "Instead of 'url', you may give scheme/address/port/base_path components:",
+      "scheme": "http",
+      "address": "127.0.0.1",
+      "port": 10322,
+      "token": "PEERTEST",
+      "enabled": false
+    }
+  ]
+}
