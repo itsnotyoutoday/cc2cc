@@ -1919,14 +1919,26 @@ async function init() {
   if (ENCRYPT_ENABLED) log("info", "encryption enabled", { hasKey: !!encryptionKey });
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
 
+  // 0f: Gate mesh-join on a real MCP client completing the initialize handshake. A bare
+  // `node server.mjs` (no Claude/LLM attached) must NOT mint a live account — it would
+  // register, heartbeat, and queue inbound it can never read or answer (a phantom peer that
+  // looks online in the roster). The SDK fires oninitialized when the client sends
+  // notifications/initialized (MCP spec), so a client-less launch never joins. Set the hook
+  // BEFORE connect so it's armed when the handshake arrives.
   if (IDENTITY_NAME) {
-    log("info", "auto-join (CC2CC_IDENTITY/SELF present)", { name: IDENTITY_NAME });
-    await activate(IDENTITY_NAME);
+    let joined = false;
+    server.oninitialized = () => {
+      if (joined) return; // guard against a duplicate initialized notification
+      joined = true;
+      log("info", "client initialized — auto-join (CC2CC_IDENTITY/SELF present)", { name: IDENTITY_NAME });
+      activate(IDENTITY_NAME).catch((e) => log("error", "activate failed", { error: e?.message }));
+    };
   } else {
     log("info", "cc2cc dormant — no CC2CC_IDENTITY/SELF set; not joining. register(name) to participate.");
   }
+
+  await server.connect(transport);
 }
 
 // ─── Global Error Handlers ──────────────────────────────────────────────────
