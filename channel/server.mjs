@@ -30,6 +30,7 @@ import { fileURLToPath } from "url";
 import { realpathSync } from "fs";
 import { generateUniqueName, validateName, takenNames } from "./names.mjs";
 import * as relay from "./relay.mjs";
+import { ensureDaemon, connectToDaemon } from "./daemon-client.mjs";
 import { render as tpl, loadTemplateOverrides } from "./templates.mjs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -69,6 +70,13 @@ let agentStatus = "Idle"; // Default status (v3.6)
 let pollTimer = null;
 let statusTimer = null;
 let heartbeatTimer = null;
+// Daemon mode (v3.7): the standalone daemon owns the hub connection; this MCP does not poll
+// the hub. daemonMode = a daemon is ensured + we're connected for wake pushes.
+let daemonMode = false;
+let relayConfigured = false;
+let daemonClient = null;
+/** Relay is reachable for this session iff a daemon owns it and a hub is configured. */
+function relayActive() { return daemonMode && relayConfigured; }
 let wakeAcknowledged = false; // set true when direct push succeeds
 let agentIdentity = null; // loaded during init — {display_name, agent_id, created, teams}
 let participating = false; // opt-in: false until the session joins (env identity or register)
@@ -726,7 +734,7 @@ function handleWhoami() {
 function handleListAgents() {
   const local = getAgentList();
   let remote = [];
-  if (relay.isRelayEnabled()) {
+  if (relayActive()) {
     remote = relay.getRemoteAgents();
   }
   return jsonResult([...local, ...remote]);
@@ -739,7 +747,7 @@ async function handleSend({ to, text, type = "message", priority = "normal" }) {
 
   // Bug 0d fix: if the target is a known REMOTE agent (another machine), a local inbox write
   // would strand. Relay via that agent's team instead (reaches the team leader).
-  const remote = relay.isRelayEnabled() ? relay.getRemoteAgents().find((a) => a.name === to) : null;
+  const remote = relayActive() ? relay.getRemoteAgents().find((a) => a.name === to) : null;
   if (remote && remote.team) {
     log("info", "direct send relayed via remote team", { to, team: remote.team });
     return handleSendTeam({ team: remote.team, text, intent: type });
@@ -935,20 +943,15 @@ async function handleSendTeam({ team, text, intent = "message", priority = "norm
     return textResult(`Cross-team message sent to ${team} leader (${leader}) — ${msg.id}`);
   }
 
-  // 2. Check if target is a remote team (via relay)
-  if (relay.isRelayEnabled()) {
+  // 2. Remote team → spool to the outbox; the DAEMON owns the hub connection and relays it
+  //    (drains the outbox with retry). The MCP never talks to the hub directly.
+  if (relayActive()) {
+    await relay.refreshRemoteState(BRIDGE_DIR); // ensure the cross-machine map is current
     if (!relay.isRemoteTeam(team)) {
       return textResult(`Team "${team}" is not reachable — no local leader and not registered with the relay hub.`, true);
     }
 
-    if (!relay.isRelayEnabled()) {
-      return textResult(`Team "${team}" is remote but relay is not enabled. Use register_relay to configure.`, true);
-    }
-
-    // Send via relay hub
-    const relayCfg = relay.getRelayStatus();
-    const relayToken = relay.getConfigToken();
-    // B5: Encrypt text before uploading to Hub
+    // B5: Encrypt text before it is spooled (the hub only ever sees ciphertext).
     const relayText = ENCRYPT_ENABLED && encryptionKey ? encryptText(text) : text;
     const msg = {
       id: `msg-${randomUUID()}`,
@@ -964,32 +967,18 @@ async function handleSendTeam({ team, text, intent = "message", priority = "norm
     };
 
     try {
-      await relay.sendViaRelay(
-        relayCfg.hub_url,
-        relayToken,
-        relayCfg.machine_id,
-        fromTeam,
-        team,
-        msg,
-      );
+      await atomicWrite(join(BRIDGE_DIR, "outbox", `${msg.id}.json`),
+        { id: msg.id, from_team: fromTeam, to_team: team, msg, created: new Date().toISOString() });
       const st = relay.getRemoteTeamStatus(team);
       const online = st.online_members?.length || 0;
-      log("info", "relay message sent", { id: msg.id, from_team: fromTeam, to_team: team, target_active: st.active, online });
+      log("info", "relay message spooled for daemon", { id: msg.id, from_team: fromTeam, to_team: team, target_active: st.active, online });
       const out = (st.active && online > 0)
         ? tpl("relay_queued_online", { team, id: msg.id, online })
         : tpl("relay_queued_dark", { team, id: msg.id, lastSeenSuffix: st.last_seen ? ` (last seen ${new Date(st.last_seen).toISOString()})` : "" });
       return textResult(out);
     } catch (err) {
-      // Hub unreachable → spool locally; the relay client drains the outbox with retry.
-      try {
-        await atomicWrite(join(BRIDGE_DIR, "outbox", `${msg.id}.json`),
-          { id: msg.id, from_team: fromTeam, to_team: team, msg, created: new Date().toISOString() });
-        log("info", "relay send spooled", { id: msg.id, to_team: team, error: err.message });
-        return textResult(tpl("relay_spooled", { team, id: msg.id }));
-      } catch (e2) {
-        log("error", "relay send failed (spool failed)", { to_team: team, error: err.message });
-        return textResult(tpl("relay_unreachable", { team, error: err.message, retryNote: "" }), true);
-      }
+      log("error", "relay spool failed", { to_team: team, error: err.message });
+      return textResult(tpl("relay_unreachable", { team, error: err.message, retryNote: "" }), true);
     }
   }
 
@@ -1359,6 +1348,9 @@ async function pollInbox() {
 // ─── Status Polling (join/leave detection) ───────────────────────────────────
 
 async function pollStatus() {
+  // In daemon mode, refresh the cross-machine map the daemon maintains so the roster + remote
+  // routing stay current (the MCP no longer polls the hub itself).
+  if (daemonMode) await relay.refreshRemoteState(BRIDGE_DIR).catch(() => {});
   const sDir = statusDir();
   let files;
   try {
@@ -1670,6 +1662,7 @@ async function shutdown(signal) {
   clearInterval(pollTimer);
   clearInterval(statusTimer);
   clearInterval(heartbeatTimer);
+  try { daemonClient?.close(); } catch {} // detach from the daemon (daemon keeps running)
 
   try {
     await writeHeartbeat("offline", `shutdown via ${signal}`);
@@ -1781,17 +1774,36 @@ async function activate(candidateName) {
   await loadTeamPolicies();
   reconcileTeamLeaders();
 
-  // 11. Load relay config and start relay client if configured
+  // 11. Relay is owned by the standalone daemon (one per host) — the MCP does NOT poll the
+  //     hub itself (fixes the relay-per-session contention, 0g). Ensure a daemon is running
+  //     and connect for wake pushes; the MCP reads the daemon-maintained remote map read-only.
   const relayConfig = await relay.loadRelayConfig(BRIDGE_DIR);
-  if (relayConfig && relayConfig.enabled !== false) {
-    // B6: Encryption is mandatory for relay — refuse to start without it
+  relayConfigured = !!(relayConfig && relayConfig.enabled !== false);
+  if (relayConfigured) {
     if (!ENCRYPT_ENABLED || !encryptionKey) {
-      log("warn", "refusing to start relay: encryption is mandatory (set CC2CC_ENCRYPT=1 and configure secret.key)");
+      // B6: Encryption is mandatory for relay — refuse without it.
+      log("warn", "relay disabled: encryption is mandatory (set CC2CC_ENCRYPT=1 and configure secret.key)");
+      relayConfigured = false;
     } else {
       const teamName = (agentIdentity?.teams || ["cc2cc"])[0];
-      relay.setEncryptionFunction(encryptText);
-      relay.startRelayClient(BRIDGE_DIR, teamName, relayConfig, agentName);
-      log("info", "relay client started", { hub: relayConfig.hub_url, machine: relayConfig.machine_id });
+      try {
+        const res = await ensureDaemon({
+          bridgeDir: BRIDGE_DIR,
+          env: { ...process.env, CC2CC_TEAM: teamName, CC2CC_IDENTITY: agentName },
+        });
+        daemonClient = connectToDaemon({
+          bridgeDir: BRIDGE_DIR,
+          agent: agentName,
+          onWake: () => { pollInbox().catch(() => {}); },
+          onStatus: (s) => log("info", "daemon link", { status: s }),
+        });
+        daemonMode = true;
+        await relay.refreshRemoteState(BRIDGE_DIR); // read daemon-maintained cross-machine map
+        log("info", "daemon mode active", { launched: res.launched, socket: res.socketPath, team: teamName });
+      } catch (e) {
+        log("warn", "daemon mode unavailable; relay disabled this session", { error: e.message });
+        relayConfigured = false;
+      }
     }
   }
 

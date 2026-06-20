@@ -359,6 +359,17 @@ async function loadRemoteState(dir) {
   } catch { /* no prior state */ }
 }
 
+/**
+ * Read-only refresh of the cross-machine map from the daemon-maintained remote-teams.json.
+ * Used by the MCP (which no longer runs the relay loop) so isRemoteTeam/getRemoteTeamStatus/
+ * getRemoteAgents reflect what the daemon has discovered. Does NOT start any network or
+ * persist (saveRemoteState early-returns when bridgeDir is unset), so it can't clobber the
+ * daemon's writes.
+ */
+export async function refreshRemoteState(dir) {
+  await loadRemoteState(dir);
+}
+
 // ─── Poll Cycle ─────────────────────────────────────────────────────────────
 
 /** Drain the local outbox: re-send spooled messages (hub-was-down), remove on success,
