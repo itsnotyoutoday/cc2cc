@@ -913,9 +913,15 @@ async function handleSendTeam({ team, text, intent = "message", priority = "norm
   const senderTeams = agentIdentity?.teams || ["cc2cc"];
   const fromTeam = senderTeams[0]; // primary team for routing
 
-  // 1. Try local team leader first
+  // 1. Local team leader first — BUT a team owned by another machine must route via the relay,
+  //    even when we hold a federated leader replica for it (teams-remote.json). Without this
+  //    guard a remote leader entry traps the message in the local branch (the remote leader is
+  //    never locally "online"), returns leader_offline, and never spools to the outbox for the
+  //    daemon to relay. Refresh the cross-machine map first so isRemoteTeam() is current.
+  if (relayActive()) await relay.refreshRemoteState(BRIDGE_DIR);
+  const isRemoteTeamTarget = relayActive() && relay.isRemoteTeam(team);
   const leader = teamLeaders.get(team);
-  if (leader) {
+  if (leader && !isRemoteTeamTarget) {
     if (!isAgentOnline(leader)) {
       return textResult(tpl("leader_offline", { team, leader }), true);
     }
@@ -946,7 +952,7 @@ async function handleSendTeam({ team, text, intent = "message", priority = "norm
   // 2. Remote team → spool to the outbox; the DAEMON owns the hub connection and relays it
   //    (drains the outbox with retry). The MCP never talks to the hub directly.
   if (relayActive()) {
-    await relay.refreshRemoteState(BRIDGE_DIR); // ensure the cross-machine map is current
+    // (remote map already refreshed above for the routing decision)
     if (!relay.isRemoteTeam(team)) {
       return textResult(`Team "${team}" is not reachable — no local leader and not registered with the relay hub.`, true);
     }
