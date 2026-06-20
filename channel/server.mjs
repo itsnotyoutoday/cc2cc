@@ -737,6 +737,14 @@ function handleListAgents() {
 async function handleSend({ to, text, type = "message", priority = "normal" }) {
   if (!to || !text) return textResult("Missing required fields: to, text", true);
 
+  // Bug 0d fix: if the target is a known REMOTE agent (another machine), a local inbox write
+  // would strand. Relay via that agent's team instead (reaches the team leader).
+  const remote = relay.isRelayEnabled() ? relay.getRemoteAgents().find((a) => a.name === to) : null;
+  if (remote && remote.team) {
+    log("info", "direct send relayed via remote team", { to, team: remote.team });
+    return handleSendTeam({ team: remote.team, text, intent: type });
+  }
+
   // Block cross-team direct sends (check before offline check — remote agents
   // may be offline on this machine but reachable via send_team relay)
   if (!sharesTeam(agentName, to)) {
@@ -856,6 +864,22 @@ async function handleReply({ msg_id, text }) {
 
   // Auto-complete task type: if original was a task, reply as response
   const replyType = originalMsg.type === "task" ? "response" : "message";
+  const fromTeam = originalMsg.from_team;
+  const myTeams = agentIdentity?.teams || [];
+
+  // Bug 0d fix: the original sender may be on another team / another machine. Writing to a
+  // local inbox would strand the reply (no one there reads it). If the original came
+  // cross-team, or the sender isn't reachable locally, RELAY the reply via send_team to the
+  // sender's team (reaches that team's leader, who can forward).
+  const localOnline = isAgentOnline(to);
+  if (fromTeam && (!myTeams.includes(fromTeam) || !localOnline)) {
+    log("info", "reply relayed via team", { to, team: fromTeam, replyTo: msg_id });
+    const r = await handleSendTeam({ team: fromTeam, text, intent: "reply" });
+    return r;
+  }
+  if (!localOnline) {
+    return textResult(`Original sender "${to}" is not reachable locally (likely on another machine) — reply with send_team to their team.`, true);
+  }
 
   const msg = buildMessage({
     from: agentName,
