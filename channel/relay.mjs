@@ -608,7 +608,12 @@ export async function doHeartbeat(bridgeDir, teamName) {
   try {
     const reg = JSON.parse(await readFile(join(bridgeDir, "teams.json"), "utf8"));
     for (const [tname, pol] of Object.entries(reg.teams || {})) {
-      if (pol && pol.owner_machine === config.machine_id) ownedPolicies[tname] = pol;
+      // Federate teams this machine OWNS, OR the team this daemon is registered for on the hub
+      // (it authoritatively holds that (machine, team) slot). The second clause guards against a
+      // stale/mismatched owner_machine silently suppressing federation — observed cross-account:
+      // a team created before the relay's machine_id was settled keeps an owner_machine that no
+      // longer equals config.machine_id, so its policy was never published and never synced.
+      if (pol && (pol.owner_machine === config.machine_id || tname === teamName)) ownedPolicies[tname] = pol;
     }
   } catch { /* no teams.json */ }
 
