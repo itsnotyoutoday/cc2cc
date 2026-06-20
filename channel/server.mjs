@@ -706,6 +706,15 @@ function jsonResult(data) {
 
 // ── whoami ──
 
+// 12b: In the daemon model the DAEMON owns the relay loop, so the MCP's own relayEnabled flag
+// is always false even while the relay is live. Report liveness from the daemon link instead,
+// so whoami doesn't contradict list_agents (which correctly shows remote peers online).
+function relayStatusForUi() {
+  const s = relay.getRelayStatus();
+  if (daemonMode) s.enabled = relayActive();
+  return s;
+}
+
 function handleWhoami() {
   const peers = getAgentList().filter((a) => a.status === "online" && !a.is_self);
   const whoami = {
@@ -720,7 +729,7 @@ function handleWhoami() {
     online_agents: peers.map((a) => a.name),
     // Structured roster so callers can name peers (and their team/role) directly.
     online_roster: peers.map((a) => ({ name: a.name, teams: a.teams, role: a.role })),
-    relay: relay.getRelayStatus(),
+    relay: relayStatusForUi(),
     // Presentation guidance for the agent relaying this to a human.
     _note:
       "Refer to agents by `name` (e.g. \"alpha-mem\") when reporting to the user — never by agent_id. " +
