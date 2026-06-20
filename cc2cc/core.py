@@ -15,6 +15,11 @@ def bridge_path() -> Path:
     return Path(os.environ.get("CC2CC_BRIDGE_DIR", os.path.expanduser("~/.cc2cc")))
 
 
+def room_inbox_path(recipient: str, room_id: str) -> Path:
+    """Return the path to a recipient's inbox within a specific room."""
+    return bridge_path() / "rooms" / room_id / f"to-{recipient}" / "inbox"
+
+
 def retry_replace(src: str, dst: str, retries: int = 5, delay: float = 0.05) -> None:
     """os.replace with retry for Windows AV file locking (PermissionError)."""
     for i in range(retries):
