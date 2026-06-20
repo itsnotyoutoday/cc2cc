@@ -10,6 +10,7 @@
 import { readFile, mkdir, writeFile, readdir, rm } from "fs/promises";
 import { join, basename } from "path";
 import { randomUUID } from "crypto";
+import { validateName } from "./names.mjs";
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -475,6 +476,10 @@ async function pollCycle(bridgeDir, teamName) {
       }
 
       if (!targetName) {
+        // Security (B1): targetTeam is attacker-supplied (msg.to_team). Reject anything that
+        // isn't a clean team name before it can escape bridgeDir via the staging path. Ack to
+        // drop the message rather than re-leasing it forever.
+        if (!validateName(targetTeam)) { ackedIds.push(msg.lease_id); continue; }
         // Fallback — write to staging area but pings will re-deliver
         const fallbackDir = join(bridgeDir, "remote", targetTeam, "inbox");
         await mkdir(fallbackDir, { recursive: true }).catch(() => {});
@@ -492,6 +497,9 @@ async function pollCycle(bridgeDir, teamName) {
         continue;
       }
 
+      // Security (B1): targetName can be a remote-asserted agent name (from the hub's
+      // online_teams roster); reject traversal before it drives an inbox path.
+      if (!validateName(targetName)) { ackedIds.push(msg.lease_id); continue; }
       try {
         // Write to standard inbox so pollInbox picks it up
         const inboxDir = join(bridgeDir, `to-${targetName}`, "inbox");

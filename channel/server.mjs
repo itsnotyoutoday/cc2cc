@@ -185,6 +185,11 @@ function log(level, msg, data = {}) {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function inboxDir(name) {
+  // Security (B1): names reaching here may be message-derived (msg.from, a reply target, a
+  // federated leader) and are NOT otherwise trusted. validateName rejects anything containing
+  // path separators or dots, so this is the single chokepoint guaranteeing inbox writes stay
+  // inside BRIDGE_DIR. Every legitimate agent name passes; only spoofed/traversal names throw.
+  if (!validateName(name)) throw new Error(`invalid agent name for inbox path: ${JSON.stringify(name)}`);
   return join(BRIDGE_DIR, `to-${name}`, "inbox");
 }
 function doneDir(name) {
@@ -878,6 +883,11 @@ async function handleReply({ msg_id, text }) {
   if (!to) {
     return textResult(`Cannot find original message ${msg_id}. Unable to determine recipient.`, true);
   }
+  // Security (B1): the recipient is taken from the original message body; reject a malformed
+  // name before it can drive an inbox path.
+  if (!validateName(to)) {
+    return textResult(`Cannot reply: original sender name "${to}" is malformed.`, true);
+  }
 
   // Auto-complete task type: if original was a task, reply as response
   const replyType = originalMsg.type === "task" ? "response" : "message";
@@ -1110,6 +1120,7 @@ async function handleRegister({ name: newName }) {
  * Called on every tool invocation so the agent sees new messages immediately.
  */
 async function consumeInbox() {
+  if (!agentName) return []; // dormant session (no identity yet) → no inbox to consume
   const primary = inboxDir(agentName);
   await mkdir(primary, { recursive: true });
   await mkdir(doneDir(agentName), { recursive: true });
@@ -1156,7 +1167,10 @@ async function consumeInbox() {
             await mkdir(done, { recursive: true });
             await retryRename(filePath, join(done, file));
 
-            if (msg.from && msg.from !== agentName) {
+            // Security (B1): msg.from is attacker-controllable on relayed mail. Only echo an
+            // expiry notice back to a well-formed local agent name — never let a spoofed
+            // name drive a filesystem path in this auto-triggered background path.
+            if (msg.from && msg.from !== agentName && validateName(msg.from)) {
               const expNotice = buildMessage({
                 from: agentName,
                 to: msg.from,
@@ -1283,6 +1297,7 @@ function formatNotification(msg) {
  * without waiting for the next tool call (piggyback).
  */
 async function pollInbox() {
+  if (!agentName) return; // dormant session (no identity yet) → nothing to poll
   const primary = inboxDir(agentName);
   const inboxPaths = [primary];
 
