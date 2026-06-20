@@ -111,6 +111,10 @@ function handleConnection(sock) {
         addConn(m.agent, sock);
         log("info", "mcp connected", { agent: m.agent });
         try { sock.write(JSON.stringify({ type: "welcome", agent: m.agent }) + "\n"); } catch {}
+        // Catch-up wake: mail that arrived while this agent had no live connection fired a
+        // watcher wake "to nobody". Nudge the (re)connecting MCP to poll now so a reconnect
+        // never misses already-delivered mail. The poll is idempotent, so an extra wake is safe.
+        try { sock.write(JSON.stringify({ type: "wake", agent: m.agent }) + "\n"); } catch {}
       } else if (m.type === "ping") {
         try { sock.write(JSON.stringify({ type: "pong" }) + "\n"); } catch {}
       }

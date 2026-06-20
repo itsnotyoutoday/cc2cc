@@ -32,6 +32,22 @@ test("ensureDaemon: no-op when a daemon already owns the socket", async () => {
   }
 });
 
+test("connectToDaemon: gets a catch-up wake on hello (reconnect never misses mail)", async () => {
+  const bridge = freshBridge();
+  const handle = await daemon.main({ bridgeDir: bridge, team: null, self: null });
+  const wakes = [];
+  // A message that landed BEFORE this client connects (wake fired to nobody).
+  poke(bridge, "carol", "pre");
+  const client = connectToDaemon({ bridgeDir: bridge, agent: "carol", onWake: (m) => wakes.push(m) });
+  try {
+    await sleep(300);                 // hello → welcome → catch-up wake
+    assert.ok(wakes.some((w) => w.agent === "carol"), "client got a catch-up wake on connect");
+  } finally {
+    client.close();
+    await handle.stop();
+  }
+});
+
 test("connectToDaemon: receives wake on inbox change", async () => {
   const bridge = freshBridge();
   const handle = await daemon.main({ bridgeDir: bridge, team: null, self: null });
