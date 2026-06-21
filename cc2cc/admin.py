@@ -95,7 +95,28 @@ def _load_registry() -> dict:
     return (d or {}).get("teams", {}) if d else {}
 
 
+# Token of the lock this process currently holds (set inside teams_lock); drives the re-stat guard.
+_CURRENT_LOCK_TOKEN = None
+
+
 def _save_registry(reg: dict):
+    # Re-stat guard (defense-in-depth vs the steal window): if we hold the lock, confirm it's STILL
+    # ours immediately before the write. A steal needs the lock to age past max_hold; the only thing
+    # after this check is atomic_write's sub-ms temp+rename, far too short to age out — so check→write
+    # is effectively atomic wrt the steal heuristic. If we were stolen (a >max_hold mid-section
+    # deschedule), abort LOUD so the fail-loud→retry contract re-applies cleanly. No-op outside a lock.
+    tok = _CURRENT_LOCK_TOKEN
+    if tok is not None:
+        lock_path = _teams_path().with_name("teams.json.lock")
+        try:
+            holder = json.loads(lock_path.read_text())
+        except Exception:
+            holder = None
+        if not holder or holder.get("pid") != tok["pid"] or holder.get("ts") != tok["ts"]:
+            raise RuntimeError(
+                "teams.json lock no longer owned (stolen after a long deschedule); "
+                "aborting to avoid a lost mutation"
+            )
     atomic_write(_teams_path(), {"teams": reg})
 
 
@@ -223,9 +244,12 @@ def teams_lock():
                 "aborting to avoid a lost mutation"
             )
         time.sleep(0.015 + random.random() * 0.035)  # jittered backoff
+    global _CURRENT_LOCK_TOKEN
+    _CURRENT_LOCK_TOKEN = token  # mark ownership for the re-stat guard in _save_registry
     try:
         yield
     finally:
+        _CURRENT_LOCK_TOKEN = None
         # Release only if the on-disk lock is still OURS — never delete a lock stolen + re-acquired.
         try:
             cur = json.loads(lock_path.read_text())

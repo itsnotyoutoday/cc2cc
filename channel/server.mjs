@@ -1687,11 +1687,32 @@ async function releaseTeamsLock(token) {
   } catch { /* already gone or unreadable → nothing to release */ }
 }
 
+// The token of the lock THIS process currently holds (set while inside withTeamsLock). Used by the
+// re-stat guard below. Safe as a module global: the file lock serializes critical sections so at most
+// one withTeamsLock body runs at a time per process.
+let currentLockToken = null;
+
+/** Defense-in-depth against the steal window: a steal can only happen if our lock AGED past max_hold
+ *  (a >max_hold mid-section deschedule). Re-stat right before the final write confirms we still own a
+ *  FRESH lock; the only thing after is atomicWrite's sub-ms temp+rename, far too short to age out. So
+ *  re-stat→write is effectively atomic wrt the steal heuristic — closing the window, not just narrowing
+ *  it. If we've been stolen, abort LOUD so the existing fail-loud→retry contract re-applies cleanly.
+ *  No-op when not under a lock (single-writer paths). */
+function assertLockOwned() {
+  if (!currentLockToken) return;
+  let h = null;
+  try { h = JSON.parse(readFileSync(TEAMS_LOCK, "utf8")); } catch { /* gone/torn → not ours */ }
+  if (!h || h.pid !== currentLockToken.pid || h.ts !== currentLockToken.ts) {
+    throw new Error("teams.json lock no longer owned (stolen after a long deschedule); aborting to avoid a lost mutation");
+  }
+}
+
 /** Run fn() holding the teams.json lock. FAIL LOUD on acquire-timeout — never silently drop a team
  *  mutation (a swallowed failure would reintroduce the exact lost-update we're preventing). */
 async function withTeamsLock(fn) {
   const token = await acquireTeamsLock();
-  try { return await fn(); } finally { await releaseTeamsLock(token); }
+  currentLockToken = token;
+  try { return await fn(); } finally { currentLockToken = null; await releaseTeamsLock(token); }
 }
 
 async function loadTeamsRegistry() {
@@ -1710,6 +1731,7 @@ async function saveTeamFile(t) {
   t.updated = new Date().toISOString();
   const reg = await loadTeamsRegistry();
   reg[t.name] = t;
+  assertLockOwned(); // re-stat: confirm our lock wasn't stolen during a long deschedule before writing
   await atomicWrite(TEAMS_PATH, { teams: reg });
 }
 
