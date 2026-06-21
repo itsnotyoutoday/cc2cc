@@ -230,9 +230,9 @@ export async function handleRegisterRelay(bridgeDir, args) {
         headers: { "Content-Type": "application/json" },
         signal: AbortSignal.timeout(HUB_FETCH_TIMEOUT_MS), // M5: bound the call
         // NOTE: agent roster is intentionally NOT sent here (registers with empty
-        // agents on the Hub). Cross-machine agent-level visibility is STUBBED until
-        // v3.6 §3 link #1, which will read local agents from the status dir and fold
-        // them into the keepalive payload. See SPEC-v3.6-ADDENDUM-STATUS.md §3.
+        // agents on the Hub). Cross-machine agent-level visibility is delivered via the
+        // heartbeat roster (doHeartbeat folds local agents into /api/heartbeat). See
+        // docs/SPECIFICATION.md §6 (teams & routing / federation) and §3 (heartbeat schema).
         body: JSON.stringify({
           token: cfg.token,
           machine_id: cfg.machine_id,

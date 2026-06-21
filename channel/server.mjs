@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * CC2CC MCP Channel Server v3.0
+ * CC2CC MCP Channel Server v3.6
  *
  * Unified multi-agent communication server with dynamic identity.
- * Auto-generates a unique name on startup, discovers peers via heartbeats,
- * and exposes 7 MCP tools: whoami, list_agents, send, broadcast, reply, check_inbox, register.
+ * Auto-generates a unique name on startup, discovers peers via heartbeats, and exposes 15 MCP
+ * tools: whoami, list_agents, list_teams, send, send_team, broadcast, reply, check_inbox,
+ * register, register_relay, set_status, create_team, request_join, admit, evict.
  *
  * Ephemeral mailboxes: on startup, stale agent directories are cleaned up.
  * Sending to offline agents is rejected — mailboxes only exist for active sessions.
@@ -432,7 +433,7 @@ function sharesTeam(agentA, agentB) {
 const server = new Server(
   {
     name: "cc2cc_channel",
-    version: "3.0.0",
+    version: "3.6.0",
     instructions: [
       "You are connected to CC2CC — an agent-to-agent communication bridge.",
       "Other agents can send you messages. Incoming messages appear as INCOMING MESSAGES blocks in tool responses.",
