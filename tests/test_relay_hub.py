@@ -452,10 +452,20 @@ class TestHeartbeat:
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 class TestHealth:
-    def test_health_returns_counts(self):
+    def test_health_unauthenticated_is_liveness_only(self):
+        # m4: /health leaks no mesh metrics without a valid token — only liveness.
         reset_state()
         register()
         resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data == {"status": "ok"}
+        assert "registrations" not in data
+
+    def test_health_returns_counts_when_authenticated(self):
+        reset_state()
+        register()
+        resp = client.get("/health", headers={"Authorization": f"Bearer {TOKEN}"})
         assert resp.status_code == 200
         data = resp.json()
         assert "registrations" in data

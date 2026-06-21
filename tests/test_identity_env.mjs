@@ -20,16 +20,36 @@ import { fileURLToPath } from "node:url";
 
 const SERVER = join(dirname(fileURLToPath(import.meta.url)), "..", "channel", "server.mjs");
 
+// Strip any cc2cc identity env inherited from the runner (e.g. when tests run inside a live
+// cc2cc session that exports CC2CC_IDENTITY/CC2CC_TEAM) — otherwise CC2CC_IDENTITY would win over
+// a test's SELF=, naming the wrong agent. Each test supplies exactly the vars it means to test.
+function cleanEnv(extra) {
+  const e = { ...process.env, ...extra };
+  for (const k of ["CC2CC_IDENTITY", "SELF", "CC2CC_TEAM", "CC2CC_ROLE"]) {
+    if (!(k in (extra || {}))) delete e[k];
+  }
+  return e;
+}
+
 /** Spawn the server on a fresh bridge with the given env; resolve once the
  *  expected identity file exists (or reject on timeout). Always kills the proc. */
 async function bootServer(env, identityFileName, { timeoutMs = 8000 } = {}) {
   const bridge = await mkdtemp(join(tmpdir(), "cc2cc-idtest-"));
   const child = spawn("node", [SERVER], {
-    env: { ...process.env, CC2CC_BRIDGE_DIR: bridge, ...env },
+    env: cleanEnv({ CC2CC_BRIDGE_DIR: bridge, ...env }),
     stdio: ["pipe", "pipe", "pipe"], // keep stdin open so the stdio transport stays alive
   });
   let stderr = "";
   child.stderr.on("data", (d) => { stderr += d.toString(); });
+  child.stdout.on("data", () => {}); // drain so the transport never backpressures
+  // 0f: mesh activation (which writes the identity file) is gated on a real MCP initialize
+  // handshake — a bare spawn no longer auto-joins. Complete the handshake so the env-driven
+  // identity actually materializes.
+  const send = (m) => { try { child.stdin.write(JSON.stringify(m) + "\n"); } catch {} };
+  send({ jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "idtest", version: "1" } } });
+  await new Promise((r) => setTimeout(r, 200));
+  send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   const idPath = join(bridge, "identities", identityFileName);
   const deadline = Date.now() + timeoutMs;
@@ -105,7 +125,7 @@ describe("identity from launch env (CC2CC_IDENTITY / CC2CC_TEAM / CC2CC_ROLE)", 
     // Opt-in policy: a session launched without CC2CC_IDENTITY/SELF must NOT join the mesh.
     const bridge = await mkdtemp(join(tmpdir(), "cc2cc-idtest-dormant-"));
     const child = spawn("node", [SERVER], {
-      env: { ...process.env, CC2CC_BRIDGE_DIR: bridge }, // no CC2CC_IDENTITY/SELF
+      env: cleanEnv({ CC2CC_BRIDGE_DIR: bridge }), // no CC2CC_IDENTITY/SELF
       stdio: ["pipe", "pipe", "pipe"],
     });
     try {
@@ -127,9 +147,15 @@ describe("identity from launch env (CC2CC_IDENTITY / CC2CC_TEAM / CC2CC_ROLE)", 
     const bridge = await mkdtemp(join(tmpdir(), "cc2cc-idtest-share-"));
     const boot = (env, file) => new Promise(async (resolve, reject) => {
       const child = spawn("node", [SERVER], {
-        env: { ...process.env, CC2CC_BRIDGE_DIR: bridge, ...env },
+        env: cleanEnv({ CC2CC_BRIDGE_DIR: bridge, ...env }),
         stdio: ["pipe", "pipe", "pipe"],
       });
+      child.stdout.on("data", () => {});
+      // 0f: complete the MCP handshake so the env-driven identity activates.
+      const send = (m) => { try { child.stdin.write(JSON.stringify(m) + "\n"); } catch {} };
+      send({ jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "idtest", version: "1" } } });
+      setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/initialized" }), 200);
       const idPath = join(bridge, "identities", file);
       const deadline = Date.now() + 8000;
       for (;;) {
