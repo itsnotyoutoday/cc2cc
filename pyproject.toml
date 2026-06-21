@@ -26,7 +26,7 @@ classifiers = [
 
 [project.scripts]
 cc2cc = "cc2cc.cli:main"
-cc2cc_admin = "cc2cc.admin:main"
+cc2cc-admin = "cc2cc.admin:main"
 
 [project.optional-dependencies]
 watch = ["watchdog"]

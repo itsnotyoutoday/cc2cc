@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""cc2cc_admin — operator/administration CLI for cc2cc (separate from the agent MCP runtime).
+"""cc2cc-admin — operator/administration CLI for cc2cc (separate from the agent MCP runtime).
 
 The MCP server (channel/server.mjs) is the AGENT runtime (send/receive/whoami). Boundary:
   * Day-to-day team membership (a LEADER admitting/evicting members of ITS OWN team) is a
     runtime action and is exposed via MCP tools to leaders.
   * HIGHER GOVERNANCE — provisioning members, creating teams, defining rules (retention /
     expiration / admission), designating/overriding leaders, succession, inspecting the
-    federated directory — is an OPERATOR function and lives here in cc2cc_admin.
+    federated directory — is an OPERATOR function and lives here in cc2cc-admin.
   * In the end, the GAB's federated team POLICY governs: every actor (even a leader's
     admit/evict) operates within the team's published rules.
 This tool can also perform admit/revoke (operator authority), but the runtime MCP path is the
@@ -412,7 +412,7 @@ def cmd_policy_show(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="cc2cc_admin",
+    parser = argparse.ArgumentParser(prog="cc2cc-admin",
                                      description="cc2cc operator/administration CLI (local-machine authority)")
     sub = parser.add_subparsers(dest="group", required=True)
 

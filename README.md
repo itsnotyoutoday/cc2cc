@@ -1,10 +1,14 @@
 # CC2CC: Claude Code ↔ Claude Code Communication
 
-**File-based agent-to-agent communication** between Claude Code instances running on the same machine.
+**Agent-to-agent communication** between Claude Code instances — on the same machine via a shared
+file mailbox, and **across machines** via an encrypted relay hub. Agents are organized into
+**teams** with leaders, membership, and cross-team message routing.
 
-> Two Claude Code sessions can't talk to each other. CC2CC fixes that with a file mailbox + MCP push channel.
+> Two Claude Code sessions can't talk to each other. CC2CC fixes that with a file mailbox + MCP
+> push channel, **teams** for scoping who talks to whom, and an optional **relay** for joining
+> agents across machines into one mesh.
 
-Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP channels, and plain JSON files.
+Built on Claude Code hooks, MCP channels, plain JSON files, and a small per-host daemon.
 
 > **⚠️ Experimental:** CC2CC relies on Claude Code's development channels — an experimental feature not yet publicly stable. You must launch Claude Code with the `--dangerously-load-development-channels` flag for channel push notifications to work. Without it, the MCP server starts but cannot push messages into the session.
 >
@@ -25,52 +29,108 @@ Extracted from a working multi-agent setup. Built on Claude Code hooks, MCP chan
 
 ## Architecture
 
-```
-┌─────────────────┐                              ┌─────────────────┐
-│  Claude Code A   │                              │  Claude Code B   │
-│  (auto: brave-fox)│                             │  (auto: calm-owl)│
-│                  │                              │                  │
-│  MCP Server ◄────┼─── to-brave-fox/inbox/ ◄─────┼── send tool     │
-│  (polls inbox)   │                              │                  │
-│  send tool ──────┼──► to-calm-owl/inbox/ ───────┼──► MCP Server   │
-│                  │                              │  (polls inbox)   │
-│  Tools:          │    status/                   │  Tools:          │
-│  send, broadcast │    brave-fox-heartbeat.json  │  send, broadcast │
-│  reply, register │    calm-owl-heartbeat.json   │  reply, register │
-│  list_agents     │                              │  list_agents     │
-│  whoami          │                              │  whoami          │
-└─────────────────┘                              └─────────────────┘
+CC2CC has three runtime pieces:
+
+- **MCP server (`channel/server.mjs`)** — **one per Claude Code session**. Claude Code spawns it
+  from the `mcpServers.cc2cc` entry. It exposes the agent tools, polls the agent's inbox, and
+  pushes incoming messages into the session as channel notifications.
+- **Daemon (`channel/daemon.mjs`)** — **one per host** (per bridge), auto-spawned by the first MCP
+  session. It owns the single connection to the relay hub (so sessions don't contend for it) and
+  maintains the cross-machine roster. MCPs talk to it over a unix socket at `<bridge>/daemon.sock`.
+- **Relay hub (`relay_hub.py`)** — **optional, one per "server" machine**. A zero-knowledge message
+  queue that forwards **ciphertext** between machines. Only needed for cross-machine meshes.
+
+### Same-machine message flow
+
+Agents on one host share a **bridge** directory. A message is just a signed JSON file dropped into
+the recipient's inbox; the recipient's MCP server polls that inbox and pushes it into the session.
+
+```mermaid
+flowchart LR
+  A(["alice<br/>Claude session + MCP"])
+  B(["bob<br/>Claude session + MCP"])
+  subgraph BR["Shared bridge · CC2CC_BRIDGE_DIR"]
+    IB["to-bob/inbox/<br/>msg-uuid.json"]
+    DN["to-bob/done/<br/>to-bob/receipts/"]
+    IA["to-alice/inbox/"]
+    ST["status/<br/>*-heartbeat.json"]
+    KEY["secret.key<br/>HMAC sign + verify"]
+  end
+  A -- "① send(to=bob)<br/>write signed JSON" --> IB
+  IB -- "② bob's MCP polls (≤3s)<br/>verify sig → push to session" --> B
+  B -- "③ reply() / send<br/>write JSON" --> IA
+  IA -- "④ alice's MCP polls + push" --> A
+  IB -. "after read → archived" .-> DN
+  A -. heartbeat .-> ST
+  B -. heartbeat .-> ST
+  LOC["📁 CC2CC_BRIDGE_DIR resolves to:<br/>• User · Linux/macOS: ~/.cc2cc · Windows: %USERPROFILE%\.cc2cc<br/>• System-wide · Linux: /var/lib/cc2cc · macOS: /Library/Application Support/cc2cc · Windows: C:\ProgramData\cc2cc"]
+  BR -. "lives at" .-> LOC
 ```
 
-**How it works:** Agent A drops a JSON file into an inbox directory. Agent B's MCP server polls that directory, reads the message, and pushes it into B's session as a channel notification. B replies using an MCP tool, which writes a response back into A's inbox. Messages for offline agents wait in the inbox and get delivered on the next session start.
+> Bridge location is resolved from `CC2CC_BRIDGE_DIR`, falling back to the per-user default above.
+> The bundled installer implements **user scope** on every OS and **system scope** on Linux
+> (systemd); the macOS/Windows system paths follow each OS's shared-data convention. Messages for
+> offline agents wait in the inbox and deliver on next launch.
+
+### Cross-machine flow (relay protocol)
+
+Agents on different hosts never share a filesystem — they meet at a **relay hub**. Each host's
+**daemon** holds the one hub connection; the hub is a zero-knowledge queue that only sees
+ciphertext. Everything is encrypted end-to-end (AES-256-GCM) before it leaves the origin host.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant AM as Alice MCP (Host A)
+  participant OB as outbox/ (bridge A)
+  participant DA as Daemon A
+  participant HUB as Relay Hub
+  participant DB as Daemon B
+  participant IB as to-carol/inbox/ (bridge B)
+  participant CM as Carol MCP (Host B)
+
+  Note over DA,HUB: registration (per host, periodic)
+  DA->>HUB: POST /api/register {machine_id, team, token}
+  HUB-->>DA: { ttl_seconds }
+  loop keep alive
+    DA->>HUB: POST /api/keepalive + /api/heartbeat
+  end
+
+  Note over AM,DA: send (cross-team → cross-host)
+  AM->>OB: send_team("remote", text)<br/>encrypt AES-256-GCM, spool envelope
+  DA->>OB: read pending envelope
+  DA->>HUB: POST /api/send {to_team, ciphertext}
+  HUB-->>HUB: route by (machine_id, team)
+
+  Note over HUB,CM: deliver
+  DB->>HUB: POST /api/poll
+  HUB-->>DB: ciphertext envelope(s)
+  DB->>HUB: POST /api/ack
+  DB->>IB: decrypt + verify → write msg-uuid.json
+  IB->>CM: Carol's MCP polls + pushes into session
+```
+
+See [Teams](#teams) for how `send_team` routing works and [Remote connections (relay)](#remote-connections-relay) for setup.
 
 ## Quick Start
 
-**The easy way:** copy this prompt, paste it into any Claude Code session — Claude does the rest!
+**The easy way — one installer:**
 
+```bash
+git clone https://github.com/non4me/cc2cc.git ~/cc2cc && cd ~/cc2cc
+scripts/cc2cc-install.sh            # interactive: local (this account) or global (machine-wide)
 ```
-Install cc2cc — a file-based agent-to-agent messaging system that lets
-multiple Claude Code sessions communicate with each other on the same machine.
 
-Steps:
-1. Clone: git clone https://github.com/non4me/cc2cc.git ~/.cc2cc/repo
-2. Install deps: cd ~/.cc2cc/repo/channel && npm install
-3. Copy server files to bridge:
-   cp ~/.cc2cc/repo/channel/server.mjs ~/.cc2cc/server.mjs
-   cp ~/.cc2cc/repo/channel/names.mjs ~/.cc2cc/names.mjs
-   cp ~/.cc2cc/repo/channel/package.json ~/.cc2cc/package.json
-   cp -r ~/.cc2cc/repo/channel/node_modules ~/.cc2cc/node_modules
-4. Create status dir: mkdir -p ~/.cc2cc/status
-5. Add MCP server to ~/.claude.json (mcpServers section):
-   "cc2cc": {
-     "command": "node",
-     "args": ["~/.cc2cc/server.mjs"],
-     "env": { "CC2CC_BRIDGE_DIR": "~/.cc2cc" }
-   }
-6. Verify: run "node ~/.cc2cc/server.mjs" to check it starts without errors.
+The installer creates the bridge + signing key, registers the `cc2cc` MCP server in
+`~/.claude.json` (via `claude mcp add`), and optionally sets up the relay client/hub and teams.
+A machine-wide (`--scope global`) install puts a shared bridge in `/var/lib/cc2cc` and runs the
+daemon (and optional hub) as systemd services. Reverse anything with `scripts/cc2cc-install.sh uninstall`.
 
-After install, restart Claude Code with:
-claude --dangerously-load-development-channels server:cc2cc
+Then bring an agent online:
+
+```bash
+cc2cc-launch <identity>            # foreground interactive (no identity → pick from a list)
+cc2cc-launch -t <identity>         # in tmux, hands-free (auto-answers the startup menus)
 ```
 
 <details>
@@ -79,35 +139,50 @@ claude --dangerously-load-development-channels server:cc2cc
 #### Requirements
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (CLI)
-- Node.js ≥ 18 (for the MCP channel server)
-- Python 3.8+ (for scripts)
+- Node.js ≥ 18 (MCP channel server + daemon)
+- Python 3.8+ (scripts, signing)
+- **For relay / teams:** a Python venv with `pip install -e .` — pulls in `fastapi`, `uvicorn`,
+  `pydantic` (relay hub) and the `cc2cc` / `cc2cc-admin` CLIs. `tmux` for `cc2cc-launch -t`.
 
 #### 1. Clone and initialize
 
 ```bash
 git clone https://github.com/non4me/cc2cc.git
 cd cc2cc
-pip install -e .
-cc2cc init
+pip install -e .          # installs the cc2cc + cc2cc-admin CLIs and relay-hub deps
 ```
 
 #### 2. Configure Claude Code
 
-Add to `~/.claude/settings.json`:
+MCP server definitions live in **`~/.claude.json`** (user scope) or a project `.mcp.json` —
+*not* in `settings.json`, which holds no MCP server definitions. The safest way to register is
+the Claude Code CLI, which edits the file atomically and is idempotent:
+
+```bash
+claude mcp add --scope user cc2cc \
+  --env CC2CC_BRIDGE_DIR="$HOME/.cc2cc" \
+  -- node "$HOME/.cc2cc/server.mjs"
+```
+
+Or, to merge it by hand, add to the `mcpServers` object in `~/.claude.json` (use an **absolute**
+path — `node` does not expand `~`):
 
 ```json
 {
   "mcpServers": {
     "cc2cc": {
       "command": "node",
-      "args": ["~/.cc2cc/server.mjs"],
+      "args": ["/home/you/.cc2cc/server.mjs"],
       "env": {
-        "CC2CC_BRIDGE_DIR": "~/.cc2cc"
+        "CC2CC_BRIDGE_DIR": "/home/you/.cc2cc"
       }
     }
   }
 }
 ```
+
+> Or just run `scripts/cc2cc-install.sh`, which does all of the above (and optional relay/teams
+> setup) for you, with a matching `cc2cc-install.sh uninstall` to reverse it.
 
 </details>
 
@@ -130,89 +205,173 @@ claude --dangerously-load-development-channels server:cc2cc
 
 ### 4. Communicate (from inside Claude Code)
 
-The agent can use MCP tools directly:
-- `send(to="brave-fox", text="Hello!")` — send to specific agent
-- `broadcast(text="Deploy starting")` — send to all
-- `reply(msg_id="msg-xxx", text="Got it")` — reply to a message
-- `list_agents()` — see who's online
-- `whoami()` — check your name
-- `register(name="devops")` — change your name
+The agent uses the cc2cc MCP tools directly. Full surface:
+
+**Messaging**
+- `send(to, text)` — message another agent **on your team** (cross-team is blocked — use `send_team`)
+- `broadcast(text)` — message all online agents **on your team**
+- `send_team(team, text)` — **cross-team**: routes to the target team's leader, who forwards it
+- `reply(msg_id, text)` — reply to a message (threads via `replyTo`)
+- `check_inbox()` — read pending messages (old ones are flagged "may be stale")
+
+**Identity & presence**
+- `whoami()` — your name, teams, role, online peers, relay status
+- `list_agents()` — who's online (local + relayed remote agents)
+- `list_teams()` — known teams across the federation
+- `register(name)` — set/rename your identity (or join, server-side)
+- `set_status(text)` — set your status line (e.g. "reviewing PR #42")
+
+**Teams (membership & governance)**
+- `create_team(name)` — create a team; you become its leader
+- `request_join(team)` — ask a team's leader to admit you
+- `admit(name)` / `evict(name)` — **leaders only**, for their own team
+
+**Relay**
+- `register_relay(...)` — configure cross-machine relay and register with a running hub
+
+## Teams
+
+Agents are scoped into **teams**. Messaging rules:
+
+- **Same team** is direct: `send` (to one member) and `broadcast` (to all members).
+- **Cross team** goes **through the target team's leader**: `send_team(team, text)` lands in the
+  leader's inbox, and the leader forwards it to members. Direct cross-team `send` is blocked.
+- Each team has a **leader**, an optional **succession** list, and **admission** policy
+  (`open` or `approved`). Leaders `admit`/`evict` members of their own team.
+
+```mermaid
+flowchart TD
+  subgraph nexus["Team: nexus"]
+    L1["leader<br/>nexus-coord"]
+    M1["member<br/>tom"]
+  end
+  subgraph remote["Team: remote"]
+    L2["leader<br/>rlead"]
+    M2["member<br/>rmem"]
+  end
+  M1 -- "send / broadcast<br/>(same team · direct)" --> L1
+  M1 -- "send_team('remote', …)" --> L2
+  L2 -- "leader forwards" --> M2
+```
+
+An agent picks its team at launch (`CC2CC_TEAM`, or the team tied to its provisioned identity) or
+at runtime via `create_team` / `request_join`. **Provisioning** (creating teams, adding members,
+setting leaders/succession/admission/retention) is an operator job done with the **`cc2cc-admin`**
+CLI — separate from the agent's everyday MCP tools:
+
+```bash
+export CC2CC_BRIDGE_DIR=~/.cc2cc
+cc2cc-admin team create nexus --leader nexus-coord --admission approved
+cc2cc-admin member add tom --team nexus
+cc2cc-admin member add nexus-coord --team nexus --role leader
+cc2cc-admin team show nexus      # leader, members, succession, rules
+cc2cc-admin gab                  # federated directory (your teams + remote replicas)
+```
+
+## Remote connections (relay)
+
+A **relay hub** joins agents across machines into one mesh. Each host runs a daemon that holds the
+single hub connection; the hub is a **zero-knowledge** queue that only ever forwards **ciphertext**.
+The on-the-wire protocol is shown in [Cross-machine flow](#cross-machine-flow-relay-protocol) above.
+
+Set it up with the installer (`scripts/cc2cc-install.sh --relay` to dial a hub, `--hub` to run
+one) or by hand:
+
+- **Run a hub** (the "server" machine): `./starthub.sh --bg --port 10322 --token <TOKEN>`
+  (wraps `relay_hub.py`). Health: `curl -s http://127.0.0.1:10322/health`.
+- **Client config** lives in `connections.json` (canonical; legacy flat `relay.json` is still read)
+  — `self` identity + a list of hub `connections`. See `connections.example.json`.
+- **Encryption is mandatory** for the relay: launch agents with `CC2CC_ENCRYPT=1`, and every peer
+  must share a **byte-identical `secret.key`**. The relay refuses to start without it and is
+  **fail-closed** — it won't put plaintext on the wire and quarantines inbound messages whose
+  encryption was stripped.
+
+`cc2cc-launch` auto-enables `CC2CC_ENCRYPT` when a relay config is present.
 
 ## CC2CC vs Google A2A
 
 | Feature | Google A2A | CC2CC |
 |---------|-----------|-------|
-| Transport | HTTP | Filesystem |
-| Setup | Service discovery, auth, endpoints | `cc2cc init` |
-| Dependencies | HTTP server per agent | Node.js (MCP server only) |
+| Transport | HTTP | Filesystem (same host) + relay hub (cross host) |
+| Setup | Service discovery, auth, endpoints | `cc2cc-install.sh` |
+| Dependencies | HTTP server per agent | Node.js MCP + per-host daemon; Python hub for relay |
 | Offline delivery | Requires message broker | Built-in (files wait in inbox) |
 | Same-machine agents | Overkill | Purpose-built |
-| Cross-network agents | ✅ | ❌ (same filesystem required) |
+| Cross-network agents | ✅ | ✅ via encrypted relay hub (zero-knowledge) |
+| Teams / routing | DIY | Built-in (leaders, cross-team via `send_team`) |
 
-CC2CC is not a replacement for A2A. It's for the common case where you have multiple Claude Code instances on the same machine that need to coordinate.
+CC2CC shines for fleets of Claude Code instances — on one machine or several — that need to
+coordinate with minimal infrastructure.
 
 ## Repo Structure
 
 ```
 cc2cc/
 ├── cc2cc/                      # Python package
-│   ├── __init__.py
 │   ├── core.py                 # Atomic writes, bridge path, size limits
 │   ├── signing.py              # HMAC-SHA256 message signing
-│   └── cli.py                  # Unified CLI entry point
-├── pyproject.toml              # pip installable package
-├── channel/
-│   ├── server.mjs           # Unified MCP server (dynamic identity, multi-agent)
-│   ├── names.mjs            # Name generation (adjective-animal dictionary)
+│   ├── cli.py                  # `cc2cc` CLI entry point
+│   └── admin.py                # `cc2cc-admin` operator/governance CLI (teams, members, policy)
+├── relay_hub.py                # Cross-machine relay hub (FastAPI; zero-knowledge ciphertext queue)
+├── starthub.sh                 # Convenience launcher for the relay hub
+├── connections.example.json    # Canonical relay client config (connections.json)
+├── pyproject.toml              # pip installable; defines cc2cc + cc2cc-admin
+├── channel/                    # Node.js runtime
+│   ├── server.mjs              # MCP server — one per Claude session (dynamic identity, teams)
+│   ├── daemon.mjs              # Per-host daemon — owns the hub connection + cross-machine roster
+│   ├── daemon-client.mjs       # MCP↔daemon client (ensures/launches the daemon)
+│   ├── relay.mjs               # Relay client (spool/deliver, connections.json handling)
+│   ├── crypto.mjs              # AES-256-GCM end-to-end encryption
+│   ├── names.mjs               # Name generation (adjective-animal dictionary)
 │   └── package.json
 ├── scripts/
-│   ├── init.py              # Bootstrap the bridge
-│   ├── send.py              # Send a message
-│   ├── receive.py           # Read pending messages
-│   ├── reply.py             # Reply to a message (completes tasks automatically)
-│   ├── task.py              # Delegate a task
-│   ├── status.py            # Show bridge status
-│   ├── validate.py          # Validate message schema
-│   └── cleanup.py           # TTL-based cleanup
+│   ├── cc2cc-install.sh        # Unified installer/uninstaller (local + global scopes)
+│   ├── cc2cc-launch.sh         # Launch an agent under a chosen identity (foreground or tmux)
+│   ├── setup.sh                # Minimal single-node setup
+│   ├── default-policy.json     # Default federation policy
+│   └── send.py, receive.py, reply.py, task.py, status.py, validate.py, cleanup.py, init.py
 ├── hooks/
-│   ├── session_start.py     # SessionStart hook (heartbeat + inbox check)
-│   ├── session_end.py       # SessionEnd hook (mark offline)
-│   └── inbox_watcher.py     # Optional: watchdog-based real-time delivery
-├── services/
-│   ├── macos/               # LaunchAgent template (macOS)
-│   ├── linux/               # systemd service template (Linux)
-│   └── windows/             # Task Scheduler template (Windows)
-├── tests/
-│   └── test_smoke.py        # Smoke tests
-├── docs/
-│   ├── SPECIFICATION.md     # Protocol spec, schemas, message lifecycle
-│   └── CONFIGURATION.md     # Environment variables, full settings.json examples
+│   ├── session_start.py        # SessionStart hook (heartbeat + inbox check)
+│   ├── session_end.py          # SessionEnd hook (mark offline)
+│   └── inbox_watcher.py        # Optional: watchdog-based real-time delivery
+├── services/                   # OS service templates (macOS launchd / Linux systemd / Windows)
+├── tests/                      # pytest (python) + node test_*.mjs (channel/daemon/relay/teams)
+├── docs/                       # ARCHITECTURE.md, SPECIFICATION.md, CONFIGURATION.md
 ├── LICENSE
-└── README.md                # ← you are here
+└── README.md                   # ← you are here
 ```
 
 ## Platform Support
 
-| Platform | Status | Notes |
-|----------|--------|-------|
-| macOS | Full support | watchdog or polling, LaunchAgent template |
-| Linux | Full support | watchdog or polling, systemd template |
-| Windows | Full support | watchdog or polling, Task Scheduler template |
+| Platform | Agents (MCP + daemon, user scope) | Daemon/hub as a *system service* | Inbox-watcher template |
+|----------|:---:|---|---|
+| Linux | ✅ | ✅ systemd — wired by `cc2cc-install.sh --scope global` | `services/linux/` (systemd) |
+| macOS | ✅ | ⚠️ manual — LaunchAgent template only | `services/macos/` (launchd) |
+| Windows | ✅ | ⚠️ manual — Task Scheduler template only | `services/windows/` (Task Scheduler) |
+
+Core messaging — the same-machine bridge, the per-host daemon, and the relay client — runs on all
+three (Node.js + Python). What's **Linux-only today** is the unified installer wiring the daemon and
+relay hub up as *system services*; on macOS/Windows the daemon still auto-spawns per session, and
+for an always-on service use the templates under `services/` or your own supervisor. *(Known gap —
+see issues.)*
 
 ## Limitations
 
-- **Same filesystem required** — both agents must see `~/.cc2cc` (local machine, NFS, or shared volume)
+- **Same-host = shared bridge; cross-host = relay** — same-machine agents must share a bridge dir (`~/.cc2cc`, or `/var/lib/cc2cc` for a machine-wide install). Agents on **different machines** connect through the encrypted relay hub instead
 - **No authentication** — any process that can write to the inbox can inject messages. See [Security](#security) below.
-- **No encryption** — messages are plaintext JSON
+- **Encryption** — local same-host messages are HMAC-SHA256 *signed* (integrity), not encrypted, since they never leave the machine. **Cross-machine relay traffic is end-to-end encrypted with AES-256-GCM** and is **fail-closed**: the relay refuses to send plaintext on the wire and quarantines inbound messages whose encryption was stripped. The MCP server performs the crypto; the relay **hub is zero-knowledge** (it only ever sees ciphertext)
 - **No guaranteed ordering** — use `replyTo` for threading
 - **Polling latency** — up to 3s delivery delay (use watchdog for near-instant)
 - **Experimental MCP feature** — requires `--dangerously-load-development-channels` flag; the channels API may change or be removed
 
 ## Security
 
-CC2CC generates an HMAC-SHA256 shared secret during `cc2cc init`. All messages are signed automatically. Recipients verify signatures on read.
+CC2CC generates an HMAC-SHA256 shared secret at install time (`cc2cc-install.sh`, or `cc2cc init`).
+All local messages are signed automatically and verified on read. For the **relay**, the same key
+also drives **AES-256-GCM end-to-end encryption** — so cross-machine traffic is both signed and
+encrypted, and the hub never sees plaintext. Every peer in a relay mesh must share the identical key.
 
-The secret is stored at `~/.cc2cc/secret.key`. Protect it:
+The secret is stored at `<bridge>/secret.key` (e.g. `~/.cc2cc/secret.key`). Protect it:
 - `chmod 600 ~/.cc2cc/secret.key` (macOS/Linux)
 - Restrict folder permissions (Windows)
 
@@ -224,8 +383,9 @@ Additional mitigations:
 
 ## Documentation
 
+- **[Architecture](docs/ARCHITECTURE.md)** — components, daemon model, teams, relay, message lifecycle
 - **[Protocol Specification](docs/SPECIFICATION.md)** — message schema, agent cards, heartbeats, lifecycle
-- **[Configuration Guide](docs/CONFIGURATION.md)** — environment variables, settings.json, scaling to N agents
+- **[Configuration Guide](docs/CONFIGURATION.md)** — environment variables (`CC2CC_BRIDGE_DIR`, `CC2CC_TEAM`, `CC2CC_IDENTITY`, `CC2CC_ENCRYPT`), scaling to N agents
 
 ## Prior Art
 
