@@ -187,6 +187,7 @@ export async function handleRegisterRelay(bridgeDir, args) {
       const res = await fetch(`${cfg.hub_url}/api/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(HUB_FETCH_TIMEOUT_MS), // M5: bound the call
         // NOTE: agent roster is intentionally NOT sent here (registers with empty
         // agents on the Hub). Cross-machine agent-level visibility is STUBBED until
         // v3.6 §3 link #1, which will read local agents from the status dir and fold
@@ -212,6 +213,9 @@ export async function handleRegisterRelay(bridgeDir, args) {
 
 // ─── Hub API Calls ───────────────────────────────────────────────────────────
 
+// M5: bound every hub call so a single hung connection can't stall all polling/heartbeat.
+const HUB_FETCH_TIMEOUT_MS = 10000;
+
 async function apiPost(url, body, token) {
   const headers = { "Content-Type": "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -219,6 +223,7 @@ async function apiPost(url, body, token) {
     method: "POST",
     headers,
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(HUB_FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -405,7 +410,21 @@ async function drainOutbox(bridgeDir) {
   }
 }
 
+// M5: serialize poll cycles. setInterval fires every POLL_MS regardless of whether the prior
+// cycle finished; overlapping cycles ran drainOutbox concurrently over the same outbox dir
+// (double-sends) and a slow hub call could pile up. Skip a tick if one is still in flight.
+let pollInFlight = false;
 async function pollCycle(bridgeDir, teamName) {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    await runPollCycle(bridgeDir, teamName);
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+async function runPollCycle(bridgeDir, teamName) {
   if (!config || !relayEnabled) return;
 
   const hubUrl = config.hub_url;
@@ -436,8 +455,8 @@ async function pollCycle(bridgeDir, teamName) {
       });
       changed = true;
     }
-    pruneExpiredRemoteTeams();
-    if (changed || remoteTeams.size) saveRemoteState();
+    pruneExpiredRemoteTeams(); // self-persists if it removes anything
+    if (changed) saveRemoteState(); // m5: only write on real change, not every idle tick
 
     // Persist replicated remote team policies (federation): teams owned by OTHER machines,
     // cached locally so a disconnected node still knows the leader/rules of its remote teams.
@@ -529,8 +548,10 @@ async function pollCycle(bridgeDir, teamName) {
       }
     }
   } catch (err) {
-    // Poll failed — hub might be down. Don't crash.
-    // Remote teams become stale via pruneStaleRemoteTeams() if poll keeps failing.
+    // Poll failed — hub might be down. Don't crash; remote teams age out via
+    // pruneExpiredRemoteTeams() if polls keep failing. (m6: was silent + named a
+    // non-existent function.) Gate the log so a down hub doesn't spam every POLL_MS.
+    if (process.env.CC2CC_DEBUG) console.error(`[relay] poll cycle failed: ${err.message}`);
   }
 }
 

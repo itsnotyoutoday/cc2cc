@@ -63,6 +63,7 @@ export function connectToDaemon({ bridgeDir, agent, onWake, onStatus }) {
   let sock = null;
   let closed = false;
   let backoff = 250;
+  let reconnectTimer = null; // m9: track the pending reconnect so close() can cancel it
 
   const emit = (s) => { try { onStatus?.(s); } catch {} };
 
@@ -93,7 +94,9 @@ export function connectToDaemon({ bridgeDir, agent, onWake, onStatus }) {
     sock.on("close", () => {
       if (closed) return;
       emit("disconnected");
-      setTimeout(connect, backoff);
+      // m9: add jitter so many MCPs sharing a daemon don't reconnect in lockstep after a restart.
+      const delay = backoff + Math.floor(Math.random() * backoff);
+      reconnectTimer = setTimeout(connect, delay);
       backoff = Math.min(backoff * 2, 5000);
     });
   }
@@ -101,6 +104,10 @@ export function connectToDaemon({ bridgeDir, agent, onWake, onStatus }) {
   connect();
   return {
     socketPath,
-    close() { closed = true; try { sock?.destroy(); } catch {} },
+    close() {
+      closed = true;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } // m9
+      try { sock?.destroy(); } catch {}
+    },
   };
 }
