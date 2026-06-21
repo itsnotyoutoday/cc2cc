@@ -1638,8 +1638,19 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } // EPERM = exists, different owner
 }
 
-/** Atomically remove a lock we've judged stale: rename it aside (only one racer wins) then delete. */
-async function breakStaleLock() {
+/** Remove a lock we've judged stale — but ONLY if it's STILL that same stale thing right now.
+ *  Re-read immediately before the rename and bail if it changed, so we can't clobber a FRESH lock a
+ *  sibling created in the gap between our judgment and the rename (the breakStaleLock TOCTOU). The
+ *  rename-aside-then-delete keeps the removal itself atomic across racers. `expected` = the stale
+ *  holder {pid,ts} we judged; null = "an aged file with no parseable holder". */
+async function breakStaleLock(expected) {
+  let cur = null;
+  try { cur = JSON.parse(await readFile(TEAMS_LOCK, "utf8")); } catch { /* gone/torn → cur stays null */ }
+  if (expected) {
+    if (!cur || cur.pid !== expected.pid || cur.ts !== expected.ts) return; // changed/fresh → not ours to break
+  } else if (cur) {
+    return; // we judged it unparseable, but it's a parseable (fresh) holder now → don't break
+  }
   const brk = `${TEAMS_LOCK}.break.${lockSuffix()}`;
   try { await rename(TEAMS_LOCK, brk); await unlink(brk).catch(() => {}); }
   catch (e) { if (e.code !== "ENOENT") throw e; } // ENOENT → another racer already broke/took it
@@ -1665,12 +1676,14 @@ async function acquireTeamsLock() {
     let holder = null;
     try { holder = JSON.parse(await readFile(TEAMS_LOCK, "utf8")); } catch { /* vanished / legacy-empty */ }
     if (!holder) {
-      // No parseable holder (raced away, or a legacy/torn empty lock). Don't blind-steal — steal only
-      // if the FILE ITSELF has aged past max_hold; otherwise it's a just-created lock mid-claim: wait.
-      let st = null; try { st = await stat(TEAMS_LOCK); } catch { /* gone → retry link */ }
-      if (!st || Date.now() - st.mtimeMs > LOCK_MAX_HOLD_MS) { await breakStaleLock(); continue; }
+      // Parseable read failed. Two cases: (a) the file VANISHED — a sibling mid release→reacquire;
+      // do NOT break (renaming here would clobber a fresh lock the sibling is about to/just created —
+      // the TOCTOU) — just fall through to backoff + retry the link. (b) a PRESENT but aged torn/legacy
+      // lock → break it (conditionally). Only (b) steals.
+      let st = null; try { st = await stat(TEAMS_LOCK); } catch { /* gone → retry link, no break */ }
+      if (st && Date.now() - st.mtimeMs > LOCK_MAX_HOLD_MS) { await breakStaleLock(null); continue; }
     } else if (!pidAlive(holder.pid) || Date.now() - (holder.ts || 0) > LOCK_MAX_HOLD_MS) {
-      await breakStaleLock(); continue;       // dead, or held longer than any real section: reclaim
+      await breakStaleLock(holder); continue;  // dead, or held longer than any real section: reclaim (conditional)
     } else if (Date.now() > deadline) {
       throw new Error(`teams.json lock busy (held by pid ${holder.pid}); aborting to avoid a lost mutation`);
     }

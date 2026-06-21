@@ -176,8 +176,20 @@ def _pid_alive(pid) -> bool:
         return False
 
 
-def _break_stale_lock(lock_path: Path):
-    """Atomically remove a lock judged stale: rename aside (one racer wins) then delete."""
+def _break_stale_lock(lock_path: Path, expected):
+    """Remove a lock judged stale — but ONLY if it's STILL that same stale thing right now. Re-read
+    immediately before the rename and bail if it changed, so we can't clobber a FRESH lock a sibling
+    created in the gap (the breakStaleLock TOCTOU). `expected` = the stale holder {pid,ts} we judged,
+    or None = "an aged file with no parseable holder"."""
+    try:
+        cur = json.loads(lock_path.read_text())
+    except Exception:
+        cur = None
+    if expected is not None:
+        if not cur or cur.get("pid") != expected.get("pid") or cur.get("ts") != expected.get("ts"):
+            return  # changed/fresh → not ours to break
+    elif cur:
+        return  # judged unparseable, but it's a parseable (fresh) holder now → don't break
     brk = f"{lock_path}.break.{os.getpid()}.{random.random()}"
     try:
         os.rename(str(lock_path), brk)
@@ -224,19 +236,21 @@ def teams_lock():
         except Exception:
             pass
         if not holder:
-            # No parseable holder (raced away, or legacy/torn empty lock). Don't blind-steal — steal
-            # only if the FILE itself has aged past max_hold; else it's a just-created lock mid-claim.
+            # Parseable read failed. If the file VANISHED (sibling mid release→reacquire), do NOT
+            # break — renaming would clobber a fresh lock created in the gap (the TOCTOU); just fall
+            # through to backoff + retry. Only break a PRESENT but aged torn/legacy lock.
             try:
                 age_ms = time.time() * 1000 - lock_path.stat().st_mtime * 1000
+                present = True
             except OSError:
-                age_ms = _LOCK_MAX_HOLD_MS + 1  # gone → just retry the link
-            if age_ms > _LOCK_MAX_HOLD_MS:
-                _break_stale_lock(lock_path)
+                present = False  # gone → retry link, no break
+            if present and age_ms > _LOCK_MAX_HOLD_MS:
+                _break_stale_lock(lock_path, None)
                 continue
         elif (not _pid_alive(holder.get("pid"))) or (
             time.time() * 1000 - holder.get("ts", 0) > _LOCK_MAX_HOLD_MS
         ):
-            _break_stale_lock(lock_path)  # dead, or held longer than any real section
+            _break_stale_lock(lock_path, holder)  # dead/aged: reclaim (conditional on still-same)
             continue
         elif time.time() > deadline:
             raise RuntimeError(
