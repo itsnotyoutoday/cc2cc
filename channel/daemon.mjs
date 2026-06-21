@@ -26,7 +26,7 @@
 import net from "net";
 import { watch } from "fs";
 import { mkdir, unlink, writeFile } from "fs/promises";
-import { existsSync, statSync, readFileSync } from "fs";
+import { existsSync, statSync, readFileSync, chmodSync } from "fs";
 import { spawn } from "child_process";
 import { join } from "path";
 import { homedir, platform } from "os";
@@ -184,7 +184,15 @@ async function bindSocket(socketPath) {
     // On a failed bind, CLOSE the server so its handle doesn't leak (an un-closed Server keeps the
     // event loop alive — the post-suite hang). Only a successfully-listening server is returned.
     server.once("error", (err) => { try { server.close(); } catch { /* not running */ } resolve({ err }); });
-    server.listen(socketPath, () => resolve({ server }));
+    server.listen(socketPath, () => {
+      // connect() to a unix socket needs WRITE perm on the socket file. The default umask creates it
+      // ~0755, so on a SHARED bridge a group-member MCP (a human user in the cc2cc group, not the
+      // socket's owner) gets EACCES and silently falls back to the 3s poll instead of real-time
+      // wakes — only the owner/root got pushes. Force 0770 so group clients can connect. No-op on the
+      // Windows named pipe (no fs perms). Best-effort: a chmod failure shouldn't kill a live daemon.
+      if (platform() !== "win32") { try { chmodSync(socketPath, 0o770); } catch { /* best effort */ } }
+      resolve({ server });
+    });
   });
 
   let r = await tryListen();
