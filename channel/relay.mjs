@@ -34,7 +34,7 @@ const MAX_SEEN_IDS = 10000;
 const SEEN_STATE_FILE = "seen-messages.json"; // M4: persist dedup so it survives a daemon restart
 let seenDirty = false;
 
-function hasSeenMessage(msgIdentity) {
+export function hasSeenMessage(msgIdentity) {
   if (seenMessageIds.has(msgIdentity)) return true;
   seenMessageIds.add(msgIdentity);
   seenDirty = true;
@@ -49,18 +49,24 @@ function hasSeenMessage(msgIdentity) {
 // M4: at-least-once relay delivery + in-memory dedup meant a write-then-ack-fail-then-restart (or
 // an outbox resend after a recipient restart) could redeliver. Persist the processed-id set so
 // dedup survives restarts. msg.id is the stable client idempotency key (minted once at send).
-async function loadSeenMessages(dir) {
+export async function loadSeenMessages(dir) {
   try {
     const arr = JSON.parse(await readFile(join(dir, SEEN_STATE_FILE), "utf8"));
     if (Array.isArray(arr)) for (const id of arr.slice(-MAX_SEEN_IDS)) seenMessageIds.add(id);
   } catch { /* none yet */ }
 }
 
-function persistSeenMessages(dir) {
+export function persistSeenMessages(dir) {
   if (!seenDirty || !dir) return;
   seenDirty = false;
   writeFile(join(dir, SEEN_STATE_FILE), JSON.stringify([...seenMessageIds]), "utf8").catch(() => {}); // bounded by MAX_SEEN_IDS
 }
+
+// M4 test hooks: read-only seen check, count, and a reset that empties the in-memory set so a
+// test can simulate a daemon restart (mark → persist → reset → load → still seen).
+export function isSeen(id) { return seenMessageIds.has(id); }
+export function seenCount() { return seenMessageIds.size; }
+export function clearSeenMessages() { seenMessageIds.clear(); seenDirty = false; }
 
 // M3: this machine's per-machine auth secret (distinct from the shared access token). Generated
 // once and persisted in the bridge (0600); sent on every hub call so the hub can bind our
