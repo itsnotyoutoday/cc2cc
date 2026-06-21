@@ -127,8 +127,18 @@ def _save_team(team: dict):
 # max_hold >> longest plausible deschedule of a HEALTHY holder mid-section (~1ms): a live holder
 # starved past this would be assumed-crashed, stolen, then resume and clobber. 30s = huge margin,
 # still reclaims a dead holder within 30s. (Inherent to time-based stealing; see channel/server.mjs.)
-_LOCK_MAX_HOLD_MS = 30000
-_LOCK_ACQUIRE_TIMEOUT_S = 5.0    # fail loud sooner; caller retries
+# Env-overridable (CC2CC_LOCK_MAX_HOLD_MS) so QA can shrink it to provoke the steal window — must
+# match the JS side and stay >> the real section in production.
+def _env_pos(name, default):
+    try:
+        v = float(os.environ.get(name, ""))
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+_LOCK_MAX_HOLD_MS = _env_pos("CC2CC_LOCK_MAX_HOLD_MS", 30000)
+_LOCK_ACQUIRE_TIMEOUT_S = _env_pos("CC2CC_LOCK_ACQUIRE_TIMEOUT_MS", 5000) / 1000.0  # fail loud sooner; caller retries
 
 
 def _pid_alive(pid) -> bool:

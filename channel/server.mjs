@@ -1626,8 +1626,10 @@ const TEAMS_LOCK = TEAMS_PATH + ".lock";
 // resumes and clobbers. 30s leaves enormous margin under any realistic load while still reclaiming a
 // genuinely dead holder within 30s. (Inherent to time-based stealing; native flock(2) would avoid it
 // but needs a compiled dep cc2cc deliberately omits.) acquire-timeout fails loud sooner; caller retries.
-const LOCK_MAX_HOLD_MS = 30000;
-const LOCK_ACQUIRE_TIMEOUT_MS = 5000;
+// Env-overridable (CC2CC_LOCK_MAX_HOLD_MS) so QA can shrink it to provoke the steal window without a
+// 30s wall-clock wait — must stay >> the real section in production.
+const LOCK_MAX_HOLD_MS = (() => { const v = Number(process.env.CC2CC_LOCK_MAX_HOLD_MS); return Number.isFinite(v) && v > 0 ? v : 30000; })();
+const LOCK_ACQUIRE_TIMEOUT_MS = (() => { const v = Number(process.env.CC2CC_LOCK_ACQUIRE_TIMEOUT_MS); return Number.isFinite(v) && v > 0 ? v : 5000; })();
 const lockSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const lockSuffix = () => `${process.pid}.${Math.random().toString(36).slice(2)}`;
 
