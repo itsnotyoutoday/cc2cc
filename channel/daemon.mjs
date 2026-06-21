@@ -26,10 +26,22 @@
 import net from "net";
 import { watch } from "fs";
 import { mkdir, unlink, writeFile } from "fs/promises";
-import { existsSync, statSync } from "fs";
+import { existsSync, statSync, readFileSync } from "fs";
+import { spawn } from "child_process";
 import { join } from "path";
 import { homedir, platform } from "os";
 import { fileURLToPath } from "url";
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Ad-hoc daemons self-exit after this long with ZERO MCP connections (cleans up unused/zombie
+// daemons). DISABLED in service mode (CC2CC_SERVICE_MODE=1 / --service), where always-on is the
+// point and a manager (systemd / cc2cc-admin) owns the lifecycle.
+const IDLE_EXIT_MS = Number(process.env.CC2CC_DAEMON_IDLE_MS) || 10 * 60 * 1000;
+function isServiceMode(opts = {}) {
+  if (opts.service != null) return !!opts.service;
+  const v = process.env.CC2CC_SERVICE_MODE;
+  return v === "1" || v === "true";
+}
 
 import {
   loadRelayConfig,
@@ -95,6 +107,7 @@ function pushToAgent(agent, payload) {
 // ─── IPC socket server ───────────────────────────────────────────────────────
 function handleConnection(sock) {
   allSockets.add(sock);
+  lastActivity = Date.now(); // a session connected → reset the idle clock
   sock.setEncoding("utf8");
   let buf = "";
   sock.on("data", (chunk) => {
@@ -187,12 +200,32 @@ function startWatcher(bridgeDir) {
 let server = null;
 let watcher = null;
 let stampTimer = null;
+let idleTimer = null;
+let lastActivity = Date.now(); // last MCP socket activity; drives ad-hoc idle-exit
 let running = null; // { bridgeDir, socketPath }
+
+// Ad-hoc idle-exit: once nothing has connected for IDLE_EXIT_MS, tear down and exit. A new
+// session's ensureDaemon relaunches on demand. No-op in service mode.
+function startIdleExit(serviceMode) {
+  if (serviceMode) return;
+  // Check often enough to honor short windows (tests) but never busier than every 30s.
+  const checkMs = Math.min(30000, Math.max(1000, Math.floor(IDLE_EXIT_MS / 4)));
+  idleTimer = setInterval(async () => {
+    if (allSockets.size > 0) { lastActivity = Date.now(); return; } // a live MCP → not idle
+    if (Date.now() - lastActivity >= IDLE_EXIT_MS) {
+      log("info", "idle-exit — no MCP connections", { idleMs: IDLE_EXIT_MS });
+      await stop();
+      process.exit(0);
+    }
+  }, checkMs);
+  idleTimer.unref();
+}
 
 /** Tear down server/watcher/relay/socket. Returns when closed; does NOT exit the process. */
 export async function stop() {
   try { stopRelayClient(); } catch {}
   try { clearInterval(stampTimer); } catch {}
+  try { clearInterval(idleTimer); } catch {}
   try { watcher?.close(); } catch {}
   for (const sock of allSockets) { try { sock.destroy(); } catch {} }
   allSockets.clear();
@@ -227,10 +260,11 @@ export async function main(opts = {}) {
     return null;
   }
   server = bound;
+  const serviceMode = isServiceMode(opts);
   let socketIno = null;
   try { socketIno = statSync(socketPath).ino; } catch { /* raced away already */ }
   running = { bridgeDir: cfg.bridgeDir, socketPath, ino: socketIno };
-  log("info", "daemon up", { socket: socketPath, team: cfg.team, self: cfg.self });
+  log("info", "daemon up", { socket: socketPath, team: cfg.team, self: cfg.self, mode: serviceMode ? "service" : "adhoc" });
 
   // Crypto is performed by the MCP (server.mjs): it encrypts before spooling to the outbox and
   // decrypts on inbox read. The daemon just relays the already-encrypted payload, so the hub
@@ -253,6 +287,7 @@ export async function main(opts = {}) {
   const stamp = async () => {
     await writeFile(stampPath, JSON.stringify({
       pid: process.pid, socket: socketPath, team: cfg.team, self: cfg.self,
+      mode: serviceMode ? "service" : "adhoc",
       ts: Date.now(), relay: getRelayStatus?.() ?? null,
     }, null, 2), "utf8").catch(() => {});
   };
@@ -260,18 +295,65 @@ export async function main(opts = {}) {
   stampTimer = setInterval(stamp, 15000);
   stampTimer.unref();
 
+  startIdleExit(serviceMode); // ad-hoc: self-exit when idle; service: stays alive
+
   return { socketPath, stop };
+}
+
+// ─── CLI control (cc2cc-admin daemon … wraps these) ──────────────────────────
+function statusStampPath() { return join(resolveConfig().bridgeDir, "status", "daemon.json"); }
+function readStamp() { try { return JSON.parse(readFileSync(statusStampPath(), "utf8")); } catch { return null; } }
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+
+function daemonStatusCmd() {
+  const s = readStamp();
+  if (!s || !pidAlive(s.pid)) { console.log(JSON.stringify({ running: false })); return; }
+  console.log(JSON.stringify({ running: true, pid: s.pid, mode: s.mode || "adhoc",
+    socket: s.socket, team: s.team, self: s.self, relay: s.relay?.enabled ?? null }, null, 2));
+}
+async function daemonStopCmd() {
+  const s = readStamp();
+  if (!s || !pidAlive(s.pid)) { console.log("daemon not running"); return; }
+  try { process.kill(s.pid, "SIGTERM"); } catch {}
+  for (let i = 0; i < 50 && pidAlive(s.pid); i++) await sleep(100); // wait ≤5s for clean stop()
+  console.log(pidAlive(s.pid) ? `daemon ${s.pid} did not stop` : `stopped daemon ${s.pid}`);
+}
+function daemonStartCmd({ service }) {
+  // Launch a detached daemon and return — the no-systemd equivalent of how a service manager
+  // would start it. `service` → always-on (no idle-exit). If one already owns the socket, the
+  // child's main() bows out cleanly.
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...(service ? ["--service"] : [])],
+    { detached: true, stdio: "ignore", env: { ...process.env, ...(service ? { CC2CC_SERVICE_MODE: "1" } : {}) } });
+  child.unref();
+  console.log(`launched daemon (pid ${child.pid}${service ? ", service mode" : ", ad-hoc"})`);
+}
+async function daemonRestartCmd() {
+  const wasService = readStamp()?.mode === "service";
+  await daemonStopCmd();
+  await sleep(300);
+  daemonStartCmd({ service: wasService }); // preserve the mode it was running in
 }
 
 // Only auto-run (and own process lifecycle) when this file IS the entry point — exact path
 // match (NOT endsWith, which would also match e.g. tests/test_daemon.mjs on import).
 const invokedDirectly = process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url);
 if (invokedDirectly) {
-  main()
-    .then((handle) => {
-      if (!handle) { log("info", "exiting — daemon already running"); process.exit(0); }
-      process.on("SIGINT", async () => { await stop(); process.exit(0); });
-      process.on("SIGTERM", async () => { await stop(); process.exit(0); });
-    })
-    .catch((err) => { log("error", "fatal", { error: err.message }); process.exit(1); });
+  const arg = process.argv[2];
+  // Control verbs (used by cc2cc-admin daemon …); each exits when done.
+  if (arg === "--status" || arg === "status") { daemonStatusCmd(); process.exit(0); }
+  else if (arg === "--stop" || arg === "stop") { daemonStopCmd().then(() => process.exit(0)); }
+  else if (arg === "--restart" || arg === "restart") { daemonRestartCmd().then(() => process.exit(0)); }
+  else if (arg === "--start" || arg === "start") {
+    // detached launch + return; --service for always-on (no idle-exit)
+    daemonStartCmd({ service: process.argv.includes("--service") }); process.exit(0);
+  } else {
+    // Foreground run. Bare = ad-hoc (idle-exit). --service = always-on (no idle-exit).
+    main({ service: arg === "--service" || isServiceMode() })
+      .then((handle) => {
+        if (!handle) { log("info", "exiting — daemon already running"); process.exit(0); }
+        process.on("SIGINT", async () => { await stop(); process.exit(0); });
+        process.on("SIGTERM", async () => { await stop(); process.exit(0); });
+      })
+      .catch((err) => { log("error", "fatal", { error: err.message }); process.exit(1); });
+  }
 }
