@@ -6,8 +6,9 @@
  *
  * Responsibilities:
  *   1. RELAY — owns the single hub connection (register / poll / heartbeat / outbox-drain /
- *      teams-sync). Reuses channel/relay.mjs. Encryption boundary (channel/crypto.mjs):
- *      encrypts outbound; hub only ever sees ciphertext (zero-knowledge).
+ *      teams-sync). Reuses channel/relay.mjs. The daemon relays already-encrypted ciphertext
+ *      as-is: the MCP (server.mjs) encrypts at outbox spool and decrypts on inbox read, so the
+ *      hub stays zero-knowledge. The daemon is NOT currently the crypto boundary.
  *   2. WATCHER — the SOLE mailbox file-watcher. No MCP watches files.
  *   3. PUSH — on an inbox change for agent X, pushes a {wake} over the local IPC socket to
  *      X's MCP, which then pings its own Claude session.
@@ -30,10 +31,8 @@ import { join } from "path";
 import { homedir, platform } from "os";
 import { fileURLToPath } from "url";
 
-import * as crypto from "./crypto.mjs";
 import {
   loadRelayConfig,
-  setEncryptionFunction,
   startRelayClient,
   stopRelayClient,
   getRelayStatus,
@@ -208,10 +207,9 @@ export async function main(opts = {}) {
   running = { bridgeDir: cfg.bridgeDir, socketPath };
   log("info", "daemon up", { socket: socketPath, team: cfg.team, self: cfg.self });
 
-  // Encryption boundary: outbound is encrypted before it leaves on the relay.
-  await crypto.loadKey(cfg.bridgeDir);
-  setEncryptionFunction(crypto.encryptText);
-  log("info", "crypto", { hasKey: crypto.hasKey() });
+  // Crypto is performed by the MCP (server.mjs): it encrypts before spooling to the outbox and
+  // decrypts on inbox read. The daemon just relays the already-encrypted payload, so the hub
+  // stays zero-knowledge and the daemon needs no key. (M2: removed dead daemon-side wiring.)
 
   // Relay: own the single hub connection for this host.
   const relayCfg = await loadRelayConfig(cfg.bridgeDir);

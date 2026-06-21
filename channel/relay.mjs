@@ -155,6 +155,10 @@ export function isRelayEnabled() {
   return relayEnabled && config && config.enabled !== false;
 }
 
+// Reserved extension hook for a future daemon-side crypto boundary. NOT currently wired into the
+// send path — relaySend transmits the payload as-is; crypto is performed by the MCP (server.mjs),
+// which encrypts before spooling. Kept so the boundary could move into the daemon later without
+// an API change.
 export function setEncryptionFunction(fn) {
   _encryptFn = fn;
 }

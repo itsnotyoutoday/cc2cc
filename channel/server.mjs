@@ -246,9 +246,17 @@ function buildMessage({ from, to, text, type = "message", priority = "normal", r
 
 /** Decrypt content.text if encrypted. Returns null on failure — caller must skip/remove the file. */
 export function decryptMessage(msg) {
-  if (msg?.content?.text && msg.content.text.startsWith("ENC:")) {
+  const text = msg?.content?.text;
+  // M1 fail-closed: a relayed message (arrived over the wire — carries _relay_meta) MUST be
+  // encrypted when encryption is enabled. A non-ENC: payload means it was stripped or sent in the
+  // clear — quarantine rather than surface plaintext. Local (non-relayed) messages may be plaintext.
+  if (ENCRYPT_ENABLED && msg?._relay_meta && typeof text === "string" && !text.startsWith("ENC:")) {
+    log("error", "relayed message not encrypted — discarding (encryption required)", { msg_id: msg.id, from: msg.from });
+    return null;
+  }
+  if (text && text.startsWith("ENC:")) {
     try {
-      msg.content.text = decryptText(msg.content.text);
+      msg.content.text = decryptText(text);
     } catch (err) {
       log("error", "message decryption failed, discarding", { msg_id: msg.id, from: msg.from });
       return null; // quarantine — never surface ciphertext
@@ -980,6 +988,11 @@ async function handleSendTeam({ team, text, intent = "message", priority = "norm
       return textResult(`Team "${team}" is not reachable — no local leader and not registered with the relay hub.`, true);
     }
 
+    // M1 fail-closed: never put plaintext on the wire when encryption is required. A missing key
+    // must refuse the send, not silently downgrade.
+    if (ENCRYPT_ENABLED && !encryptionKey) {
+      return textResult(`Refusing to relay to "${team}": encryption is required but no key is loaded (check ${BRIDGE_DIR}/secret.key).`, true);
+    }
     // B5: Encrypt text before it is spooled (the hub only ever sees ciphertext).
     const relayText = ENCRYPT_ENABLED && encryptionKey ? encryptText(text) : text;
     const msg = {
