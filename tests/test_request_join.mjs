@@ -42,6 +42,12 @@ describe("request_join routes to the team leader", () => {
     } } }));
 
     leaderProc = spawn("node", [SERVER], { env: env(bridge, "gov-lead"), stdio: ["pipe", "pipe", "pipe"] });
+    // 0f: mesh activation is gated on a real MCP initialize handshake; the bare-spawned leader must complete it.
+    const sendL = (m) => leaderProc.stdin.write(JSON.stringify(m) + "\n");
+    sendL({ jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    await sleep(400);
+    sendL({ jsonrpc: "2.0", method: "notifications/initialized" });
     transport = new StdioClientTransport({ command: "node", args: [SERVER], env: env(bridge, "r-user") });
     client = new Client({ name: "join-test", version: "0" }, { capabilities: {} });
     await client.connect(transport);

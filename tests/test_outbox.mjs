@@ -34,6 +34,12 @@ describe("outbound spool / bounce", () => {
       env: { ...process.env, CC2CC_BRIDGE_DIR: bridge, CC2CC_IDENTITY: "sender", CC2CC_ENCRYPT: "1", CC2CC_REMOTE_EXPIRE_MS: "2000" },
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // 0f: mesh activation is gated on a real MCP initialize handshake; a bare spawn must complete it.
+    const send = (m) => proc.stdin.write(JSON.stringify(m) + "\n");
+    send({ jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    await sleep(400);
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
     let bounced = false, outboxEmpty = false;
     for (let i = 0; i < 12; i++) {

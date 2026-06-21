@@ -51,6 +51,12 @@ describe("runtime honors governance artifacts", () => {
     client = new Client({ name: "gov-test", version: "0" }, { capabilities: {} });
     await client.connect(transport);
     memProc = spawn("node", [SERVER], { env: env(bridge, "a-mem"), stdio: ["pipe", "pipe", "pipe"] });
+    // 0f: mesh activation is gated on a real MCP initialize handshake; the bare-spawned member must complete it.
+    const sendM = (m) => memProc.stdin.write(JSON.stringify(m) + "\n");
+    sendM({ jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    await sleep(400);
+    sendM({ jsonrpc: "2.0", method: "notifications/initialized" });
 
     // Wait until a-lead leads gov and a-mem is visible.
     for (let i = 0; i < 12; i++) {
