@@ -133,7 +133,9 @@ async function bindSocket(socketPath) {
   // unlink after a probe that CONFIRMS the in-use socket is dead.
   const tryListen = () => new Promise((resolve) => {
     const server = net.createServer(handleConnection);
-    server.once("error", (err) => resolve({ err }));
+    // On a failed bind, CLOSE the server so its handle doesn't leak (an un-closed Server keeps the
+    // event loop alive — the post-suite hang). Only a successfully-listening server is returned.
+    server.once("error", (err) => { try { server.close(); } catch { /* not running */ } resolve({ err }); });
     server.listen(socketPath, () => resolve({ server }));
   });
 
@@ -147,8 +149,9 @@ async function bindSocket(socketPath) {
   if (platform() === "win32") return null; // named pipe in use → assume a live owner
   const alive = await new Promise((resolve) => {
     const probe = net.connect(socketPath);
-    probe.on("connect", () => { probe.end(); resolve(true); });
-    probe.on("error", () => resolve(false));
+    // destroy() (not end()) so the probe socket handle is released immediately, not left half-open.
+    probe.on("connect", () => { probe.destroy(); resolve(true); });
+    probe.on("error", () => { probe.destroy(); resolve(false); });
   });
   if (alive) return null; // a real daemon owns it → we bail
   // Confirmed dead → remove the stale socket and retry binding ONCE.
@@ -215,11 +218,15 @@ export async function main(opts = {}) {
   await mkdir(cfg.bridgeDir, { recursive: true }).catch(() => {});
   const socketPath = daemonSocketPath(cfg.bridgeDir);
 
-  server = await bindSocket(socketPath);
-  if (!server) {
+  // Assign the module-level `server` only on success: a second in-process main() that bows out
+  // (bindSocket → null) must NOT clobber a running daemon's server reference, or that daemon's
+  // stop() would see null and never close its server (leaking the handle → node hangs post-test).
+  const bound = await bindSocket(socketPath);
+  if (!bound) {
     log("info", "another daemon owns the socket", { socket: socketPath });
     return null;
   }
+  server = bound;
   let socketIno = null;
   try { socketIno = statSync(socketPath).ino; } catch { /* raced away already */ }
   running = { bridgeDir: cfg.bridgeDir, socketPath, ino: socketIno };
