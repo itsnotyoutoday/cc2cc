@@ -24,7 +24,7 @@ import {
 import { readdir, readFile, rename, mkdir, writeFile, stat, rm } from "fs/promises";
 import { writeFileSync } from "fs";
 import { join, basename, dirname } from "path";
-import { randomUUID, createCipheriv, createDecipheriv, scryptSync } from "crypto";
+import { randomUUID, randomBytes, createCipheriv, createDecipheriv, scryptSync } from "crypto";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { realpathSync } from "fs";
@@ -119,7 +119,7 @@ async function loadEncryptionKey() {
 
 function encryptText(plaintext) {
   if (!encryptionKey) return plaintext;
-  const iv = Buffer.from(randomUUID().replace(/-/g, ""), "hex").subarray(0, 12);
+  const iv = randomBytes(12); // m1: full 96-bit random nonce (was a truncated UUID — version nibble fixed)
   const cipher = createCipheriv("aes-256-gcm", encryptionKey, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
@@ -749,7 +749,11 @@ function handleListAgents() {
   const local = getAgentList();
   let remote = [];
   if (relayActive()) {
-    remote = relay.getRemoteAgents();
+    // Enrich remote agents with role: the team leader is already federated into teamLeaders
+    // (via team_policies), and roleOf derives role purely from that registry — so a remote
+    // agent's leader/member role is correct without storing it in the relayed roster. (tom's
+    // find; root-caused by rlead — fix at the merge layer, no heartbeat/hub change.)
+    remote = relay.getRemoteAgents().map((a) => ({ ...a, role: a.team ? roleOf(a.name, [a.team]) : undefined }));
   }
   return jsonResult([...local, ...remote]);
 }
@@ -1724,7 +1728,7 @@ process.on("exit", () => {
         agent: agentName,
         timestamp: new Date().toISOString(),
         session_id: "none",
-        parent_pid: process.ppid,
+        parent_pid: String(process.ppid), // m7: string to match the cleanup comparisons (was numeric)
         status: "offline",
         context: "process exit (unclean)",
       }, null, 2),

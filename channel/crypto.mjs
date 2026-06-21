@@ -8,7 +8,7 @@
  */
 import { readFile } from "fs/promises";
 import { join } from "path";
-import { randomUUID, createCipheriv, createDecipheriv, scryptSync } from "crypto";
+import { randomBytes, createCipheriv, createDecipheriv, scryptSync } from "crypto";
 
 let key = null;
 
@@ -28,7 +28,7 @@ export async function loadKey(bridgeDir) {
 
 export function encryptText(plaintext) {
   if (!key) return plaintext;
-  const iv = Buffer.from(randomUUID().replace(/-/g, ""), "hex").subarray(0, 12);
+  const iv = randomBytes(12); // m1: full 96-bit random nonce (was a truncated UUID)
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
