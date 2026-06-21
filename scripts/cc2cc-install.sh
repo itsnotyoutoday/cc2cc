@@ -16,6 +16,10 @@
 #
 # ACTIONS:
 #   install            interactive wizard (or flag-driven; see --non-interactive)
+#   upgrade            pull latest source, re-stage code, and restart the daemon/hub. Global:
+#                      git pull + restage /opt + `systemctl restart cc2cc.target`. Local: git pull
+#                      + restart the daemon. Run from a source checkout, or pass --repo DIR.
+#                      --no-pull to skip git pull (restage/restart only).
 #   register-client    register THIS user's Claude (~/.claude.json) against an existing bridge
 #                      (auto-detects the global bridge /var/lib/cc2cc + staged /opt code — no path needed)
 #   unregister-client  remove THIS user's cc2cc MCP entry from ~/.claude.json (inverse of register-client)
@@ -47,11 +51,11 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_GUESS="$(dirname "$(dirname "$SELF")")"
 [ -f "$REPO_GUESS/channel/server.mjs" ] || REPO_GUESS="$(pwd)"
 
-ACTION="${1:-install}"; [[ "$ACTION" =~ ^(install|uninstall|register-client|unregister-client|status)$ ]] && shift || ACTION="install"
+ACTION="${1:-install}"; [[ "$ACTION" =~ ^(install|upgrade|uninstall|register-client|unregister-client|status)$ ]] && shift || ACTION="install"
 
 SCOPE=""; REPO="$REPO_GUESS"; BRIDGE=""; WANT_RELAY=0; WANT_HUB=0
 HUB_PORT=10322; HUB_TOKEN=""; VENV=""; WANT_ENCRYPT=0; INTERACTIVE=1; ASSUME_YES=0
-SYS_USER="cc2cc"; SYS_GROUP="cc2cc"; GLOBAL_ROOT="/var/lib/cc2cc"; ETC="/etc/cc2cc"; OPT_ROOT="/opt/cc2cc"; ADD_USERS=""; NODE_NAME=""; SECRET_SRC=""
+SYS_USER="cc2cc"; SYS_GROUP="cc2cc"; GLOBAL_ROOT="/var/lib/cc2cc"; ETC="/etc/cc2cc"; OPT_ROOT="/opt/cc2cc"; ADD_USERS=""; NODE_NAME=""; SECRET_SRC=""; NO_PULL=0
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --scope) SCOPE="$2"; shift 2;;
@@ -66,6 +70,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --venv) VENV="$2"; shift 2;;
   --add-user) ADD_USERS="$ADD_USERS $2"; shift 2;;
   --encrypt) WANT_ENCRYPT=1; shift;;
+  --no-pull) NO_PULL=1; shift;;
   --non-interactive) INTERACTIVE=0; shift;;
   --yes) ASSUME_YES=1; shift;;
   -h|--help) grep '^#' "$SELF" | sed 's/^# \{0,1\}//'; exit 0;;
@@ -341,7 +346,12 @@ do_install(){
     # Stage code into a stable shared location (/opt/cc2cc) so services don't reference a homedir.
     if [ "$REPO" != "$OPT_ROOT" ]; then
       c "staging code into $OPT_ROOT"
-      $SUDO mkdir -p "$OPT_ROOT"; $SUDO cp -a "$REPO/." "$OPT_ROOT/"; REPO="$OPT_ROOT"
+      $SUDO mkdir -p "$OPT_ROOT"; $SUDO cp -a "$REPO/." "$OPT_ROOT/"
+      # Drop the copied-in .git pointer: /opt is a deploy SNAPSHOT, not a working checkout. Leaving
+      # it makes /opt masquerade as a pullable repo (git reports the source's HEAD while the files
+      # are frozen) — `cc2cc-install upgrade` is the real update path. Also strip __pycache__.
+      $SUDO rm -rf "$OPT_ROOT/.git" "$OPT_ROOT"/**/__pycache__ 2>/dev/null || true
+      REPO="$OPT_ROOT"
     fi
     VENV="${VENV:-$REPO/venv}"
     if [ "$INTERACTIVE" = 1 ]; then askyn "Run the cross-machine relay hub as a system service?" y && WANT_HUB=1; fi
@@ -360,6 +370,7 @@ do_install(){
     $SUDO mkdir -p "$BRIDGE/status" "$BRIDGE/identities"
     $SUDO chgrp -R "$SYS_GROUP" "$BRIDGE"
     $SUDO chmod 2770 "$BRIDGE" "$BRIDGE/status" "$BRIDGE/identities"   # setgid: shared writable
+    write_service_marker "$BRIDGE"
     ensure_venv "$VENV" "$SUDO"
     # Code in /opt is system-owned: root owns it (a regular user must NOT be able to modify code the
     # cc2cc service runs), group cc2cc + world-read let the service read/execute it. `cp -a` above
@@ -527,6 +538,99 @@ PY
   done
 }
 
+# Managed-bridge marker: tells per-user sessions NOT to spawn/auto-heal their own daemon and tells
+# daemon.mjs to refuse binding unless run as the service user — prevents an individual session from
+# hijacking the shared system daemon. Read by server.mjs/daemon.mjs. Idempotent.
+write_service_marker(){ # $1 = bridge dir
+  printf '{\n  "managed": true,\n  "service_user": "%s",\n  "opt_root": "%s"\n}\n' "$SYS_USER" "$OPT_ROOT" | $SUDO tee "$1/service.json" >/dev/null
+  $SUDO chgrp "$SYS_GROUP" "$1/service.json"; $SUDO chmod 640 "$1/service.json"
+}
+
+# Kill any daemon.mjs pointed at the GLOBAL bridge that is NOT the systemd service — a pre-guard
+# user/root session may have hijacked the shared socket, which would block the service from binding.
+# Identify by CC2CC_BRIDGE_DIR in the process environ (needs root to read other users'). Call only
+# AFTER stopping the service, so this never targets the legitimate service daemon.
+reclaim_global_daemon(){
+  local p
+  for p in $(pgrep -f "channel/daemon.mjs" 2>/dev/null || true); do
+    if $SUDO sh -c "tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null" | grep -qx "CC2CC_BRIDGE_DIR=$GLOBAL_ROOT"; then
+      c "clearing stray daemon pid $p (bridge $GLOBAL_ROOT) so the service can reclaim the socket"
+      $SUDO kill "$p" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  # If the socket file lingers with no live owner, daemon.mjs clears stale sockets on bind anyway.
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UPGRADE — pull latest source, re-stage, restart the daemon/hub.
+# ═══════════════════════════════════════════════════════════════════════════════
+do_upgrade(){
+  # Resolve the SOURCE checkout to pull from. It must be a real git working tree — NOT /opt/cc2cc
+  # (a frozen deploy snapshot; its .git is stripped at install). Default to the dir this script ships
+  # in; require --repo otherwise.
+  local SRC="$REPO"
+  if [ "$SRC" = "$OPT_ROOT" ] || ! git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    die "upgrade needs a source git checkout. Run from the repo, or pass --repo <path-to-cc2cc-checkout>. (/opt/cc2cc is a deploy snapshot, not a repo.)"
+  fi
+  c "source checkout: $SRC"
+  if [ "$NO_PULL" = 1 ]; then
+    c "skipping git pull (--no-pull); using working tree as-is"
+  else
+    c "pulling latest ($(git -C "$SRC" rev-parse --abbrev-ref HEAD))"
+    git -C "$SRC" pull --ff-only || warn "git pull failed (continuing with current working tree)"
+  fi
+  c "now at $(git -C "$SRC" log --oneline -1 2>/dev/null || echo '?')"
+
+  # Global install present? (shared bridge or a system unit). Else treat as local.
+  if [ -e "$GLOBAL_ROOT/secret.key" ] || systemctl list-unit-files cc2cc-daemon.service >/dev/null 2>&1; then
+    require_priv "upgrade (global)"
+    c "re-staging code into $OPT_ROOT"
+    $SUDO mkdir -p "$OPT_ROOT"
+    # rsync would prune deleted files, but it isn't guaranteed present; cp -a over the top then drop
+    # the stray .git/pyc. (Stale removed files are rare across upgrades and harmless to the runtime.)
+    $SUDO cp -a "$SRC/." "$OPT_ROOT/"
+    $SUDO rm -rf "$OPT_ROOT/.git" "$OPT_ROOT"/**/__pycache__ 2>/dev/null || true
+    # Re-assert system ownership: root-owned, group cc2cc, NOT group-writable (service user can't
+    # alter the code it runs) — same invariant as install.
+    $SUDO chown -R root:"$SYS_GROUP" "$OPT_ROOT" 2>/dev/null || true
+    $SUDO chmod -R g-w "$OPT_ROOT" 2>/dev/null || true
+    # Ensure the managed marker exists (older installs predate it; required for the anti-takeover guard).
+    write_service_marker "$GLOBAL_ROOT"
+    $SUDO systemctl daemon-reload 2>/dev/null || true
+    # Bring the service daemon up cleanly. Stop it, CLEAR any rogue ad-hoc daemon still holding the
+    # global socket (a pre-guard session may have hijacked it), then start fresh so the service user
+    # owns the socket. The managed guard now prevents the rogues from coming back.
+    c "stopping services, then reclaiming the global daemon socket"
+    $SUDO systemctl stop cc2cc.target 2>/dev/null || $SUDO systemctl stop cc2cc-daemon 2>/dev/null || true
+    reclaim_global_daemon
+    if systemctl list-unit-files cc2cc.target >/dev/null 2>&1; then
+      c "starting cc2cc.target (daemon + hub)"
+      $SUDO systemctl restart cc2cc.target
+    else
+      c "starting cc2cc-daemon"
+      $SUDO systemctl restart cc2cc-daemon
+      systemctl list-unit-files cc2cc-hub.service >/dev/null 2>&1 && $SUDO systemctl restart cc2cc-hub || true
+    fi
+    sleep 1
+    if systemctl is-active cc2cc-daemon >/dev/null 2>&1; then
+      c "global upgrade complete — cc2cc-daemon active (socket: $(stat -c '%U' "$GLOBAL_ROOT/daemon.sock" 2>/dev/null || echo '?')). Restart any agent to load new MCP code."
+    else
+      warn "cc2cc-daemon is not active after upgrade — check: journalctl -u cc2cc-daemon -n 30"
+    fi
+  else
+    # Local: the MCP runs code straight from the checkout (no /opt staging). git pull already updated
+    # it; just bounce the auto-spawned daemon so it reloads. The MCP re-spawns it on next activity.
+    c "local install — restarting the daemon to pick up new code"
+    if command -v cc2cc-admin >/dev/null 2>&1; then
+      cc2cc-admin daemon restart 2>/dev/null || cc2cc-admin daemon stop 2>/dev/null || true
+    else
+      node "$SRC/channel/daemon.mjs" --stop 2>/dev/null || pkill -f "channel/daemon.mjs" 2>/dev/null || true
+    fi
+    c "local upgrade complete. Restart any running agent to load new MCP code."
+  fi
+}
+
 summary(){
   cat <<EOF
 
@@ -546,6 +650,7 @@ EOF
 
 case "$ACTION" in
   install)            do_install;;
+  upgrade)            do_upgrade;;
   register-client)    do_register_client;;
   unregister-client)  do_unregister_client;;
   uninstall)          do_uninstall;;

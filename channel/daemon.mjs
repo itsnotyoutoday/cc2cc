@@ -78,6 +78,41 @@ export function daemonSocketPath(bridgeDir) {
   return join(bridgeDir, "daemon.sock");
 }
 
+/**
+ * A "managed" bridge is a global/system install whose daemon lifecycle is owned by a service
+ * manager (systemd) running as a dedicated service user. The installer drops a service.json marker.
+ * On a managed bridge, per-user Claude sessions must NOT spawn or auto-heal their own daemon, and a
+ * daemon launched by the wrong OS user must refuse to bind — otherwise an individual session can
+ * hijack the shared socket (wrong-owner files, ad-hoc idle-exit killing the relay, EADDRINUSE
+ * fighting systemd). Returns null when not managed, else the parsed marker { managed, service_user }.
+ */
+export function readServiceMarker(bridgeDir) {
+  try {
+    const m = JSON.parse(readFileSync(join(bridgeDir, "service.json"), "utf8"));
+    return m && m.managed ? m : null;
+  } catch { return null; }
+}
+
+/**
+ * May the current process legitimately OWN (bind) the daemon for this bridge?
+ * On an unmanaged (local) bridge: always yes. On a managed bridge: ONLY the service user, matched by
+ * the bridge dir's owning uid (systemd runs the daemon as that user). Note root is NOT exempt — in a
+ * shared install a human account that merely happens to run as root (e.g. an agent session) is not
+ * the daemon manager, and letting it bind would race the service for the socket. For genuine
+ * maintenance, run as the service user (`sudo -u <service_user>`). Set CC2CC_DAEMON_FORCE=1 to
+ * override. Windows has no uid model, so ownership is not enforced there.
+ */
+export function daemonOwnershipCheck(bridgeDir) {
+  if (!readServiceMarker(bridgeDir)) return { ok: true };
+  if (process.env.CC2CC_DAEMON_FORCE === "1") return { ok: true };
+  if (platform() === "win32" || typeof process.getuid !== "function") return { ok: true };
+  const me = process.getuid();
+  let ownerUid;
+  try { ownerUid = statSync(bridgeDir).uid; } catch { return { ok: true }; } // can't stat → don't block
+  if (me === ownerUid) return { ok: true };
+  return { ok: false, reason: `managed bridge owned by uid ${ownerUid}; refusing to bind as uid ${me} (only the service user may own the daemon; use 'sudo -u' or CC2CC_DAEMON_FORCE=1 for maintenance)` };
+}
+
 // ─── MCP connection registry ─────────────────────────────────────────────────
 // agent name → Set<socket>. An MCP says {type:"hello", agent} on connect; the daemon then
 // knows which socket to wake when that agent's inbox changes.
@@ -250,6 +285,15 @@ export async function main(opts = {}) {
   const cfg = resolveConfig(opts);
   await mkdir(cfg.bridgeDir, { recursive: true }).catch(() => {});
   const socketPath = daemonSocketPath(cfg.bridgeDir);
+
+  // Anti-takeover guard: on a managed (global) bridge, refuse to bind unless we're the service user
+  // (or root). This stops an individual user session's auto-spawn/auto-heal from hijacking the
+  // shared system socket with a wrong-owner, idle-exiting ad-hoc daemon.
+  const own = daemonOwnershipCheck(cfg.bridgeDir);
+  if (!own.ok) {
+    log("error", "refusing to start on managed bridge", { reason: own.reason, socket: socketPath });
+    return null;
+  }
 
   // Assign the module-level `server` only on success: a second in-process main() that bows out
   // (bindSocket → null) must NOT clobber a running daemon's server reference, or that daemon's

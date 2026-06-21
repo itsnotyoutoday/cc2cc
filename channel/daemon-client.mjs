@@ -33,9 +33,15 @@ function probe(socketPath, timeoutMs = 500) {
  * { launched:false }. Otherwise spawns a detached daemon and waits for it to come up.
  * @param {object} opts { bridgeDir, env } — env should carry CC2CC_BRIDGE_DIR/TEAM/IDENTITY.
  */
-export async function ensureDaemon({ bridgeDir, env = process.env, waitMs = 3000 } = {}) {
+export async function ensureDaemon({ bridgeDir, env = process.env, waitMs = 3000, managed = false } = {}) {
   const socketPath = daemonSocketPath(bridgeDir);
   if (await probe(socketPath)) return { launched: false, socketPath };
+
+  // Managed (global/system) bridge: the daemon lifecycle belongs to the service manager (systemd),
+  // not to this per-user session. Never spawn our own — that would hijack the shared socket with a
+  // wrong-owner, idle-exiting daemon. Report it's down; connectToDaemon will keep retrying until the
+  // service comes back.
+  if (managed) return { launched: false, socketPath, ready: false, managed: true };
 
   const child = spawn(process.execPath, [DAEMON_PATH], {
     detached: true,
@@ -58,7 +64,7 @@ export async function ensureDaemon({ bridgeDir, env = process.env, waitMs = 3000
  * Reconnects with backoff if the daemon restarts (the whole point: backend can restart
  * without the MCP/session restarting).
  */
-export function connectToDaemon({ bridgeDir, agent, onWake, onStatus, env }) {
+export function connectToDaemon({ bridgeDir, agent, onWake, onStatus, env, managed = false }) {
   const socketPath = daemonSocketPath(bridgeDir);
   const HEAL_AFTER_FAILURES = 3; // a quick daemon restart reconnects in 1–2 tries; more = it's dead
   let sock = null;
@@ -103,7 +109,9 @@ export function connectToDaemon({ bridgeDir, agent, onWake, onStatus, env }) {
       // ensureDaemon probes first, so this is a no-op if it already recovered (e.g. systemd or
       // another session relaunched it). Respawns in ad-hoc mode; single-instance bind prevents
       // duplicates if a service manager wins the race.
-      if (failures >= HEAL_AFTER_FAILURES && env) {
+      // On a MANAGED bridge we never self-heal by spawning (the service manager owns the daemon);
+      // we just keep reconnecting with backoff until systemd brings it back.
+      if (failures >= HEAL_AFTER_FAILURES && env && !managed) {
         emit("relaunching");
         try { await ensureDaemon({ bridgeDir, env }); } catch {}
         failures = 0;

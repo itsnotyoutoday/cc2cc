@@ -32,6 +32,7 @@ import { realpathSync } from "fs";
 import { generateUniqueName, validateName, takenNames } from "./names.mjs";
 import * as relay from "./relay.mjs";
 import { ensureDaemon, connectToDaemon } from "./daemon-client.mjs";
+import { readServiceMarker } from "./daemon.mjs";
 import { render as tpl, loadTemplateOverrides } from "./templates.mjs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -2020,17 +2021,22 @@ async function activate(candidateName) {
       const teamName = (agentIdentity?.teams || [DEFAULT_TEAM])[0];
       try {
         const daemonEnv = { ...process.env, CC2CC_TEAM: teamName, CC2CC_IDENTITY: agentName };
-        const res = await ensureDaemon({ bridgeDir: BRIDGE_DIR, env: daemonEnv });
+        // On a managed (global/system) bridge the daemon is owned by systemd as the service user;
+        // this per-user session must only CONNECT — never spawn or auto-heal one, or it would hijack
+        // the shared socket. connectToDaemon keeps retrying until the service is up.
+        const managed = !!readServiceMarker(BRIDGE_DIR);
+        const res = await ensureDaemon({ bridgeDir: BRIDGE_DIR, env: daemonEnv, managed });
         daemonClient = connectToDaemon({
           bridgeDir: BRIDGE_DIR,
           agent: agentName,
           onWake: () => { pollInbox().catch(() => {}); },
           onStatus: (s) => log("info", "daemon link", { status: s }),
           env: daemonEnv, // auto-heal: re-ensure the daemon if it dies (else reconnect-spins forever)
+          managed,        // …but never self-spawn on a managed bridge — systemd owns the lifecycle
         });
         daemonMode = true;
         await relay.refreshRemoteState(BRIDGE_DIR); // read daemon-maintained cross-machine map
-        log("info", "daemon mode active", { launched: res.launched, socket: res.socketPath, team: teamName });
+        log("info", "daemon mode active", { launched: res.launched, managed, socket: res.socketPath, team: teamName });
       } catch (e) {
         log("warn", "daemon mode unavailable; relay disabled this session", { error: e.message });
         relayConfigured = false;
