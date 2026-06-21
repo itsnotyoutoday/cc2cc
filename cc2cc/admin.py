@@ -33,8 +33,11 @@ import argparse
 import datetime
 import json
 import os
+import random
 import sys
+import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .core import bridge_path, atomic_write
@@ -109,6 +112,125 @@ def _save_team(team: dict):
     reg = _load_registry()
     reg[team["name"]] = team
     _save_registry(reg)
+
+
+# ── teams.json write lock (mirrors channel/server.mjs acquireTeamsLock) ──
+# teams.json has multiple writers (this CLI + the long-running MCP servers), each doing
+# read-merge-write. A sidecar lock <bridge>/teams.json.lock serializes them so a concurrent mutation
+# can't clobber (a lost admit / leadership change). The lock must appear ATOMICALLY WITH its holder
+# payload: an O_EXCL-create-then-write leaves an empty-file window where a waiter reads "", can't
+# parse a holder, mis-judges it stale, and steals → two holders → the lost-update we're preventing
+# (QA-found). Fix: write the payload to a temp file then os.link() it into place — link is atomic and
+# fails if the lock exists, so it's never observable empty. Works cross-language (Node + Python hit
+# the same link/rename/stat) on a local FS — never put the bridge on NFS. Steal a dead/over-aged
+# holder via an atomic rename-to-claim (one breaker wins); release only if we still own it.
+# max_hold >> longest plausible deschedule of a HEALTHY holder mid-section (~1ms): a live holder
+# starved past this would be assumed-crashed, stolen, then resume and clobber. 30s = huge margin,
+# still reclaims a dead holder within 30s. (Inherent to time-based stealing; see channel/server.mjs.)
+_LOCK_MAX_HOLD_MS = 30000
+_LOCK_ACQUIRE_TIMEOUT_S = 5.0    # fail loud sooner; caller retries
+
+
+def _pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except (OSError, ValueError):
+        return False
+
+
+def _break_stale_lock(lock_path: Path):
+    """Atomically remove a lock judged stale: rename aside (one racer wins) then delete."""
+    brk = f"{lock_path}.break.{os.getpid()}.{random.random()}"
+    try:
+        os.rename(str(lock_path), brk)
+        try:
+            os.unlink(brk)
+        except OSError:
+            pass
+    except FileNotFoundError:
+        pass  # another racer already broke/took it
+
+
+@contextmanager
+def teams_lock():
+    """Hold the teams.json sidecar lock for the whole read-merge-write. FAIL LOUD on timeout —
+    never silently drop a team mutation."""
+    lock_path = _teams_path().with_name("teams.json.lock")
+    deadline = time.time() + _LOCK_ACQUIRE_TIMEOUT_S
+    token = None
+    while True:
+        token = {"pid": os.getpid(), "ts": int(time.time() * 1000)}
+        tmp = f"{lock_path}.tmp.{os.getpid()}.{random.random()}"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(token))
+        try:
+            os.chmod(tmp, 0o660)
+        except OSError:
+            pass
+        try:
+            os.link(tmp, str(lock_path))  # atomic create-WITH-content; raises if held
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            break
+        except FileExistsError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        # Held by someone. Decide wait vs steal.
+        holder = None
+        try:
+            holder = json.loads(lock_path.read_text())
+        except Exception:
+            pass
+        if not holder:
+            # No parseable holder (raced away, or legacy/torn empty lock). Don't blind-steal — steal
+            # only if the FILE itself has aged past max_hold; else it's a just-created lock mid-claim.
+            try:
+                age_ms = time.time() * 1000 - lock_path.stat().st_mtime * 1000
+            except OSError:
+                age_ms = _LOCK_MAX_HOLD_MS + 1  # gone → just retry the link
+            if age_ms > _LOCK_MAX_HOLD_MS:
+                _break_stale_lock(lock_path)
+                continue
+        elif (not _pid_alive(holder.get("pid"))) or (
+            time.time() * 1000 - holder.get("ts", 0) > _LOCK_MAX_HOLD_MS
+        ):
+            _break_stale_lock(lock_path)  # dead, or held longer than any real section
+            continue
+        elif time.time() > deadline:
+            raise RuntimeError(
+                f"teams.json lock busy (held by pid {holder.get('pid')}); "
+                "aborting to avoid a lost mutation"
+            )
+        time.sleep(0.015 + random.random() * 0.035)  # jittered backoff
+    try:
+        yield
+    finally:
+        # Release only if the on-disk lock is still OURS — never delete a lock stolen + re-acquired.
+        try:
+            cur = json.loads(lock_path.read_text())
+            if cur and cur.get("pid") == token["pid"] and cur.get("ts") == token["ts"]:
+                lock_path.unlink()
+        except Exception:
+            pass
+
+
+def with_teams_lock(fn):
+    """Decorator: run a mutating command's full read-merge-write under the teams.json lock."""
+    def wrapper(args):
+        with teams_lock():
+            return fn(args)
+    return wrapper
 
 
 DEFAULT_POLICY = {
@@ -206,6 +328,7 @@ def _ok(msg: str):
 
 # ─── identity / member commands ─────────────────────────────────────────────
 
+@with_teams_lock
 def cmd_member_add(args):
     name = args.name
     if not _valid_name(name):
@@ -246,6 +369,7 @@ def cmd_member_list(args):
         _ok(f"  {n.ljust(w)}  teams={teams:<16} role={role:<7} {status}")
 
 
+@with_teams_lock
 def cmd_member_remove(args):
     """Home-machine authority: delete the member's identity entirely."""
     p = _identity_path(args.name)
@@ -262,6 +386,7 @@ def cmd_member_remove(args):
     _ok(f"deleted member '{args.name}'")
 
 
+@with_teams_lock
 def cmd_member_revoke(args):
     """Team-owner authority: revoke a member's PARTICIPATION in a team (tombstone).
     Does NOT delete the member's identity."""
@@ -284,6 +409,7 @@ def cmd_member_revoke(args):
 
 # ─── team / rules commands ───────────────────────────────────────────────────
 
+@with_teams_lock
 def cmd_team_create(args):
     if not _valid_name(args.name):
         _err(f"invalid team name '{args.name}'")
@@ -318,6 +444,7 @@ def cmd_team_show(args):
     print(json.dumps(team, indent=2))
 
 
+@with_teams_lock
 def cmd_team_set(args):
     team = _load_team(args.name)
     if not team:
@@ -335,6 +462,7 @@ def cmd_team_set(args):
     _ok(f"team '{args.name}' rule {key} = {val!r}")
 
 
+@with_teams_lock
 def cmd_team_leader(args):
     """Operator override: designate the leader for a team this machine owns.
     Leadership lives in the team registry (teams.json) — the runtime derives role from it."""
@@ -349,6 +477,7 @@ def cmd_team_leader(args):
     _ok(f"team '{args.name}' leader set to '{args.agent}'" + (f" (was '{prev}')" if prev else ""))
 
 
+@with_teams_lock
 def cmd_team_succession(args):
     team = _load_team(args.name)
     if not team:
@@ -359,6 +488,7 @@ def cmd_team_succession(args):
     _ok(f"team '{args.name}' succession = {order}")
 
 
+@with_teams_lock
 def cmd_team_admit(args):
     team = _load_team(args.name)
     if not team:

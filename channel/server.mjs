@@ -22,8 +22,8 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readdir, readFile, rename, mkdir, writeFile, stat, rm, chmod } from "fs/promises";
-import { writeFileSync, readFileSync } from "fs";
+import { readdir, readFile, rename, mkdir, writeFile, stat, rm, chmod, link, unlink } from "fs/promises";
+import { writeFileSync, readFileSync, chmodSync } from "fs";
 import { join, basename, dirname } from "path";
 import { randomUUID, randomBytes, createCipheriv, createDecipheriv, scryptSync } from "crypto";
 import { homedir, hostname } from "os";
@@ -400,12 +400,24 @@ async function writeHeartbeat(statusValue = "active", context = "session started
   }
 }
 
+/** Seconds after which a heartbeat counts as offline — operator-tunable via
+ *  policy.identities.offline_after_seconds (reloaded every poll). Falls back to the built-in. */
+function offlineAfterS() {
+  const v = policy?.identities?.offline_after_seconds;
+  return Number.isFinite(v) && v > 0 ? v : HEARTBEAT_STALE_S;
+}
+/** Heartbeat WRITE cadence, derived from the staleness window: ~3 writes per window so up to 2
+ *  late/missed writes don't trip a false-offline. offlineAfterS/3 is the floor; never thinner. */
+function heartbeatMs() {
+  return Math.max(1000, Math.floor((offlineAfterS() * 1000) / 3));
+}
+
 /** Check if a heartbeat is stale */
 function isStale(heartbeatData) {
   const ts = heartbeatData.timestamp || heartbeatData.heartbeat;
   if (!ts) return true;
   const age = (Date.now() - new Date(ts).getTime()) / 1000;
-  return age > HEARTBEAT_STALE_S;
+  return age > offlineAfterS();
 }
 
 /** Check if an agent is online based on known heartbeat data */
@@ -1518,6 +1530,13 @@ async function pollStatus() {
 
   // Refresh operator/governance policy (cc2cc_admin team-<name>.json) before reconciling.
   await loadTeamPolicies();
+  // Hot-reload bridge config so cc2cc_admin edits take effect in running sessions (≤1 poll) without
+  // a restart. Dumb re-parse every poll: these are tiny idempotent parse-and-assign loads, so it's
+  // microseconds — and mtime-gating would risk a same-second missed reload. policy.json also drives
+  // the presence cadence (offline_after_seconds), which is why this runs before any staleness check.
+  await loadPolicy(BRIDGE_DIR);
+  await loadRules();
+  await loadTemplateOverrides(BRIDGE_DIR);
   // Reconcile team leaders from the just-refreshed heartbeats. Init-only discovery
   // was a startup race: a leader that came online AFTER this agent started was never
   // picked up, breaking send_team routing and list_teams. Doing it every poll closes
@@ -1570,6 +1589,7 @@ async function loadPolicy(bridgeDir) {
     policy = {
       messages: { ...DEFAULT_POLICY.messages, ...(o.messages || {}) },
       teams: { ...DEFAULT_POLICY.teams, ...(o.teams || {}) },
+      identities: { ...DEFAULT_POLICY.identities, ...(o.identities || {}) },
       directory: { ...DEFAULT_POLICY.directory, ...(o.directory || {}) },
       relay: { ...DEFAULT_POLICY.relay, ...(o.relay || {}) },
     };
@@ -1584,6 +1604,93 @@ async function loadPolicy(bridgeDir) {
 // team's owner machine is authoritative; cc2cc_admin and leader tools write here.
 
 const TEAMS_PATH = join(BRIDGE_DIR, "teams.json");
+
+// ── teams.json write lock ──
+// teams.json is the one bridge file with MULTIPLE writers (this runtime's saveTeamFile + the Python
+// cc2cc-admin), each doing read-merge-write. Without serialization, two concurrent mutations race:
+// the second write clobbers the first (a lost admit / leadership change — a real correctness bug).
+// We serialize with a sidecar lock <bridge>/teams.json.lock (NOT a lock on teams.json itself —
+// atomicWrite renames a new inode into place, so a lock on the file's fd protects nothing).
+//
+// The lock must appear ATOMICALLY WITH ITS HOLDER PAYLOAD. A naive O_EXCL-create-then-write leaves a
+// window where the file exists but is EMPTY; a concurrent waiter reads "", can't parse a holder, and
+// (mis)judges it stale → steals → two holders → the exact lost-update we're preventing (QA-found).
+// Fix: write the payload to a temp file, then hardlink() it into place — link is atomic and fails
+// EEXIST if held, so the lock is NEVER observable without its {pid,ts}. Cross-language because both
+// Node and Python hit the same link/rename/stat syscalls on the (local-FS) bridge — never use NFS.
+// Steal a DEAD or OVER-AGED holder via an atomic rename-to-claim so only one breaker wins the race;
+// release only if WE still own it (re-read pid+ts) so a stolen-from holder can't delete the new lock.
+const TEAMS_LOCK = TEAMS_PATH + ".lock";
+// max_hold must be >> the longest plausible deschedule of a HEALTHY holder mid-section (real section
+// is ~1ms): if a live holder is starved past this, a peer assumes it crashed, steals, and the holder
+// resumes and clobbers. 30s leaves enormous margin under any realistic load while still reclaiming a
+// genuinely dead holder within 30s. (Inherent to time-based stealing; native flock(2) would avoid it
+// but needs a compiled dep cc2cc deliberately omits.) acquire-timeout fails loud sooner; caller retries.
+const LOCK_MAX_HOLD_MS = 30000;
+const LOCK_ACQUIRE_TIMEOUT_MS = 5000;
+const lockSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const lockSuffix = () => `${process.pid}.${Math.random().toString(36).slice(2)}`;
+
+function pidAlive(pid) {
+  if (!pid || typeof process.kill !== "function") return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } // EPERM = exists, different owner
+}
+
+/** Atomically remove a lock we've judged stale: rename it aside (only one racer wins) then delete. */
+async function breakStaleLock() {
+  const brk = `${TEAMS_LOCK}.break.${lockSuffix()}`;
+  try { await rename(TEAMS_LOCK, brk); await unlink(brk).catch(() => {}); }
+  catch (e) { if (e.code !== "ENOENT") throw e; } // ENOENT → another racer already broke/took it
+}
+
+/** Acquire the lock; returns the holder token {pid,ts} we wrote (needed for owner-checked release). */
+async function acquireTeamsLock() {
+  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  for (;;) {
+    const token = { pid: process.pid, ts: Date.now() };
+    const tmp = `${TEAMS_LOCK}.tmp.${lockSuffix()}`;
+    await writeFile(tmp, JSON.stringify(token));
+    await chmodQuiet(tmp, 0o660);
+    try {
+      await link(tmp, TEAMS_LOCK);            // atomic create-WITH-content; throws EEXIST if held
+      await unlink(tmp).catch(() => {});
+      return token;                           // we hold it; payload was never observable empty
+    } catch (e) {
+      await unlink(tmp).catch(() => {});
+      if (e.code !== "EEXIST") throw e;
+    }
+    // Held by someone. Decide wait vs steal.
+    let holder = null;
+    try { holder = JSON.parse(await readFile(TEAMS_LOCK, "utf8")); } catch { /* vanished / legacy-empty */ }
+    if (!holder) {
+      // No parseable holder (raced away, or a legacy/torn empty lock). Don't blind-steal — steal only
+      // if the FILE ITSELF has aged past max_hold; otherwise it's a just-created lock mid-claim: wait.
+      let st = null; try { st = await stat(TEAMS_LOCK); } catch { /* gone → retry link */ }
+      if (!st || Date.now() - st.mtimeMs > LOCK_MAX_HOLD_MS) { await breakStaleLock(); continue; }
+    } else if (!pidAlive(holder.pid) || Date.now() - (holder.ts || 0) > LOCK_MAX_HOLD_MS) {
+      await breakStaleLock(); continue;       // dead, or held longer than any real section: reclaim
+    } else if (Date.now() > deadline) {
+      throw new Error(`teams.json lock busy (held by pid ${holder.pid}); aborting to avoid a lost mutation`);
+    }
+    await lockSleep(15 + Math.floor(Math.random() * 35)); // jittered backoff
+  }
+}
+
+/** Release only if the on-disk lock is still OURS (pid+ts match) — never delete a lock that was
+ *  stolen from us and re-acquired by someone else. */
+async function releaseTeamsLock(token) {
+  try {
+    const cur = JSON.parse(await readFile(TEAMS_LOCK, "utf8"));
+    if (cur && cur.pid === token.pid && cur.ts === token.ts) await unlink(TEAMS_LOCK);
+  } catch { /* already gone or unreadable → nothing to release */ }
+}
+
+/** Run fn() holding the teams.json lock. FAIL LOUD on acquire-timeout — never silently drop a team
+ *  mutation (a swallowed failure would reintroduce the exact lost-update we're preventing). */
+async function withTeamsLock(fn) {
+  const token = await acquireTeamsLock();
+  try { return await fn(); } finally { await releaseTeamsLock(token); }
+}
 
 async function loadTeamsRegistry() {
   try {
@@ -1688,10 +1795,12 @@ async function loadOrInitTeam(team) {
 async function handleAdmit({ team, agent } = {}) {
   if (!team || !agent) return textResult("Missing required fields: team, agent", true);
   if (!leadsTeam(team)) return textResult(`Only the leader of "${team}" can admit members.`, true);
-  const t = await loadOrInitTeam(team);
-  t.revoked = (t.revoked || []).filter((n) => n !== agent);
-  if (!t.admitted.includes(agent)) t.admitted.push(agent);
-  await saveTeamFile(t);
+  await withTeamsLock(async () => {
+    const t = await loadOrInitTeam(team);
+    t.revoked = (t.revoked || []).filter((n) => n !== agent);
+    if (!t.admitted.includes(agent)) t.admitted.push(agent);
+    await saveTeamFile(t);
+  });
   await loadTeamPolicies();
   log("info", "member admitted", { team, agent, by: agentName });
   return textResult(tpl("admitted", { agent, team }));
@@ -1700,12 +1809,14 @@ async function handleAdmit({ team, agent } = {}) {
 async function handleEvict({ team, agent } = {}) {
   if (!team || !agent) return textResult("Missing required fields: team, agent", true);
   if (!leadsTeam(team)) return textResult(`Only the leader of "${team}" can evict members.`, true);
-  const t = await loadOrInitTeam(team);
-  t.admitted = (t.admitted || []).filter((n) => n !== agent);
-  t.revoked = t.revoked || [];
-  if (!t.revoked.includes(agent)) t.revoked.push(agent);
-  if (t.leader === agent) t.leader = null;
-  await saveTeamFile(t);
+  await withTeamsLock(async () => {
+    const t = await loadOrInitTeam(team);
+    t.admitted = (t.admitted || []).filter((n) => n !== agent);
+    t.revoked = t.revoked || [];
+    if (!t.revoked.includes(agent)) t.revoked.push(agent);
+    if (t.leader === agent) t.leader = null;
+    await saveTeamFile(t);
+  });
   const mid = relay.getRelayStatus?.()?.machine_id || "local";
   await atomicWrite(join(BRIDGE_DIR, "tombstones", `${team}__${agent}.json`),
     { type: "revoke", team, member: agent, by_machine: mid, at: new Date().toISOString() });
@@ -1719,19 +1830,24 @@ async function handleEvict({ team, agent } = {}) {
 async function handleCreateTeam({ name, admission, retention_days } = {}) {
   if (!participating || !agentIdentity) return textResult(tpl("not_registered"), true);
   if (!name || !validateName(name)) return textResult(`Invalid team name "${name}".`, true);
-  if (await loadTeamFile(name)) return textResult(tpl("team_exists", { team: name }), true);
   const mid = relay.getRelayStatus?.()?.machine_id || "local";
   const now = new Date().toISOString();
-  const t = {
-    name, owner_machine: mid, leader: agentName, succession: [],
-    rules: {
-      retention_days: Number.isInteger(retention_days) ? retention_days : policy.messages.retention_days,
-      admission: (admission === "approved" || admission === "open") ? admission : policy.teams.default_admission,
-      sticky_leader: policy.teams.sticky_leader,
-    },
-    admitted: [agentName], revoked: [], created: now, updated: now,
-  };
-  await saveTeamFile(t);
+  // Existence check + create under one lock so two concurrent creates of the same name can't both win.
+  const exists = await withTeamsLock(async () => {
+    if (await loadTeamFile(name)) return true;
+    const t = {
+      name, owner_machine: mid, leader: agentName, succession: [],
+      rules: {
+        retention_days: Number.isInteger(retention_days) ? retention_days : policy.messages.retention_days,
+        admission: (admission === "approved" || admission === "open") ? admission : policy.teams.default_admission,
+        sticky_leader: policy.teams.sticky_leader,
+      },
+      admitted: [agentName], revoked: [], created: now, updated: now,
+    };
+    await saveTeamFile(t);
+    return false;
+  });
+  if (exists) return textResult(tpl("team_exists", { team: name }), true);
   if (!agentIdentity.teams.includes(name)) {
     agentIdentity.teams.push(name);
     await saveIdentity(agentIdentity);
@@ -1766,28 +1882,32 @@ async function handleClaimTeam({ team } = {}) {
   if (remoteOwner && remoteOwner !== mid) {
     return textResult(tpl("team_remote_owned", { team }), true);
   }
-  const t = await loadOrInitTeam(team);
-  t.owner_machine = mid;
-  t.leader = agentName;
-  // Fold in everyone who already considers themselves on this team (identity teams=[...]),
-  // preserving any prior admitted entries. Read from the identity files on disk — not just live
-  // heartbeats — so members that are currently OFFLINE are still adopted rather than stranded in
-  // the GAB-but-not-in-roster limbo. Excludes agents revoked from the team.
-  const members = new Set(t.admitted || []);
-  members.add(agentName);
-  for (const name of await membersReferencing(team)) {
-    if (!isRevoked(name, team)) members.add(name);
-  }
-  t.admitted = [...members];
-  t.revoked = (t.revoked || []).filter((n) => n !== agentName);
-  await saveTeamFile(t);
+  let admittedCount = 0;
+  await withTeamsLock(async () => {
+    const t = await loadOrInitTeam(team);
+    t.owner_machine = mid;
+    t.leader = agentName;
+    // Fold in everyone who already considers themselves on this team (identity teams=[...]),
+    // preserving any prior admitted entries. Read from the identity files on disk — not just live
+    // heartbeats — so members that are currently OFFLINE are still adopted rather than stranded in
+    // the GAB-but-not-in-roster limbo. Excludes agents revoked from the team.
+    const members = new Set(t.admitted || []);
+    members.add(agentName);
+    for (const name of await membersReferencing(team)) {
+      if (!isRevoked(name, team)) members.add(name);
+    }
+    t.admitted = [...members];
+    t.revoked = (t.revoked || []).filter((n) => n !== agentName);
+    await saveTeamFile(t);
+    admittedCount = t.admitted.length;
+  });
   if (!agentIdentity.teams.includes(team)) {
     agentIdentity.teams.push(team);
     await saveIdentity(agentIdentity);
   }
   await loadTeamPolicies();
   reconcileTeamLeaders();
-  log("info", "team claimed", { team, by: agentName, admitted: t.admitted.length });
+  log("info", "team claimed", { team, by: agentName, admitted: admittedCount });
   return textResult(tpl("team_claimed", { team }));
 }
 
@@ -1921,8 +2041,9 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("exit", () => {
   if (cleanShutdown || !agentName) return;
   try {
+    const hbPath = join(statusDir(), `${agentName}-heartbeat.json`);
     writeFileSync(
-      join(statusDir(), `${agentName}-heartbeat.json`),
+      hbPath,
       JSON.stringify({
         agent: agentName,
         timestamp: new Date().toISOString(),
@@ -1932,6 +2053,11 @@ process.on("exit", () => {
         context: "process exit (unclean)",
       }, null, 2),
     );
+    // SYNC chmod: this exit handler can't use async atomicWrite/chmodQuiet (the event loop is gone),
+    // and writeFileSync's {mode} would be umask-masked (→640 under root's 022). Force group-rw so a
+    // peer running as a different OS user can still read/rewrite it on the shared bridge — same perms
+    // invariant atomicWrite enforces everywhere else. Best-effort (this whole path is skipped on SIGKILL).
+    chmodSync(hbPath, 0o660);
   } catch { /* best effort */ }
 });
 
@@ -2047,7 +2173,17 @@ async function activate(candidateName) {
   // 12. Start polling loops
   pollTimer = setInterval(pollInbox, POLL_MS);
   statusTimer = setInterval(pollStatus, POLL_MS);
-  heartbeatTimer = setInterval(() => writeHeartbeat("active", "heartbeat"), HEARTBEAT_INTERVAL_MS);
+  // Self-rescheduling heartbeat so the WRITE cadence tracks the (reloaded) staleness window — writer
+  // and isStale reader always derive from the same policy.identities.offline_after_seconds.
+  const scheduleHeartbeat = () => {
+    if (cleanShutdown) return;
+    heartbeatTimer = setTimeout(async () => {
+      if (cleanShutdown) return;
+      try { await writeHeartbeat("active", "heartbeat"); } catch { /* best effort */ }
+      scheduleHeartbeat();
+    }, heartbeatMs());
+  };
+  scheduleHeartbeat();
 
   // 13. Initial inbox drain
   await pollInbox();
