@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import hmac
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -21,10 +22,14 @@ from typing import Optional
 
 # ─── Data Models ─────────────────────────────────────────────────────────────
 
+# M3: machine_secret authenticates the machine_id (a per-machine secret, distinct from the shared
+# access token). Optional for backward-compat during rollout; once a machine binds a secret it is
+# required for that machine_id thereafter.
 class RegisterRequest(BaseModel):
     token: str
     machine_id: str
     team: str
+    machine_secret: Optional[str] = None
 
 class SendRequest(BaseModel):
     token: str
@@ -32,21 +37,25 @@ class SendRequest(BaseModel):
     from_team: str
     to_team: str
     message: dict
+    machine_secret: Optional[str] = None  # authenticates from_machine
 
 class PollRequest(BaseModel):
     machine_id: str
     team: str
+    machine_secret: Optional[str] = None
 
 class AckRequest(BaseModel):
     token: str
     machine_id: str
     acked_ids: list[str]
+    machine_secret: Optional[str] = None
 
 class KeepaliveRequest(BaseModel):
     token: str
     machine_id: str
     team: str
     agents: Optional[dict[str, dict]] = None  # v3.6: folded agent roster
+    machine_secret: Optional[str] = None
 
 class HeartbeatRequest(BaseModel):
     token: str
@@ -54,6 +63,7 @@ class HeartbeatRequest(BaseModel):
     team: str
     agents: dict[str, dict]   # agent_name → { status_text: "..." } for v3.6
     team_policies: Optional[dict] = None  # teams this machine OWNS → policy (federated)
+    machine_secret: Optional[str] = None
 
 
 # ─── Application Setup ───────────────────────────────────────────────────────
@@ -64,6 +74,7 @@ registrations: dict[str, dict] = {}        # key: f"{machine_id}:{team}"
 message_queue: dict[str, list[dict]] = {}  # key: f"{machine_id}:{team}"
 leased_messages: dict[str, dict] = {}      # key: lease_id
 tokens: set[str] = set()
+machine_secrets: dict[str, str] = {}  # M3: machine_id → per-machine auth secret (trust-on-first-use)
 
 REGISTRATION_TTL = 30
 LEASE_TTL = 30
@@ -82,9 +93,27 @@ def _team_key(machine_id: str, team: str) -> str:
     return f"{machine_id}:{team}"
 
 
+def _is_valid_token(token: str) -> bool:
+    # m3: constant-time comparison against each configured token.
+    return any(hmac.compare_digest(token, t) for t in tokens)
+
+
 def _check_token(token: str):
-    if token not in tokens:
+    if not _is_valid_token(token):
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def _check_machine(machine_id: str, secret: Optional[str]):
+    # M3: bind machine_id → per-machine secret (trust-on-first-use). Once bound, every request
+    # claiming that machine_id must present the matching secret — so a shared-token holder can't
+    # drain another machine's queue (poll), ack/steal its leases, or spoof its from_machine (send).
+    bound = machine_secrets.get(machine_id)
+    if bound is None:
+        if secret:
+            machine_secrets[machine_id] = secret
+        return
+    if not secret or not hmac.compare_digest(secret, bound):
+        raise HTTPException(status_code=403, detail="machine_id authentication failed")
 
 
 def _is_registration_active(reg: dict) -> bool:
@@ -99,6 +128,7 @@ def _is_registration_active(reg: dict) -> bool:
 @app.post("/api/register")
 async def api_register(req: RegisterRequest):
     _check_token(req.token)
+    _check_machine(req.machine_id, req.machine_secret)
     key = _team_key(req.machine_id, req.team)
     registrations[key] = {
         "machine_id": req.machine_id,
@@ -114,6 +144,7 @@ async def api_register(req: RegisterRequest):
 @app.post("/api/send")
 async def api_send(req: SendRequest):
     _check_token(req.token)
+    _check_machine(req.from_machine, req.machine_secret)
 
     # H3: Validate sender has an active registration
     sender_key = _team_key(req.from_machine, req.from_team)
@@ -168,6 +199,7 @@ async def api_poll(req: PollRequest, request: Request):
         _check_token(token)
     else:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
+    _check_machine(req.machine_id, req.machine_secret)
 
     now = datetime.now(timezone.utc)
 
@@ -226,6 +258,7 @@ async def api_poll(req: PollRequest, request: Request):
 @app.post("/api/ack")
 async def api_ack(req: AckRequest):
     _check_token(req.token)
+    _check_machine(req.machine_id, req.machine_secret)
     deleted = 0
     for lease_id in req.acked_ids:
         if lease_id in leased_messages:
@@ -242,6 +275,7 @@ async def api_ack(req: AckRequest):
 @app.post("/api/keepalive")
 async def api_keepalive(req: KeepaliveRequest):
     _check_token(req.token)
+    _check_machine(req.machine_id, req.machine_secret)
     key = _team_key(req.machine_id, req.team)
     if key not in registrations:
         raise HTTPException(status_code=404, detail="Not registered")
@@ -252,6 +286,7 @@ async def api_keepalive(req: KeepaliveRequest):
 @app.post("/api/heartbeat")
 async def api_heartbeat(req: HeartbeatRequest):
     _check_token(req.token)
+    _check_machine(req.machine_id, req.machine_secret)
     key = _team_key(req.machine_id, req.team)
     if key not in registrations:
         raise HTTPException(status_code=404, detail="Not registered")
@@ -263,13 +298,18 @@ async def api_heartbeat(req: HeartbeatRequest):
 
 
 @app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "registrations": len(registrations),
-        "queued_messages": sum(len(q) for q in message_queue.values()),
-        "active_leases": len(leased_messages),
-    }
+async def health(request: Request):
+    # m4: liveness is public, but the mesh metrics (size / traffic) are only returned to a caller
+    # holding a valid token — they otherwise leak registration/queue/lease counts to anyone.
+    base = {"status": "ok"}
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and _is_valid_token(auth[7:]):
+        base.update({
+            "registrations": len(registrations),
+            "queued_messages": sum(len(q) for q in message_queue.values()),
+            "active_leases": len(leased_messages),
+        })
+    return base
 
 
 # ─── Background Cleanup ──────────────────────────────────────────────────────
