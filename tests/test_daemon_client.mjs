@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdtempSync, writeFileSync, mkdirSync } from "fs";
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -15,6 +15,14 @@ import { ensureDaemon, connectToDaemon } from "../channel/daemon-client.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function freshBridge() { return mkdtempSync(join(tmpdir(), "cc2cc-dc-")); }
+async function waitFor(fn, ms = 8000, step = 200) {
+  for (let t = 0; t < ms; t += step) { if (fn()) return true; await sleep(step); }
+  return fn();
+}
+const daemonPid = (bridge) => {
+  try { return JSON.parse(readFileSync(join(bridge, "status", "daemon.json"), "utf8")).pid; }
+  catch { return null; }
+};
 function poke(bridge, agent, id = "m1") {
   const inbox = join(bridge, `to-${agent}`, "inbox");
   mkdirSync(inbox, { recursive: true });
@@ -90,5 +98,41 @@ test("connectToDaemon: auto-reconnects after daemon restart", async () => {
   } finally {
     client.close();
     await handle.stop();
+  }
+});
+
+test("auto-heal: a CRASHED daemon is respawned by the MCP and messaging recovers", async () => {
+  const bridge = freshBridge();
+  const env = { ...process.env, CC2CC_BRIDGE_DIR: bridge }; // env enables the heal path (daemon-client gates on it)
+  const first = await ensureDaemon({ bridgeDir: bridge, env });
+  assert.ok(first.pid, "ensureDaemon launched a detached daemon");
+
+  const statuses = [], wakes = [];
+  const client = connectToDaemon({
+    bridgeDir: bridge, agent: "dave", env,
+    onWake: (m) => wakes.push(m), onStatus: (s) => statuses.push(s),
+  });
+  try {
+    assert.ok(await waitFor(() => statuses.includes("connected"), 3000), "initially connected");
+
+    // Simulate a CRASH (not a graceful restart): kill the process; nothing else respawns it.
+    process.kill(first.pid, "SIGKILL");
+
+    // After HEAL_AFTER_FAILURES reconnect failures the MCP re-ensures (respawns) the daemon.
+    assert.ok(await waitFor(() => statuses.includes("relaunching"), 12000),
+      "MCP entered the auto-heal (relaunching) path after sustained reconnect failure");
+
+    // A fresh daemon now owns the socket — different pid than the crashed one.
+    assert.ok(await waitFor(() => { const p = daemonPid(bridge); return p && p !== first.pid; }, 8000),
+      "a respawned daemon owns the socket after heal");
+
+    // Messaging recovers end-to-end: an inbox change wakes the client from the respawned daemon.
+    wakes.length = 0;
+    poke(bridge, "dave", "post-heal");
+    assert.ok(await waitFor(() => wakes.some((w) => w.agent === "dave"), 5000),
+      "client recovered a wake from the respawned daemon");
+  } finally {
+    client.close();
+    try { const p = daemonPid(bridge); if (p) process.kill(p, "SIGKILL"); } catch {} // reap the respawned daemon
   }
 });
