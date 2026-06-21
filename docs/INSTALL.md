@@ -53,6 +53,12 @@ cc2cc-launch <identity>      # foreground interactive (no identity → pick from
 cc2cc-launch -t <identity>   # in tmux, hands-free (auto-answers the startup menus)
 ```
 
+> **Identity names are lowercase** (letters/digits/hyphens, start alphanumeric, ≤31 chars). A
+> capitalized name like `John` is auto-lowercased to `john` (with a notice); a name that can't be
+> normalized is rejected. Provision identities/teams first with `cc2cc-admin team create` /
+> `cc2cc-admin member add`. Root **can** launch — it runs without `--dangerously-skip-permissions`,
+> so normal permission prompts apply.
+
 ---
 
 ## Machine-wide install (multi-user)
@@ -76,16 +82,51 @@ This creates:
 - A system **user + group `cc2cc`**, and a **venv** at `/opt/cc2cc/venv`
 - **`secret.key`** (mode `640`, `root:cc2cc`) — prompts generate-new vs import-shared
 - **systemd system services**: `cc2cc-daemon` (always, in **service mode** — always-on, no
-  idle-exit) and `cc2cc-hub` (if you opt into a relay hub), `enable --now`. On a host without
-  systemd, run an always-on daemon with `cc2cc-admin daemon start --service` instead.
+  idle-exit, with `CC2CC_TEAM=<node name>`) and `cc2cc-hub` (if you opt into a relay hub),
+  plus an umbrella **`cc2cc.target`** that controls them together, all `enable --now`. On a host
+  without systemd, run an always-on daemon with `cc2cc-admin daemon start --service` instead.
+- A **node identity** in `/var/lib/cc2cc/connections.json` (`self.id` seeded from `/etc/machine-id`,
+  unique per machine; `self.name` = the node name, default = `hostname`, set with `--node-name NAME`,
+  stable across reinstalls). The node name is also the **default team** for agents that don't set
+  `CC2CC_TEAM`.
 - PATH symlinks: `cc2cc` / `cc2cc-launch` / `cc2cc-install` → `/usr/local/bin`,
   `cc2cc-admin` → `/usr/local/sbin`
 - `CC2CC_ENCRYPT=1` is forced (a shared multi-user bridge always encrypts relay traffic)
 
+> **Ownership recap (global):** `/opt/cc2cc` is `root:cc2cc` and **not** group-writable (system
+> code). The bridge `/var/lib/cc2cc` is `cc2cc:cc2cc` with setgid dirs (`2770`); `secret.key` is
+> `640 cc2cc:cc2cc`; `connections.json` is `660` (it holds the hub token); `/etc/cc2cc/hub.env` is
+> `640 root:cc2cc`.
+
+#### Controlling the node (systemd)
+
+Start/stop/restart the whole node — daemon (+ hub) — through the umbrella target:
+
+```bash
+sudo systemctl start cc2cc.target      # or stop | restart
+systemctl status cc2cc.target
+```
+
+> ⚠️ There is **no bare `cc2cc` unit** — `systemctl start cc2cc` / `service cc2cc start` do **not**
+> work (they default to `.service`). Type the `.target` suffix, or address `cc2cc-daemon` /
+> `cc2cc-hub` individually.
+
+#### Non-interactive (flag-driven) global install
+
+```bash
+sudo cc2cc-install install --scope global --hub --non-interactive [--node-name NAME] [--secret-key PATH]
+```
+
+`--non-interactive` skips all prompts (flags + defaults only). `--secret-key PATH` imports an
+existing shared key (to join an existing mesh hands-free) instead of generating a new one.
+
 ### 2. Grant each account access to the shared secret
 
-The shared `secret.key` is `640 root:cc2cc`, so each human account must be in the `cc2cc` group to
-read it. Let the installer do it (repeatable; re-run any time to add more):
+A human account must be in the **`cc2cc` group** to use the global bridge. This is because the MCP
+runs **as the human** and reads `secret.key` (mode `640 cc2cc:cc2cc`) to do the end-to-end
+encryption, *and* writes the agent's identity/heartbeat into the bridge. (The daemon, which runs as
+the `cc2cc` service user, does **not** need the key — it only relays ciphertext.) Let the installer
+add members (repeatable; re-run any time to add more):
 
 ```bash
 sudo scripts/cc2cc-install.sh --scope global --add-user alice --add-user bob
@@ -93,21 +134,29 @@ sudo scripts/cc2cc-install.sh --scope global --add-user alice --add-user bob
 sudo usermod -aG cc2cc alice
 ```
 
-Each added user then logs out/in (or runs `newgrp cc2cc`) for the group to take effect.
+> Group membership only takes effect in a **new login session** — `usermod -aG` / `--add-user` does
+> **not** affect already-running sessions. Each added user logs out/in (or runs `newgrp cc2cc`).
+> `cc2cc-launch` now auto-activates the group via `sg` (it re-execs itself, and for tmux wraps the
+> agent command), so you don't have to re-login to launch. If you're **not** a member, `cc2cc-launch`
+> stops with a clear message telling you to ask an admin to run
+> `sudo cc2cc-install install --scope global --add-user <you>`, then re-login.
 
 ### 3. Each account joins the shared bridge
 
-`register-client` only edits **that user's own** `~/.claude.json`, so it needs no sudo:
+`register-client` only edits **that user's own** `~/.claude.json`, so it needs no sudo — and no
+path: it auto-detects the global bridge `/var/lib/cc2cc`, resolves the MCP server to the staged
+`/opt/cc2cc/channel/server.mjs`, and auto-enables encryption:
 
 ```bash
 # as alice:
-cc2cc-install.sh register-client --bridge /var/lib/cc2cc
+cc2cc-install.sh register-client
 ```
 
 You can also just run `cc2cc-install.sh` with no arguments — it detects the existing global
 install and offers to register your account automatically.
 
-Then launch as usual: `cc2cc-launch <identity>`.
+Then launch as usual: `cc2cc-launch <identity>`. To un-join later, `cc2cc-install.sh
+unregister-client` removes just this user's `cc2cc` MCP entry from `~/.claude.json`.
 
 > Privilege model: standing up **or** tearing down the machine-wide install requires root/sudo;
 > joining it (`register-client`) and the entire local scope never do.
@@ -128,11 +177,13 @@ Scope-aware and reversible; it confirms before deleting any data.
 
 ```bash
 cc2cc-install.sh uninstall --scope local       # removes your MCP entry, ~/bin links; asks before rm ~/.cc2cc
-sudo cc2cc-install.sh uninstall --scope global # stops/removes services, /etc/cc2cc, symlinks; asks before rm /var/lib/cc2cc and /opt/cc2cc
+sudo cc2cc-install.sh uninstall --scope global # stops/removes services + cc2cc.target, /etc/cc2cc, symlinks; asks before rm /var/lib/cc2cc and /opt/cc2cc
 ```
 
-Global uninstall is privilege-gated (root/sudo) just like global install. The per-user MCP-entry
-removal at the top of any uninstall touches only your own `~/.claude.json`.
+Global uninstall is privilege-gated (root/sudo) just like global install. It **no longer touches**
+`~/.claude.json` — that's a per-user artifact. Each user un-registers themselves with
+`cc2cc-install.sh unregister-client` (or `claude mcp remove --scope user cc2cc`). Only the **local**
+uninstall removes the invoking user's own MCP entry.
 
 ---
 
@@ -140,13 +191,18 @@ removal at the top of any uninstall touches only your own `~/.claude.json`.
 
 If you'd rather wire it by hand, see the **Manual installation** block in the
 [README](../README.md#quick-start): clone, `pip install -e .`, then register the MCP server in
-`~/.claude.json` (an **absolute** path — `node` does not expand `~`):
+`~/.claude.json`. The server file lives in the repo at `channel/server.mjs` (the bridge dir is
+separate); use an **absolute** path — `node` does not expand `~`:
 
 ```bash
 claude mcp add --scope user cc2cc \
   --env CC2CC_BRIDGE_DIR="$HOME/.cc2cc" \
-  -- node "$HOME/.cc2cc/server.mjs"
+  -- node "$HOME/cc2cc/channel/server.mjs"
 ```
+
+This matches exactly what the installer's `register_mcp` writes: command `node`, args
+`[<repo>/channel/server.mjs]`, env `CC2CC_BRIDGE_DIR=<bridge>` (plus `CC2CC_ENCRYPT=1` when
+encryption is on).
 
 Launch with `claude --dangerously-load-development-channels server:cc2cc`.
 

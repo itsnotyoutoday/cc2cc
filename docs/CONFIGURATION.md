@@ -8,7 +8,7 @@
 |----------|---------|-------------|
 | `CC2CC_BRIDGE_DIR` (alias `BRIDGE_DIR`, Node) | `~/.cc2cc` | Bridge root directory |
 | `CC2CC_IDENTITY` (aliases `SELF`, `CC2CC_SELF`) | auto-generated | This session's agent name. If unset, the server stays dormant until `register()` is called. |
-| `CC2CC_TEAM` | `cc2cc` | Comma-separated teams seeded into a **new** identity; also the daemon's hub-registered team. An existing identity file wins over this. |
+| `CC2CC_TEAM` | node name | Comma-separated teams seeded into a **new** identity; also the daemon's hub-registered team. An existing identity file wins over this. When unset, the default team is the **node name** (`connections.json` `self.name`, else the server hostname) — not a hardcoded `cc2cc`. |
 | `CC2CC_ENCRYPT` | unset | `=1` enables AES-256-GCM relay encryption. **Mandatory for the relay.** |
 | `CC2CC_RELAY_TOKEN` | — | Relay hub auth token (server side; the hub refuses to start without one). |
 | `CC2CC_HUB_TOKEN` | `PEERTEST` | `starthub.sh` launcher: hub token |
@@ -67,7 +67,7 @@ to `mcpServers`:
       "env": {
         "CC2CC_BRIDGE_DIR": "~/.cc2cc",
         "CC2CC_IDENTITY": "alpha",
-        "CC2CC_TEAM": "cc2cc"
+        "CC2CC_TEAM": "nexus"
       }
     }
   }
@@ -119,6 +119,24 @@ cc2cc-admin policy show                         # effective federation policy
 Roles are derived: a member listed as a team's `leader` in `teams.json` is the leader; everyone
 else is a member. Agents create teams at runtime with the `create_team` tool (the caller becomes
 leader) and request membership with `request_join` / `admit`.
+
+---
+
+## Config Templates (`policy.json` / `rules.json`)
+
+The global install drops two inert, **copy-to-activate** templates into the bridge:
+`policy.json.example` and `rules.json.example`. Both `policy.json` and `rules.json` are
+**optional** — the system runs on built-in defaults; you only create them to override. Copy a
+template to its live `*.json` name and edit to activate:
+
+```bash
+sudo cp /var/lib/cc2cc/policy.json.example /var/lib/cc2cc/policy.json   # then edit
+```
+
+- **`policy.json`** — governance/retention/admission/encrypt knobs (message retention + staleness,
+  default team admission, identity/directory expiry, `relay.encrypt_required`).
+- **`rules.json`** — a standing **instruction** line injected into every inbound-message
+  notification (e.g. `"Reply as soon as possible"`).
 
 ---
 

@@ -110,13 +110,17 @@ scripts/cc2cc-install.sh            # interactive: local (this account) or globa
 
 The installer creates the bridge + signing key, registers the `cc2cc` MCP server in
 `~/.claude.json` (via `claude mcp add`), and optionally sets up the relay client/hub and teams.
-A machine-wide (`--scope global`) install puts a shared bridge in `/var/lib/cc2cc` and runs the
-daemon (and optional hub) as systemd services. Reverse anything with `scripts/cc2cc-install.sh uninstall`.
+A machine-wide (`--scope global`) install stages code to `/opt/cc2cc`, puts a shared bridge in
+`/var/lib/cc2cc`, and runs the daemon (and optional hub) as systemd services under an umbrella
+`cc2cc.target` (control the node with `sudo systemctl start|stop|restart cc2cc.target`). Reverse
+anything with `scripts/cc2cc-install.sh uninstall`.
 
-> **Install scopes:** **local** (per-account, no root) vs **machine-wide** (one operator runs
-> `sudo …​--scope global` once, then each account joins the shared bridge with
-> `cc2cc-install.sh register-client`). Full walkthrough — including the `cc2cc` group step — in
-> **[docs/INSTALL.md](docs/INSTALL.md)**.
+> **Install scopes:** **local** (per-account, bridge `~/.cc2cc`, MCP in your own `~/.claude.json`,
+> no sudo) vs **global** (machine-wide bridge `/var/lib/cc2cc`, code staged to `/opt/cc2cc`, needs
+> sudo). For global, one operator runs `sudo …​--scope global` once; each account must be in the
+> **`cc2cc` group** (the MCP runs as the human and reads `secret.key`) and then joins the shared
+> bridge with `cc2cc-install.sh register-client` (no path — it auto-detects the bridge and staged
+> code; un-join with `unregister-client`). Full walkthrough in **[docs/INSTALL.md](docs/INSTALL.md)**.
 
 Then bring an agent online:
 
@@ -124,6 +128,11 @@ Then bring an agent online:
 cc2cc-launch <identity>            # foreground interactive (no identity → pick from a list)
 cc2cc-launch -t <identity>         # in tmux, hands-free (auto-answers the startup menus)
 ```
+
+> Identity names are **lowercase** (letters/digits/hyphens, start alphanumeric, ≤31 chars);
+> `John` is auto-lowercased to `john`. Root can launch (without `--dangerously-skip-permissions`,
+> so permission prompts apply). On a global bridge you must be in the `cc2cc` group —
+> `cc2cc-launch` auto-activates it via `sg`, or stops with guidance if you're not a member.
 
 <details>
 <summary><b>Manual installation</b></summary>
@@ -153,18 +162,19 @@ the Claude Code CLI, which edits the file atomically and is idempotent:
 ```bash
 claude mcp add --scope user cc2cc \
   --env CC2CC_BRIDGE_DIR="$HOME/.cc2cc" \
-  -- node "$HOME/.cc2cc/server.mjs"
+  -- node "$HOME/cc2cc/channel/server.mjs"
 ```
 
-Or, to merge it by hand, add to the `mcpServers` object in `~/.claude.json` (use an **absolute**
-path — `node` does not expand `~`):
+The server file lives in the repo at `channel/server.mjs`; the bridge dir (`CC2CC_BRIDGE_DIR`) is
+separate. Or, to merge it by hand, add to the `mcpServers` object in `~/.claude.json` (use an
+**absolute** path — `node` does not expand `~`):
 
 ```json
 {
   "mcpServers": {
     "cc2cc": {
       "command": "node",
-      "args": ["/home/you/.cc2cc/server.mjs"],
+      "args": ["/home/you/cc2cc/channel/server.mjs"],
       "env": {
         "CC2CC_BRIDGE_DIR": "/home/you/.cc2cc"
       }
@@ -238,7 +248,9 @@ flowchart LR
 ```
 
 An agent picks its team at launch (`CC2CC_TEAM`, or the team tied to its provisioned identity) or
-at runtime via `create_team` / `request_join`. **Provisioning** (creating teams, adding members,
+at runtime via `create_team` / `request_join`. When `CC2CC_TEAM` is unset and the identity is new,
+the default team is the **node name** (`connections.json` `self.name`, else the hostname) — not a
+hardcoded `cc2cc`. **Provisioning** (creating teams, adding members,
 setting leaders/succession/admission/retention) is an operator job done with the **`cc2cc-admin`**
 CLI — separate from the agent's everyday MCP tools:
 

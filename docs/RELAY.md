@@ -41,7 +41,12 @@ CC2CC_RELAY_TOKEN=<TOKEN> python3 relay_hub.py --host 127.0.0.1 --port 10322
 
 Or let the installer run it as a managed **systemd service**:
 `sudo scripts/cc2cc-install.sh --scope global --hub` (writes `cc2cc-hub.service`, token in
-`/etc/cc2cc/hub.env`). See [INSTALL.md](INSTALL.md#machine-wide-install-multi-user).
+`/etc/cc2cc/hub.env`; control the node with `sudo systemctl start|stop|restart cc2cc.target`). The
+global install also wires this node's own daemon to relay through its hub, and records a **node
+identity** in `/var/lib/cc2cc/connections.json` — `self.id` (unique per machine, seeded from
+`/etc/machine-id`) and `self.name` (the node name, default = `hostname`, set with `--node-name NAME`,
+stable across reinstalls). The node name is also the **default team** for agents that don't set
+`CC2CC_TEAM`. See [INSTALL.md](INSTALL.md#machine-wide-install-multi-user).
 
 Verify it's up:
 
