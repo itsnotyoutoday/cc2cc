@@ -204,8 +204,9 @@ Type=simple
 User=$SYS_USER
 Group=$SYS_GROUP
 Environment=CC2CC_BRIDGE_DIR=$BRIDGE
+Environment=CC2CC_SERVICE_MODE=1
 $( [ "$WANT_ENCRYPT" = 1 ] && echo "Environment=CC2CC_ENCRYPT=1" )
-ExecStart=$(command -v node) $REPO/channel/daemon.mjs
+ExecStart=$(command -v node) $REPO/channel/daemon.mjs --service
 Restart=on-failure
 RestartSec=5
 [Install]

@@ -18,6 +18,14 @@ every peer must share a **byte-identical `secret.key`**. The wire protocol is sp
 
 ## Part 1 — Operating a relay server (the hub)
 
+> **Key concept — keep the daemon always-on.** Any node that must be reachable when no Claude
+> session is open (a relay/server node, or any peer that should receive while idle) must run its
+> **daemon in service mode** — the hub is passive store-and-forward and **cannot wake a daemon**.
+> While a node's daemon is down, inbound messages just queue on the hub (~5 days) until it returns.
+> The global installer's `cc2cc-daemon` systemd unit runs in service mode; on a host without
+> systemd use `cc2cc-admin daemon start --service` (status/restart/stop via the same command).
+> See [CONFIGURATION.md → Daemon modes & control](CONFIGURATION.md#daemon-modes--control).
+
 ### Run the hub
 
 The hub refuses to start without an auth token.

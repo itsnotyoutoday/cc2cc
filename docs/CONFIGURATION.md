@@ -17,11 +17,39 @@
 | `CC2CC_PY` | `python3` | `starthub.sh` launcher: Python interpreter |
 | `CC2CC_REMOTE_ACTIVE_MS` | `60000` | Remote-team "active" window (ms) |
 | `CC2CC_REMOTE_EXPIRE_MS` | ~4 days | Remote-team expiry window (ms) |
+| `CC2CC_SERVICE_MODE` | unset | `=1` runs the daemon in **service mode** (always-on, no idle-exit). Equivalent to `--service`. Required for an always-reachable / relay node. |
+| `CC2CC_DAEMON_IDLE_MS` | `600000` | Ad-hoc daemon idle-exit timeout (ms, default 10 min). Ignored in service mode. |
 | `CC2CC_DEBUG` | unset | Log relay poll failures and extra diagnostics |
 
 > **Removed:** `CC2CC_ROLE` and `PEER` are no longer used. Roles are **derived** from `teams.json`,
 > and there is no single peer (the old `SELF`/`PEER`/`peer_channel` model is gone). `SELF` /
 > `CC2CC_SELF` survive only as aliases for `CC2CC_IDENTITY`.
+
+---
+
+## Daemon modes & control
+
+The per-host daemon (`channel/daemon.mjs`) runs in one of two modes:
+
+- **Ad-hoc** (default) — auto-spawned by the first MCP session; **idle-exits** after
+  `CC2CC_DAEMON_IDLE_MS` (10 min) with no MCP connections. Fine for ordinary interactive use.
+- **Service** (`CC2CC_SERVICE_MODE=1` or `--service`) — **always-on**, no idle-exit. Use this for
+  any node that must stay reachable (a relay/server node). The global installer's `cc2cc-daemon`
+  systemd unit runs in service mode.
+
+Control it with `cc2cc-admin daemon` (wraps `node channel/daemon.mjs`):
+
+```bash
+cc2cc-admin daemon status               # JSON: running, pid, mode, socket, team, relay
+cc2cc-admin daemon start [--service]    # detached launch (--service = always-on)
+cc2cc-admin daemon restart              # preserves mode
+cc2cc-admin daemon stop                 # clean SIGTERM
+```
+
+On a host **without systemd**, `cc2cc-admin daemon start --service` is the way to run an always-on
+daemon. **The hub cannot wake a daemon** — it's passive store-and-forward — so an always-reachable
+node must keep its daemon alive itself (inbound messages just queue on the hub, ~5 days, while a
+daemon is down).
 
 ---
 

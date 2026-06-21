@@ -75,8 +75,9 @@ This creates:
 - **Shared bridge** `/var/lib/cc2cc`, `setgid 2770`, group **`cc2cc`** (so members share it)
 - A system **user + group `cc2cc`**, and a **venv** at `/opt/cc2cc/venv`
 - **`secret.key`** (mode `640`, `root:cc2cc`) — prompts generate-new vs import-shared
-- **systemd system services**: `cc2cc-daemon` (always) and `cc2cc-hub` (if you opt into a relay
-  hub), `enable --now`
+- **systemd system services**: `cc2cc-daemon` (always, in **service mode** — always-on, no
+  idle-exit) and `cc2cc-hub` (if you opt into a relay hub), `enable --now`. On a host without
+  systemd, run an always-on daemon with `cc2cc-admin daemon start --service` instead.
 - PATH symlinks: `cc2cc` / `cc2cc-launch` / `cc2cc-install` → `/usr/local/bin`,
   `cc2cc-admin` → `/usr/local/sbin`
 - `CC2CC_ENCRYPT=1` is forced (a shared multi-user bridge always encrypts relay traffic)

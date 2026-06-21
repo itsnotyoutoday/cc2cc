@@ -26,6 +26,13 @@ identity (`CC2CC_IDENTITY`/`SELF`); otherwise it stays dormant until `register()
 daemon mode the MCP does no hub I/O or file-watching itself — it connects to the daemon over a
 local socket and reacts to `{wake}` pushes.
 
+The daemon runs in one of two modes: **ad-hoc** (default — idle-exits after
+`CC2CC_DAEMON_IDLE_MS`, default 10 min, with no MCP connections) or **service**
+(`CC2CC_SERVICE_MODE=1` / `--service` — always-on). A relay / always-reachable node must run in
+service mode: the hub is passive and **cannot wake a daemon**, so while a node's daemon is down
+its inbound messages just queue on the hub (~5 days). Control via
+`cc2cc-admin daemon <status|start [--service]|restart|stop>`.
+
 ---
 
 ## 2. Directory Layout

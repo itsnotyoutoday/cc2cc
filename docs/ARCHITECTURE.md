@@ -296,6 +296,24 @@ malformed JSON removed. `--dry-run` counts only.
 - Writes `status/daemon.json` (pid, socket, team, relay) as a liveness stamp; can be restarted
   independently of any Claude session (MCPs simply reconnect).
 
+### Two modes
+
+- **Ad-hoc** (default; a bare `node channel/daemon.mjs`, auto-spawned by an MCP) — **idle-exits**
+  after `CC2CC_DAEMON_IDLE_MS` (default 600000 ms = 10 min) with no MCP connections.
+- **Service** (`CC2CC_SERVICE_MODE=1` or `--service`) — **always-on**, no idle-exit. Required for a
+  relay / always-reachable node. The installer's `cc2cc-daemon` systemd unit runs in service mode.
+
+> **The hub cannot wake a daemon.** The relay hub is passive store-and-forward — it never initiates
+> a connection to a node. So an always-reachable node *must* keep its daemon alive (service mode);
+> while a node's daemon is down, inbound messages simply queue on the hub (held ~5 days) until the
+> daemon comes back and polls.
+
+### Control
+
+`cc2cc-admin daemon <status|start [--service]|restart|stop>` (thin wrapper over
+`node channel/daemon.mjs --status|--start [--service]|--restart|--stop`). On a host without
+systemd, `cc2cc-admin daemon start --service` is the always-on equivalent of a service manager.
+
 ---
 
 ## 9. Relay Hub (`relay_hub.py`)

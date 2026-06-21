@@ -411,6 +411,21 @@ def cmd_policy_show(args):
     print(json.dumps(_load_policy(), indent=2))
 
 
+def cmd_daemon(args):
+    """Control the per-host bridge daemon — thin wrapper over `node channel/daemon.mjs`."""
+    import shutil, subprocess
+    node = shutil.which("node")
+    if not node:
+        _err("node not found on PATH (required to control the daemon)")
+    daemon_js = Path(__file__).resolve().parent.parent / "channel" / "daemon.mjs"
+    if not daemon_js.exists():
+        _err(f"daemon.mjs not found at {daemon_js}")
+    cmd = [node, str(daemon_js), "--" + args.action]
+    if args.action == "start" and getattr(args, "service", False):
+        cmd.append("--service")
+    sys.exit(subprocess.run(cmd).returncode)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="cc2cc-admin",
                                      description="cc2cc operator/administration CLI (local-machine authority)")
@@ -475,6 +490,16 @@ def main():
     polsub = pol.add_subparsers(dest="action", required=True)
     p = polsub.add_parser("show", help="show the effective policy (defaults + policy.json)")
     p.set_defaults(func=cmd_policy_show)
+
+    # daemon (control the per-host bridge daemon; wraps `node channel/daemon.mjs`)
+    d = sub.add_parser("daemon", help="control the per-host bridge daemon")
+    dsub = d.add_subparsers(dest="action", required=True)
+    dsub.add_parser("status", help="show daemon status as JSON").set_defaults(func=cmd_daemon)
+    dsub.add_parser("stop", help="stop the daemon (clean SIGTERM)").set_defaults(func=cmd_daemon)
+    dsub.add_parser("restart", help="restart the daemon (preserves mode)").set_defaults(func=cmd_daemon)
+    ds = dsub.add_parser("start", help="start the daemon detached (--service = always-on, no idle-exit)")
+    ds.add_argument("--service", action="store_true", help="run in service mode (no idle-exit)")
+    ds.set_defaults(func=cmd_daemon)
 
     args = parser.parse_args()
     args.func(args)
