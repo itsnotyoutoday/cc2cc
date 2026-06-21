@@ -111,7 +111,10 @@ async function loadEncryptionKey() {
   try {
     const secretPath = join(BRIDGE_DIR, "secret.key");
     const secret = (await readFile(secretPath, "utf8")).trim();
-    encryptionKey = scryptSync(secret, "cc2cc-aes", 32);
+    // m2: stronger KDF — longer domain-separated salt + higher scrypt cost (N=2^15). MUST stay
+    // deterministic and identical on every machine: both peers derive the AES key from the same
+    // shared secret.key and have to land on the same key, so the salt cannot be random per-deploy.
+    encryptionKey = scryptSync(secret, "cc2cc-aes-gcm/v2", 32, { N: 2 ** 15, r: 8, p: 1, maxmem: 96 * 1024 * 1024 });
   } catch {
     encryptionKey = null;
   }
