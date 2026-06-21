@@ -1,9 +1,11 @@
 /**
  * Integration test: CC2CC Relay Hub + relay.mjs
  *
- * Single-machine loopback. Requires relay_hub.py on port 9090.
- * Run hub:   python3 relay_hub.py --port 9090 --token integ-test-token
+ * Single-machine loopback. The hub is started automatically on a free ephemeral
+ * port by the startHub() fixture (no manually-started hub required).
  * Run test:  node --test tests/test_integration.mjs
+ * If python3 lacks fastapi/uvicorn, point the fixture at a venv:
+ *            PYTHON=$HOME/venv/bin/python node --test tests/test_integration.mjs
  *
  * Covers: registration, send, poll, ack (B7), self-team inbound (B3), exports
  * B7 stale-lease rejection is covered by Python suite (LEASE_TTL=0 patching).
@@ -11,14 +13,16 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { startHub } from "./helpers/hub.mjs";
 
-const HUB_URL = "http://127.0.0.1:9090";
 const TOKEN = "integ-test-token";
 const MACHINE_A = "integ-machine-a";
 const MACHINE_B = "integ-machine-b";
 const TEAM = "integ-team";
 
 let relay;
+let hub;
+let HUB_URL; // set in before() from the ephemeral-port fixture
 
 async function apiPost(url, body, token) {
   const headers = { "Content-Type": "application/json" };
@@ -32,9 +36,16 @@ async function apiPost(url, body, token) {
 describe("Integration: Hub + relay round-trip", () => {
 
   before(async () => {
+    hub = await startHub({ token: TOKEN });
+    HUB_URL = hub.url;
     const health = await (await fetch(`${HUB_URL}/health`)).json();
     assert.equal(health.status, "ok");
     relay = await import("../channel/relay.mjs");
+  });
+
+  after(async () => {
+    try { relay?.stopRelayClient?.(); } catch {}
+    await hub?.stop();
   });
 
   it("1. Register machines + send cross-queue message", async () => {
