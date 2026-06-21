@@ -58,11 +58,13 @@ export async function ensureDaemon({ bridgeDir, env = process.env, waitMs = 3000
  * Reconnects with backoff if the daemon restarts (the whole point: backend can restart
  * without the MCP/session restarting).
  */
-export function connectToDaemon({ bridgeDir, agent, onWake, onStatus }) {
+export function connectToDaemon({ bridgeDir, agent, onWake, onStatus, env }) {
   const socketPath = daemonSocketPath(bridgeDir);
+  const HEAL_AFTER_FAILURES = 3; // a quick daemon restart reconnects in 1–2 tries; more = it's dead
   let sock = null;
   let closed = false;
   let backoff = 250;
+  let failures = 0;          // consecutive reconnect failures since the last successful connect
   let reconnectTimer = null; // m9: track the pending reconnect so close() can cancel it
 
   const emit = (s) => { try { onStatus?.(s); } catch {} };
@@ -75,6 +77,7 @@ export function connectToDaemon({ bridgeDir, agent, onWake, onStatus }) {
 
     sock.on("connect", () => {
       backoff = 250;
+      failures = 0;
       emit("connected");
       try { sock.write(JSON.stringify({ type: "hello", agent }) + "\n"); } catch {}
     });
@@ -91,9 +94,22 @@ export function connectToDaemon({ bridgeDir, agent, onWake, onStatus }) {
       }
     });
     sock.on("error", () => {});            // 'close' handles reconnect
-    sock.on("close", () => {
+    sock.on("close", async () => {
       if (closed) return;
       emit("disconnected");
+      failures++;
+      // Auto-heal: after sustained failure the daemon is likely DEAD (not just restarting), and
+      // nothing else respawns it (the MCP would otherwise reconnect-spin forever). Re-ensure it —
+      // ensureDaemon probes first, so this is a no-op if it already recovered (e.g. systemd or
+      // another session relaunched it). Respawns in ad-hoc mode; single-instance bind prevents
+      // duplicates if a service manager wins the race.
+      if (failures >= HEAL_AFTER_FAILURES && env) {
+        emit("relaunching");
+        try { await ensureDaemon({ bridgeDir, env }); } catch {}
+        failures = 0;
+        backoff = 250;
+      }
+      if (closed) return;
       // m9: add jitter so many MCPs sharing a daemon don't reconnect in lockstep after a restart.
       const delay = backoff + Math.floor(Math.random() * backoff);
       reconnectTimer = setTimeout(connect, delay);

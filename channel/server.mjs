@@ -1906,15 +1906,14 @@ async function activate(candidateName) {
     } else {
       const teamName = (agentIdentity?.teams || ["cc2cc"])[0];
       try {
-        const res = await ensureDaemon({
-          bridgeDir: BRIDGE_DIR,
-          env: { ...process.env, CC2CC_TEAM: teamName, CC2CC_IDENTITY: agentName },
-        });
+        const daemonEnv = { ...process.env, CC2CC_TEAM: teamName, CC2CC_IDENTITY: agentName };
+        const res = await ensureDaemon({ bridgeDir: BRIDGE_DIR, env: daemonEnv });
         daemonClient = connectToDaemon({
           bridgeDir: BRIDGE_DIR,
           agent: agentName,
           onWake: () => { pollInbox().catch(() => {}); },
           onStatus: (s) => log("info", "daemon link", { status: s }),
+          env: daemonEnv, // auto-heal: re-ensure the daemon if it dies (else reconnect-spins forever)
         });
         daemonMode = true;
         await relay.refreshRemoteState(BRIDGE_DIR); // read daemon-maintained cross-machine map
