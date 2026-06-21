@@ -153,68 +153,11 @@ print("py-done")
     assert.deepEqual(missPy, [], `LOST UPDATE: Python admits clobbered: ${missPy} (pyOut=${pyOut})`);
   });
 
-  // SKIPPED (flaky harness, not a code bug): the busy-wait barrier below (`while time.time()<barrier: pass`)
-  // pegs every core, so under a 32-way burst the OS occasionally starves ONE writer past the 5s lock
-  // acquire deadline → it correctly FAILS LOUD (refuses) → but this test swallows stderr (stdio:"ignore")
-  // and never retries, so a correct refusal is miscounted as a "lost update". Varying victim (py13 one
-  // run, js3 the next) = timing, not a clobber; a 64-way pure-Python burst loses ZERO (no clobber path).
-  // TODO(rlead/QA): swap the hot busy-wait for a sleep barrier + retry-on-RuntimeError, then re-enable.
-  it.skip("HIGH CONTENTION JS↔Python: synchronized burst of real writers — no lost update", async () => {
-    // The realistic worst case: a running MCP server (JS) and many cc2cc-admin invocations (Python)
-    // all hitting teams.json at the same instant. Uses ONLY the authors' real code on both sides.
-    const br = await mkdtemp(join(tmpdir(), "cc2cc-qa-hc-"));
-    await writeFile(join(br, "teams.json"), JSON.stringify({ teams: {
-      teamA: { name: "teamA", owner_machine: "local", leader: "boss", admitted: ["boss"], revoked: [], rules: { retention_days: 4, admission: "open", sticky_leader: true } },
-    }}));
-    await identity(br, "boss", ["teamA"]);
-    const N = 16;
-    for (let i = 0; i < N; i++) {
-      await identity(br, `js${i}`, ["teamA"]);
-      await identity(br, `py${i}`, ["teamA"]);
-    }
-    const s = await connect(br, "boss"); clients.push(s.client);
-    await sleep(2000);
-
-    // Python: N separate processes, each a real cmd_team_admit, all released at a shared barrier.
-    const worker = join(br, "_pyworker.py");
-    await writeFile(worker, `
-import sys, time
-sys.path.insert(0, ${JSON.stringify(REPO)})
-from cc2cc import admin
-agent = sys.argv[1]; barrier = float(sys.argv[2])
-while time.time() < barrier: pass
-class A: pass
-a = A(); a.name = "teamA"; a.agent = agent
-try: admin.cmd_team_admit(a)
-except SystemExit: pass
-`);
-    const barrier = (Date.now() + 1500) / 1000; // python time.time() is seconds
-    const pyProcs = [];
-    for (let i = 0; i < N; i++) {
-      pyProcs.push(new Promise((res) => {
-        const p = spawn(PYBIN, [worker, `py${i}`, String(barrier)],
-          { env: { ...process.env, CC2CC_BRIDGE_DIR: br }, cwd: REPO, stdio: "ignore" });
-        p.on("close", res);
-      }));
-    }
-    // JS: fire its admits right around the same barrier instant.
-    const jsJobs = (async () => {
-      const waitMs = Math.max(0, barrier * 1000 - Date.now());
-      await sleep(waitMs);
-      const jobs = [];
-      for (let i = 0; i < N; i++) jobs.push(s.client.callTool({ name: "admit", arguments: { team: "teamA", agent: `js${i}` } }));
-      return Promise.all(jobs);
-    })();
-    await Promise.all([...pyProcs, jsJobs]);
-
-    const reg = JSON.parse(await readFile(join(br, "teams.json"), "utf8")).teams;
-    const adm = new Set(reg.teamA.admitted);
-    const missJs = [...Array(N).keys()].filter((i) => !adm.has(`js${i}`)).map((i) => `js${i}`);
-    const missPy = [...Array(N).keys()].filter((i) => !adm.has(`py${i}`)).map((i) => `py${i}`);
-    await rm(br, { recursive: true, force: true });
-    assert.deepEqual([...missJs, ...missPy], [],
-      `LOST UPDATE under high contention — missing JS=${missJs} PY=${missPy}`);
-  });
+  // The HIGH-CONTENTION JS↔Python lost-update scenario that lived here as a flaky `it.skip` busy-wait
+  // placeholder has been rewritten as the AUTHORITATIVE test in tests/test_qa_lock_contention.mjs
+  // (rlead/QA): sleep barrier (no core-starvation false positives), captured fail-loud output, and
+  // retry-on-fail-loud per the lock's caller-retries contract — asserting ZERO SILENT clobbers plus a
+  // dedicated forced-contention case that actually traverses the fail-loud→retry→converge path.
 
   it("protocol: a JS-format live+fresh lock blocks Python (same path + holder schema)", async () => {
     const br = await mkdtemp(join(tmpdir(), "cc2cc-qa-proto-"));
