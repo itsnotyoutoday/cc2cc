@@ -47,30 +47,24 @@ the recipient's inbox; the recipient's MCP server polls that inbox and pushes it
 
 ```mermaid
 flowchart LR
-  A(["alice<br/>Claude session + MCP"])
-  B(["bob<br/>Claude session + MCP"])
-  subgraph BR["Shared bridge · CC2CC_BRIDGE_DIR"]
-    IB["to-bob/inbox/<br/>msg-uuid.json"]
-    DN["to-bob/done/<br/>to-bob/receipts/"]
-    IA["to-alice/inbox/"]
-    ST["status/<br/>*-heartbeat.json"]
-    KEY["secret.key<br/>HMAC sign + verify"]
-  end
-  A -- "① send(to=bob)<br/>write signed JSON" --> IB
-  IB -- "② bob's MCP polls (≤3s)<br/>verify sig → push to session" --> B
-  B -- "③ reply() / send<br/>write JSON" --> IA
-  IA -- "④ alice's MCP polls + push" --> A
-  IB -. "after read → archived" .-> DN
-  A -. heartbeat .-> ST
-  B -. heartbeat .-> ST
-  LOC["📁 CC2CC_BRIDGE_DIR resolves to:<br/>• User · Linux/macOS: ~/.cc2cc · Windows: %USERPROFILE%\.cc2cc<br/>• System-wide · Linux: /var/lib/cc2cc · macOS: /Library/Application Support/cc2cc · Windows: C:\ProgramData\cc2cc"]
-  BR -. "lives at" .-> LOC
+  A["alice<br/>(MCP)"] -- "① send → signed JSON" --> IB["to-bob/<br/>inbox/"]
+  IB -- "② bob polls ≤3s → push" --> B["bob<br/>(MCP)"]
+  B -- "③ reply → to-alice/inbox/" --> A
 ```
 
-> Bridge location is resolved from `CC2CC_BRIDGE_DIR`, falling back to the per-user default above.
-> The bundled installer implements **user scope** on every OS and **system scope** on Linux
-> (systemd); the macOS/Windows system paths follow each OS's shared-data convention. Messages for
-> offline agents wait in the inbox and deliver on next launch.
+Each agent also heartbeats under `status/`; read messages move to `done/` + `receipts/`. Every
+message is HMAC-signed with the bridge's `secret.key` and verified on read. Messages for offline
+agents wait in the inbox until next launch.
+
+**Where the bridge lives** (`CC2CC_BRIDGE_DIR`, else the default below):
+
+| Scope | Linux | macOS | Windows |
+|-------|-------|-------|---------|
+| User | `~/.cc2cc` | `~/.cc2cc` | `%USERPROFILE%\.cc2cc` |
+| System-wide | `/var/lib/cc2cc` | `/Library/Application Support/cc2cc` | `C:\ProgramData\cc2cc` |
+
+> The installer wires user scope on every OS, and system scope on Linux (systemd); the
+> macOS/Windows system paths follow each OS's shared-data convention.
 
 ### Cross-machine flow (relay protocol)
 
@@ -78,39 +72,32 @@ Agents on different hosts never share a filesystem — they meet at a **relay hu
 **daemon** holds the one hub connection; the hub is a zero-knowledge queue that only sees
 ciphertext. Everything is encrypted end-to-end (AES-256-GCM) before it leaves the origin host.
 
+**The path** — the daemon encrypts before anything leaves the host; the hub only relays ciphertext:
+
 ```mermaid
-sequenceDiagram
-  autonumber
-  participant AM as Alice MCP (Host A)
-  participant OB as outbox/ (bridge A)
-  participant DA as Daemon A
-  participant HUB as Relay Hub
-  participant DB as Daemon B
-  participant IB as to-carol/inbox/ (bridge B)
-  participant CM as Carol MCP (Host B)
-
-  Note over DA,HUB: registration (per host, periodic)
-  DA->>HUB: POST /api/register {machine_id, team, token}
-  HUB-->>DA: { ttl_seconds }
-  loop keep alive
-    DA->>HUB: POST /api/keepalive + /api/heartbeat
-  end
-
-  Note over AM,DA: send (cross-team → cross-host)
-  AM->>OB: send_team("remote", text)<br/>encrypt AES-256-GCM, spool envelope
-  DA->>OB: read pending envelope
-  DA->>HUB: POST /api/send {to_team, ciphertext}
-  HUB-->>HUB: route by (machine_id, team)
-
-  Note over HUB,CM: deliver
-  DB->>HUB: POST /api/poll
-  HUB-->>DB: ciphertext envelope(s)
-  DB->>HUB: POST /api/ack
-  DB->>IB: decrypt + verify → write msg-uuid.json
-  IB->>CM: Carol's MCP polls + pushes into session
+flowchart LR
+  A["Alice<br/>(Host A)"] --> DA["Daemon A"]
+  DA == ciphertext ==> H["Relay Hub"]
+  H == ciphertext ==> DB["Daemon B"]
+  DB --> C["Carol<br/>(Host B)"]
 ```
 
-See [Teams](#teams) for how `send_team` routing works and [Remote connections (relay)](#remote-connections-relay) for setup.
+**The protocol** — each daemon registers, then it's push / poll / ack over HTTP:
+
+```mermaid
+sequenceDiagram
+  participant DA as Daemon A
+  participant H as Hub
+  participant DB as Daemon B
+  DA->>H: register (machine_id, team)
+  DA->>H: send (ciphertext)
+  DB->>H: poll
+  H-->>DB: ciphertext
+  DB->>H: ack
+```
+
+Endpoints: `/api/register` · `/api/send` · `/api/poll` · `/api/ack` · `/api/keepalive`.
+See [Teams](#teams) for `send_team` routing and [Remote connections (relay)](#remote-connections-relay) for setup.
 
 ## Quick Start
 
@@ -240,18 +227,9 @@ Agents are scoped into **teams**. Messaging rules:
   (`open` or `approved`). Leaders `admit`/`evict` members of their own team.
 
 ```mermaid
-flowchart TD
-  subgraph nexus["Team: nexus"]
-    L1["leader<br/>nexus-coord"]
-    M1["member<br/>tom"]
-  end
-  subgraph remote["Team: remote"]
-    L2["leader<br/>rlead"]
-    M2["member<br/>rmem"]
-  end
-  M1 -- "send / broadcast<br/>(same team · direct)" --> L1
-  M1 -- "send_team('remote', …)" --> L2
-  L2 -- "leader forwards" --> M2
+flowchart LR
+  M1["tom<br/>(team nexus)"] -- "send / broadcast<br/>(same team)" --> L1["nexus-coord<br/>(nexus leader)"]
+  M1 -- "send_team('remote')" --> L2["rlead<br/>(remote leader)"] -- forwards --> M2["rmem"]
 ```
 
 An agent picks its team at launch (`CC2CC_TEAM`, or the team tied to its provisioned identity) or
