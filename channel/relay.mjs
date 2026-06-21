@@ -8,8 +8,9 @@
  */
 
 import { readFile, mkdir, writeFile, readdir, rm } from "fs/promises";
+import { readFileSync, writeFileSync } from "fs";
 import { join, basename } from "path";
-import { randomUUID } from "crypto";
+import { randomUUID, randomBytes } from "crypto";
 import { validateName } from "./names.mjs";
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -30,16 +31,46 @@ let _encryptFn = null;          // text ⇒ encrypted_text
 
 const seenMessageIds = new Set();
 const MAX_SEEN_IDS = 10000;
+const SEEN_STATE_FILE = "seen-messages.json"; // M4: persist dedup so it survives a daemon restart
+let seenDirty = false;
 
 function hasSeenMessage(msgIdentity) {
   if (seenMessageIds.has(msgIdentity)) return true;
   seenMessageIds.add(msgIdentity);
+  seenDirty = true;
   if (seenMessageIds.size > MAX_SEEN_IDS) {
     // Evict oldest entries (Set iteration order is insertion order)
     const toDelete = [...seenMessageIds].slice(0, seenMessageIds.size - MAX_SEEN_IDS);
     for (const id of toDelete) seenMessageIds.delete(id);
   }
   return false;
+}
+
+// M4: at-least-once relay delivery + in-memory dedup meant a write-then-ack-fail-then-restart (or
+// an outbox resend after a recipient restart) could redeliver. Persist the processed-id set so
+// dedup survives restarts. msg.id is the stable client idempotency key (minted once at send).
+async function loadSeenMessages(dir) {
+  try {
+    const arr = JSON.parse(await readFile(join(dir, SEEN_STATE_FILE), "utf8"));
+    if (Array.isArray(arr)) for (const id of arr.slice(-MAX_SEEN_IDS)) seenMessageIds.add(id);
+  } catch { /* none yet */ }
+}
+
+function persistSeenMessages(dir) {
+  if (!seenDirty || !dir) return;
+  seenDirty = false;
+  writeFile(join(dir, SEEN_STATE_FILE), JSON.stringify([...seenMessageIds]), "utf8").catch(() => {}); // bounded by MAX_SEEN_IDS
+}
+
+// M3: this machine's per-machine auth secret (distinct from the shared access token). Generated
+// once and persisted in the bridge (0600); sent on every hub call so the hub can bind our
+// machine_id to it (trust-on-first-use) and reject anyone else claiming our machine_id.
+function ensureMachineSecret(bridgeDir) {
+  const p = join(bridgeDir, "machine.secret");
+  try { return readFileSync(p, "utf8").trim(); } catch { /* generate below */ }
+  const secret = randomBytes(32).toString("hex");
+  try { writeFileSync(p, secret, { encoding: "utf8", mode: 0o600 }); } catch { /* best effort */ }
+  return secret;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -237,27 +268,27 @@ async function apiPost(url, body, token) {
 }
 
 export async function relayRegister(hubUrl, token, machineId, teamName) {
-  return await apiPost(`${hubUrl}/api/register`, { token, machine_id: machineId, team: teamName });
+  return await apiPost(`${hubUrl}/api/register`, { token, machine_id: machineId, team: teamName, machine_secret: config?.machine_secret });
 }
 
 export async function relaySend(hubUrl, token, fromMachine, fromTeam, toTeam, message) {
-  return await apiPost(`${hubUrl}/api/send`, { token, from_machine: fromMachine, from_team: fromTeam, to_team: toTeam, message });
+  return await apiPost(`${hubUrl}/api/send`, { token, from_machine: fromMachine, from_team: fromTeam, to_team: toTeam, message, machine_secret: config?.machine_secret });
 }
 
 export async function relayPoll(hubUrl, token, machineId, teamName) {
-  return await apiPost(`${hubUrl}/api/poll`, { machine_id: machineId, team: teamName }, token);
+  return await apiPost(`${hubUrl}/api/poll`, { machine_id: machineId, team: teamName, machine_secret: config?.machine_secret }, token);
 }
 
 export async function relayAck(hubUrl, token, machineId, ackedIds) {
-  return await apiPost(`${hubUrl}/api/ack`, { token, machine_id: machineId, acked_ids: ackedIds });
+  return await apiPost(`${hubUrl}/api/ack`, { token, machine_id: machineId, acked_ids: ackedIds, machine_secret: config?.machine_secret });
 }
 
 export async function relayKeepalive(hubUrl, token, machineId, teamName) {
-  return await apiPost(`${hubUrl}/api/keepalive`, { token, machine_id: machineId, team: teamName });
+  return await apiPost(`${hubUrl}/api/keepalive`, { token, machine_id: machineId, team: teamName, machine_secret: config?.machine_secret });
 }
 
 export async function relayHeartbeat(hubUrl, token, machineId, teamName, agents, teamPolicies) {
-  return await apiPost(`${hubUrl}/api/heartbeat`, { token, machine_id: machineId, team: teamName, agents, team_policies: teamPolicies });
+  return await apiPost(`${hubUrl}/api/heartbeat`, { token, machine_id: machineId, team: teamName, agents, team_policies: teamPolicies, machine_secret: config?.machine_secret });
 }
 
 // ─── Remote Team/Agent Queries ──────────────────────────────────────────────
@@ -572,6 +603,7 @@ async function runPollCycle(bridgeDir, teamName) {
         console.error(`[relay] Ack failed: ${err.message}`);
       }
     }
+    persistSeenMessages(bridgeDir); // M4: flush the dedup set so it survives a restart
   } catch (err) {
     // Poll failed — hub might be down. Don't crash; remote teams age out via
     // pruneExpiredRemoteTeams() if polls keep failing. (m6: was silent + named a
@@ -589,6 +621,7 @@ export function startRelayClient(dir, teamName, relayCfg, agentName) {
   }
 
   config = relayCfg;
+  config.machine_secret = ensureMachineSecret(dir); // M3: authenticate our machine_id to the hub
   bridgeDir = dir;
   localAgentName = agentName || null;
 
@@ -596,6 +629,7 @@ export function startRelayClient(dir, teamName, relayCfg, agentName) {
 
   // Restore the persisted cross-machine map (known teams survive restarts within EXPIRE_MS).
   loadRemoteState(dir);
+  loadSeenMessages(dir); // M4: restore dedup set so a restart doesn't redeliver processed messages
 
   doRegister(bridgeDir, teamName);
   pollTimer = setInterval(() => pollCycle(bridgeDir, teamName), POLL_MS);
