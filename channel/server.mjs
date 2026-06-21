@@ -1139,7 +1139,21 @@ async function handleRegister({ name: newName }) {
  * Read all pending messages from inbox, move to done, return array of messages.
  * Called on every tool invocation so the agent sees new messages immediately.
  */
+// m8: serialize inbox file operations. pollInbox (timer) and consumeInbox (tool calls) both read,
+// move-to-done, and write the same files; interleaving caused swallowed ENOENT and rare
+// double-notify. A simple promise chain runs them one at a time.
+let inboxOp = Promise.resolve();
+function serializeInbox(fn) {
+  const p = inboxOp.then(fn, fn);
+  inboxOp = p.then(() => {}, () => {}); // keep the chain alive regardless of outcome
+  return p;
+}
+
 async function consumeInbox() {
+  return serializeInbox(_consumeInbox);
+}
+
+async function _consumeInbox() {
   if (!agentName) return []; // dormant session (no identity yet) → no inbox to consume
   const primary = inboxDir(agentName);
   await mkdir(primary, { recursive: true });
@@ -1317,6 +1331,10 @@ function formatNotification(msg) {
  * without waiting for the next tool call (piggyback).
  */
 async function pollInbox() {
+  return serializeInbox(_pollInbox);
+}
+
+async function _pollInbox() {
   if (!agentName) return; // dormant session (no identity yet) → nothing to poll
   const primary = inboxDir(agentName);
   const inboxPaths = [primary];
