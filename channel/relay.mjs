@@ -335,7 +335,9 @@ function pruneExpiredRemoteTeams() {
   const cutoff = Date.now() - REMOTE_EXPIRE_MS;
   let changed = false;
   for (const [team, data] of remoteTeams) {
-    if ((data.polled_at || 0) < cutoff) {
+    // Forget a team only when presence is stale AND no policy is known. A team whose owner is
+    // merely offline (policy known, presence stale) is retained so we still know its leader/rules.
+    if ((data.polled_at || 0) < cutoff && !data.policy) {
       remoteTeams.delete(team);
       changed = true;
     }
@@ -359,9 +361,26 @@ async function loadRemoteState(dir) {
     const obj = JSON.parse(raw);
     const cutoff = Date.now() - REMOTE_EXPIRE_MS;
     for (const [team, data] of Object.entries(obj)) {
-      if ((data.polled_at || 0) >= cutoff) remoteTeams.set(team, data);
+      // Keep if presence is still fresh OR we hold a policy (policy persists across disconnect).
+      if ((data.polled_at || 0) >= cutoff || data.policy) remoteTeams.set(team, data);
     }
   } catch { /* no prior state */ }
+
+  // Migration (tolerated for one release): fold a legacy teams-remote.json policy replica into
+  // the unified map; then — in the daemon only (module bridgeDir set → it owns writes) — persist
+  // the merge and drop the legacy file.
+  try {
+    const legacy = JSON.parse(await readFile(join(dir, "teams-remote.json"), "utf8"));
+    let folded = false;
+    for (const [team, policy] of Object.entries(legacy.teams || {})) {
+      const existing = remoteTeams.get(team) || { machine_id: policy.owner_machine || null, agents: {}, first_seen: Date.now(), polled_at: 0 };
+      if (!existing.policy) { existing.policy = policy; remoteTeams.set(team, existing); folded = true; }
+    }
+    if (bridgeDir) {
+      if (folded) saveRemoteState();
+      await rm(join(dir, "teams-remote.json"), { force: true }).catch(() => {});
+    }
+  } catch { /* no legacy file */ }
 }
 
 /**
@@ -454,17 +473,20 @@ async function runPollCycle(bridgeDir, teamName) {
       });
       changed = true;
     }
-    pruneExpiredRemoteTeams(); // self-persists if it removes anything
-    if (changed) saveRemoteState(); // m5: only write on real change, not every idle tick
-
-    // Persist replicated remote team policies (federation): teams owned by OTHER machines,
-    // cached locally so a disconnected node still knows the leader/rules of its remote teams.
-    if (result.team_policies && Object.keys(result.team_policies).length) {
-      try {
-        await writeFile(join(bridgeDir, "teams-remote.json"),
-          JSON.stringify({ teams: result.team_policies }, null, 2), "utf8");
-      } catch { /* best effort */ }
+    // Fold federated team policies INTO the same map so policy + roster live in ONE file
+    // (remote-teams.json). A policy can be known even when the owner is currently offline (no
+    // presence), so create a policy-only entry if needed; policy persists across disconnect
+    // (pruneExpiredRemoteTeams keeps any entry that still carries a policy).
+    for (const [pteam, policy] of Object.entries(result.team_policies || {})) {
+      if (pteam === team) continue;
+      const existing = remoteTeams.get(pteam) || { machine_id: policy.owner_machine || null, agents: {}, first_seen: now, polled_at: 0 };
+      existing.policy = policy;
+      remoteTeams.set(pteam, existing);
+      changed = true;
     }
+
+    pruneExpiredRemoteTeams(); // self-persists if it removes anything
+    if (changed) saveRemoteState(); // unified file (roster + policy); only write on real change
 
     // B3: Write incoming messages to BRIDGE_DIR/to-{agent_name}/inbox/
     //     so pollInbox naturally finds them.

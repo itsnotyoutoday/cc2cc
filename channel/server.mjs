@@ -1486,12 +1486,24 @@ async function saveTeamFile(t) {
 /** Refresh operatorLeaders + teamRevoked from the central teams.json registry.
  *  These are the operator/governance authority; the GAB policy governs. */
 async function loadTeamsReplica() {
-  // teams-remote.json = teams owned by OTHER machines, replicated via the relay (federation).
-  // Cached locally so a disconnected node still knows the leader/rules of its remote teams.
+  // Teams owned by OTHER machines, replicated via the relay (federation). Now unified into
+  // remote-teams.json: each team entry carries { ..., policy }. Cached locally so a disconnected
+  // node still knows the leader/rules of its remote teams.
+  const out = {};
   try {
-    const o = JSON.parse(await readFile(join(BRIDGE_DIR, "teams-remote.json"), "utf8"));
-    return (o && o.teams) || {};
-  } catch { return {}; }
+    const o = JSON.parse(await readFile(join(BRIDGE_DIR, "remote-teams.json"), "utf8"));
+    for (const [team, data] of Object.entries(o || {})) {
+      if (data && data.policy) out[team] = data.policy;
+    }
+  } catch { /* no unified state yet */ }
+  // Legacy fallback (one release): the old standalone teams-remote.json policy replica.
+  try {
+    const legacy = JSON.parse(await readFile(join(BRIDGE_DIR, "teams-remote.json"), "utf8"));
+    for (const [team, pol] of Object.entries(legacy.teams || {})) {
+      if (!out[team]) out[team] = pol;
+    }
+  } catch { /* no legacy file */ }
+  return out;
 }
 
 async function loadTeamPolicies() {
