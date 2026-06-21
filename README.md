@@ -314,7 +314,7 @@ cc2cc/
 │   └── inbox_watcher.py        # Optional: watchdog-based real-time delivery
 ├── services/                   # OS service templates (macOS launchd / Linux systemd / Windows)
 ├── tests/                      # pytest (python) + node test_*.mjs (channel/daemon/relay/teams)
-├── docs/                       # ARCHITECTURE.md, SPECIFICATION.md, CONFIGURATION.md
+├── docs/                       # SPECIFICATION.md (the full spec), Demo.md, rise.md
 ├── LICENSE
 └── README.md                   # ← you are here
 ```
@@ -330,8 +330,8 @@ cc2cc/
 Core messaging — the same-machine bridge, the per-host daemon, and the relay client — runs on all
 three (Node.js + Python). What's **Linux-only today** is the unified installer wiring the daemon and
 relay hub up as *system services*; on macOS/Windows the daemon still auto-spawns per session, and
-for an always-on service use the templates under `services/` or your own supervisor. *(Known gap —
-see issues.)*
+for an always-on service use the templates under `services/` or your own supervisor. *(Installer
+launchd/Task Scheduler support is not yet implemented.)*
 
 ## Limitations
 
@@ -361,9 +361,10 @@ Additional mitigations:
 
 ## Documentation
 
-- **[Architecture](docs/ARCHITECTURE.md)** — components, daemon model, teams, relay, message lifecycle
-- **[Protocol Specification](docs/SPECIFICATION.md)** — message schema, agent cards, heartbeats, lifecycle
-- **[Configuration Guide](docs/CONFIGURATION.md)** — environment variables (`CC2CC_BRIDGE_DIR`, `CC2CC_TEAM`, `CC2CC_IDENTITY`, `CC2CC_ENCRYPT`), scaling to N agents
+- **[Specification](docs/SPECIFICATION.md)** — the complete current spec: components, bridge layout,
+  message/identity/team schemas, the 15 MCP tools, teams & routing, the relay protocol, encryption,
+  configuration, and the daemon lifecycle.
+- **[Demo scenarios](docs/Demo.md)** — multi-agent debate walkthroughs.
 
 ## Prior Art
 
