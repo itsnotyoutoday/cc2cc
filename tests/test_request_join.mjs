@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SDK = "/home/cc2ccroomstest/cc2cc/cc2cc/channel/node_modules/@modelcontextprotocol/sdk/dist/esm/client";
+const SDK = join(dirname(fileURLToPath(import.meta.url)), "..", "channel", "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm", "client");
 const { Client } = await import(`${SDK}/index.js`);
 const { StdioClientTransport } = await import(`${SDK}/stdio.js`);
 const SERVER = join(dirname(fileURLToPath(import.meta.url)), "..", "channel", "server.mjs");
