@@ -1,20 +1,42 @@
-# CC2CC — Full Architecture & Specification
+# CC2CC — Full Architecture & Design
 
-> Version: 2.0.0 | Protocol: v1.1 | Date: 2026-03-27
+> Version: 3.x (teams + relay) | Date: 2026-06-21
 
 ## 1. Overview
 
-**CC2CC (Claude Code to Claude Code)** — file-based agent-to-agent communication system for multiple Claude Code instances on one machine. Messages are plain JSON files in shared directories; delivery is via MCP channel push or polling.
+**CC2CC (Claude Code to Claude Code)** — agent-to-agent communication between multiple Claude
+Code instances. It works **same-machine** via a shared file bridge and **cross-machine** via an
+encrypted HTTP relay. Agents are organized into **teams**. Messages are JSON files in shared
+mailbox directories; cross-machine delivery is a zero-knowledge ciphertext queue.
 
-**Core idea:** Agent A writes a JSON file into a shared mailbox directory. Agent B's MCP server detects the file, reads it, and pushes content into B's Claude Code session as a channel notification. B replies via MCP tool, which writes a response back into A's mailbox.
+**Core idea:** Agent A writes a JSON file into a recipient mailbox (`to-<B>/inbox/`). A per-host
+**daemon** watching the bridge wakes B's **MCP server**, which pushes the content into B's Claude
+Code session as a channel notification. B replies via an MCP tool, which writes a response back
+into A's mailbox. For cross-machine peers the daemon encrypts the message and forwards it through
+a relay **hub** to the remote host's daemon.
 
 ### Key properties
-- **Transport:** Filesystem (no HTTP, no network)
-- **Same-machine only:** Both agents must see the bridge directory
-- **Offline delivery:** Messages wait in inbox until recipient starts a session
-- **Atomic writes:** temp file + rename (no partial reads)
-- **HMAC-SHA256 signing:** Optional integrity verification
-- **Cross-platform:** macOS, Linux, Windows
+- **Two transports:** local filesystem bridge **and** cross-machine HTTP relay (this is no longer
+  same-machine-only).
+- **Offline delivery:** messages wait in the inbox until the recipient starts a session; relay
+  messages are held on the hub up to 5 days.
+- **Atomic writes:** temp file + rename (no partial reads).
+- **HMAC-SHA256 signing** for local messages; **AES-256-GCM end-to-end encryption** for relay
+  traffic (fail-closed; the hub is zero-knowledge).
+- **Teams & derived roles:** agents are scoped to teams; leadership is derived from `teams.json`.
+- **Cross-platform:** macOS, Linux, Windows.
+
+### Three-process model
+
+| Process | Lifetime | Role |
+|---------|----------|------|
+| `channel/server.mjs` (**MCP server**) | one per Claude Code session | exposes the agent tools; owns the agent's identity, inbox consume, and heartbeat. Does **not** talk to the hub directly. |
+| `channel/daemon.mjs` (**daemon**) | one per host (per bridge) | owns the single relay-hub connection, the bridge file-watcher, and wake-push to MCP servers. Auto-spawned on demand; socket at `<bridge>/daemon.sock`. |
+| `relay_hub.py` (**relay hub**) | one per relay deployment | HTTP store-and-forward queue between machines. In-memory; zero-knowledge (ciphertext only). |
+
+In daemon mode the MCP server does no hub I/O or file-watching itself — it connects to the daemon
+over a local socket and reacts to `{wake}` pushes. Multiple sessions on one host therefore never
+contend for the relay connection.
 
 ---
 
@@ -22,99 +44,99 @@
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| Python package | `cc2cc/` (Python 3.8+) | Core lib: atomic writes, signing, CLI |
-| MCP Server | `channel/server.mjs` (Node.js 18+) | Polls inbox, pushes to Claude Code session |
-| Scripts | `scripts/*.py` | Send, receive, reply, task, status, validate, cleanup |
-| Hooks | `hooks/*.py` | Claude Code lifecycle integration (SessionStart/End) |
+| Python package | `cc2cc/` (Python 3.8+) | Core lib: atomic writes, signing, CLIs (`cc2cc`, `cc2cc-admin`) |
+| MCP Server | `channel/server.mjs` (Node.js 18+) | Per-session tool host; consumes inbox, pushes to Claude Code |
+| Daemon | `channel/daemon.mjs` (Node.js 18+) | Per-host file-watcher + relay client + wake-push |
+| Relay client | `channel/relay.mjs` | Hub HTTP client + AES-256-GCM encrypt/decrypt |
+| Relay hub | `relay_hub.py` (FastAPI) | Cross-machine ciphertext queue |
+| Scripts | `scripts/*.py` | send, receive, reply, task, status, validate, cleanup, init |
+| Hooks | `hooks/*.py` | Claude Code lifecycle integration (SessionStart/End, inbox watcher) |
 | Services | `services/` | OS-level daemon templates (launchd, systemd, Task Scheduler) |
 | Tests | `tests/` (pytest) | Unit + integration + smoke tests |
-| CI | GitHub Actions | Matrix: {ubuntu, macos, windows} × {Python 3.9, 3.12} |
-| Package | `pyproject.toml` | pip-installable, entry point `cc2cc` CLI |
+| Package | `pyproject.toml` | pip-installable, entry points `cc2cc` + `cc2cc-admin` |
 
 ---
 
-## 3. Directory Layout (Bridge Runtime)
+## 3. Directory Layout
 
-After `cc2cc init alpha beta ~/.cc2cc`:
+### Bridge Runtime
 
 ```
-~/.cc2cc/                              # Bridge root ($CC2CC_BRIDGE_DIR)
-├── secret.key                         # HMAC-SHA256 shared secret (32 bytes hex)
-├── alpha-to-beta/
-│   ├── inbox/                         # Pending messages: alpha → beta
-│   │   └── msg-<uuid>.json
-│   ├── done/                          # Processed messages (archive)
-│   │   └── msg-<uuid>.json
-│   └── receipts/                      # Delivery receipts from MCP server
-│       └── msg-<uuid>.receipt.json
-├── beta-to-alpha/
-│   ├── inbox/                         # Pending messages: beta → alpha
-│   ├── done/
-│   └── receipts/
+$CC2CC_BRIDGE_DIR/                  # default ~/.cc2cc
+├── secret.key                      # shared secret: HMAC (Python) + AES-256-GCM key source (Node)
+├── machine.secret                  # per-machine relay auth secret (0600, trust-on-first-use)
+├── to-<name>/
+│   ├── inbox/    msg-<uuid>.json    # pending messages for <name>
+│   ├── done/                        # processed / archived messages
+│   └── receipts/ <msg_id>.receipt.json
 ├── status/
-│   ├── alpha-heartbeat.json           # Agent Alpha heartbeat
-│   └── beta-heartbeat.json            # Agent Beta heartbeat
-├── alpha-channel/
-│   ├── server.mjs                     # MCP server copy for Alpha
-│   ├── package.json
-│   └── node_modules/                  # npm dependencies
-├── beta-channel/
-│   ├── server.mjs                     # MCP server copy for Beta
-│   ├── package.json
-│   └── node_modules/
-├── hooks/                             # Copied hook scripts
-│   ├── session_start.py
-│   ├── session_end.py
-│   └── inbox_watcher.py
-└── scripts/                           # Copied operational scripts
-    ├── send.py, receive.py, reply.py, task.py
-    ├── status.py, validate.py, cleanup.py
+│   ├── <name>-heartbeat.json        # per-agent presence + rich status
+│   └── daemon.json                  # daemon liveness stamp (pid, socket, team, relay)
+├── identities/identity-<name>.json  # per-name persistent identity
+├── identity.json                    # legacy single-identity fallback
+├── teams.json                       # team registry
+├── remote-teams.json                # daemon-maintained cross-machine roster + federated policy
+├── outbox/<msg_id>.json             # cross-machine messages awaiting relay
+├── tombstones/<team>__<member>.json # revoke records
+├── policy.json                      # bridge-level federation policy overrides
+├── rules.json                       # notification instruction rules
+├── connections.json                # canonical relay config (legacy flat relay.json also read)
+├── seen-messages.json               # relay dedup set
+└── daemon.sock                      # daemon IPC socket (unix/mac; named pipe on Windows)
 ```
+
+**Bridge location by scope / OS:**
+
+| Scope | Linux | macOS | Windows |
+|-------|-------|-------|---------|
+| user | `~/.cc2cc` | `~/.cc2cc` | `%USERPROFILE%\.cc2cc` |
+| system-wide | `/var/lib/cc2cc` | `/Library/Application Support/cc2cc` | `C:\ProgramData\cc2cc` |
+
+> The mailbox layout is `to-<name>/{inbox,done,receipts}`. The legacy `<a>-to-<b>/` mailbox form
+> and per-agent `*-channel/` directories are obsolete — they are read for back-compat but never
+> written.
 
 ### Repository Layout (Source)
 
 ```
-cc2cc/                                 # Git repo root
-├── cc2cc/                             # Python package
-│   ├── __init__.py                    # __version__ = "2.0.0"
-│   ├── core.py                        # atomic_write(), bridge_path(), MAX_MESSAGE_SIZE
-│   ├── signing.py                     # HMAC: generate_secret(), sign_message(), verify_message()
-│   └── cli.py                         # Unified CLI: cc2cc <command>
+cc2cc-teams/                          # Git repo root
+├── cc2cc/                            # Python package
+│   ├── __init__.py                   # __version__
+│   ├── core.py                       # atomic_write(), bridge_path(), MAX_MESSAGE_SIZE
+│   ├── signing.py                    # HMAC: generate_secret(), sign_message(), verify_message()
+│   ├── cli.py                        # `cc2cc` CLI (init/send/receive/reply/task/status/...)
+│   └── admin.py                      # `cc2cc-admin` CLI (members, teams, gab, policy)
 ├── channel/
-│   ├── server.mjs                     # MCP channel server (Node.js)
-│   └── package.json                   # @modelcontextprotocol/sdk ^1.12.0
+│   ├── server.mjs                    # MCP server (per session)
+│   ├── daemon.mjs                    # per-host daemon (file-watcher + relay client + wake-push)
+│   ├── daemon-client.mjs             # MCP↔daemon socket client
+│   ├── relay.mjs                     # hub HTTP client + AES-256-GCM
+│   ├── names.mjs                     # name generation
+│   ├── templates.mjs                 # channel/instruction templates
+│   ├── rules.default.json            # default notification rules
+│   └── package.json                  # @modelcontextprotocol/sdk
+├── relay_hub.py                      # FastAPI relay hub
+├── starthub.sh                       # relay hub launcher
 ├── scripts/
-│   ├── init.py                        # Bootstrap bridge
-│   ├── send.py                        # Send message
-│   ├── receive.py                     # Read pending messages
-│   ├── reply.py                       # Reply (auto-completes tasks)
-│   ├── task.py                        # Delegate task
-│   ├── status.py                      # Show bridge status
-│   ├── validate.py                    # Validate message JSON files
-│   └── cleanup.py                     # TTL-based cleanup
+│   ├── init.py, send.py, receive.py, reply.py, task.py
+│   ├── status.py, validate.py, cleanup.py, send_to_room.py
+│   ├── cc2cc-install.sh, cc2cc-launch.sh, setup.sh   # install / launch helpers
+│   └── default-policy.json
 ├── hooks/
-│   ├── session_start.py               # SessionStart hook
-│   ├── session_end.py                 # SessionEnd hook
-│   └── inbox_watcher.py              # Background watcher (watchdog or polling)
+│   ├── session_start.py, session_end.py, inbox_watcher.py
 ├── services/
 │   ├── macos/com.cc2cc.inbox-watcher.plist
 │   ├── linux/cc2cc-watcher.service
 │   └── windows/cc2cc-watcher.xml
-├── tests/
-│   ├── test_core.py                   # Unit tests for core module
-│   ├── test_signing.py                # Unit tests for signing module
-│   ├── test_unit.py                   # Extended unit tests + schema validation
-│   └── test_smoke.py                  # Integration tests (subprocess-based)
-├── conftest.py                        # pytest PYTHONPATH setup
-├── pyproject.toml                     # Package config
-├── .github/workflows/ci.yml           # CI pipeline
+├── tests/                            # pytest suite
+├── conftest.py
+├── pyproject.toml
+├── connections.example.json
 ├── docs/
-│   ├── SPECIFICATION.md               # Protocol spec
-│   ├── CONFIGURATION.md               # Config guide
-│   └── ARCHITECTURE.md                # ← This file
-├── README.md
-├── CONTRIBUTING.md
-└── LICENSE                            # MIT
+│   ├── SPECIFICATION.md              # Protocol / schema spec
+│   ├── CONFIGURATION.md              # Config + setup guide
+│   └── ARCHITECTURE.md               # ← This file
+├── README.md, CONTRIBUTING.md, LICENSE
 ```
 
 ---
@@ -128,509 +150,319 @@ MAX_MESSAGE_SIZE = 1_000_000  # 1 MB hard limit
 ```
 
 **`bridge_path() -> Path`**
-- Reads `CC2CC_BRIDGE_DIR` env var, defaults to `~/.cc2cc`
-- Expands `~` to home directory
+- Reads `CC2CC_BRIDGE_DIR` env var, defaults to `~/.cc2cc`; expands `~`.
 
 **`atomic_write(target: Path, data: dict) -> None`**
-- Serializes `data` to JSON (indent=2, ensure_ascii=False)
-- Validates size ≤ `MAX_MESSAGE_SIZE` (raises `ValueError` if exceeded)
-- Creates parent directories if needed
-- Writes to temp file (same directory), then `os.replace()` for atomic rename
-- On any error: deletes temp file, re-raises exception
-- Guarantees: no partial files ever written
+- Serializes `data` to JSON (indent=2, ensure_ascii=False).
+- Validates size ≤ `MAX_MESSAGE_SIZE` (raises `ValueError` if exceeded).
+- Creates parent directories if needed.
+- Writes to a temp file (same directory), then `os.replace()` for an atomic rename.
+- On any error: deletes the temp file and re-raises. Guarantees: no partial files ever written.
 
 ### 4.2 `signing.py` — HMAC-SHA256
 
-**`generate_secret() -> str`**
-- 32 random bytes → 64-char hex string
+**`generate_secret() -> str`** — 32 random bytes → 64-char hex string.
 
-**`sign_message(msg: dict, secret: str) -> dict`**
-- Returns a **new** dict (does not mutate original)
-- Canonical form: all fields except `hmac`, sorted JSON, UTF-8 encoded
-- HMAC-SHA256 with secret decoded from hex
-- Adds `hmac` field to the new dict
+**`sign_message(msg, secret) -> dict`** — returns a **new** dict; canonical form is all fields
+except `hmac`, sorted JSON, UTF-8 encoded; HMAC-SHA256 with the secret decoded from hex; adds the
+`hmac` field.
 
-**`verify_message(msg: dict, secret: str) -> bool`**
-- Returns `False` if `hmac` field missing
-- Recomputes HMAC over canonical form, uses `hmac.compare_digest()` (timing-safe)
-- Detects: tampered content, extra injected fields, wrong secret
+**`verify_message(msg, secret) -> bool`** — `False` if `hmac` missing; recomputes the HMAC over the
+canonical form and compares with `hmac.compare_digest()` (timing-safe). Detects tampered content,
+extra injected fields, and wrong secret.
 
-### 4.3 `cli.py` — Unified CLI
+> `secret.key` does double duty: the Python side uses it directly as the HMAC key, and the Node
+> side derives the AES-256-GCM relay key from it via `scrypt`.
 
-Entry point: `cc2cc` (via `pyproject.toml` `[project.scripts]`).
+### 4.3 CLIs — `cc2cc` and `cc2cc-admin`
 
-Subcommands:
-| Command | Delegates to | Description |
-|---------|-------------|-------------|
-| `cc2cc init <a> <b> [dir]` | `scripts/init.py` | Bootstrap bridge |
-| `cc2cc send <from> <to> <type> <text>` | `scripts/send.py` | Send message |
-| `cc2cc task <from> <to> <title> <desc>` | `scripts/task.py` | Delegate task |
-| `cc2cc reply <msg-id> <text>` | `scripts/reply.py` | Reply to message |
-| `cc2cc receive <agent> [--peek]` | `scripts/receive.py` | Read inbox |
-| `cc2cc status` | `scripts/status.py` | Bridge status |
-| `cc2cc validate [--fix]` | `scripts/validate.py` | Validate messages |
-| `cc2cc cleanup [--max-age-hours N] [--dry-run]` | `scripts/cleanup.py` | TTL cleanup |
+Two entry points (via `pyproject.toml` `[project.scripts]`):
 
-Implementation: rewrites `sys.argv` and calls each script's `main()` function directly (in-process). `validate` and `cleanup` use `subprocess.run()` instead.
+- **`cc2cc`** (`cli.py`) — operational commands: `init`, `send`, `receive`, `reply`, `task`,
+  `status`, `validate`, `cleanup`.
+- **`cc2cc-admin`** (`admin.py`, note the hyphen) — provisioning / administration:
+  - `member add|list|remove|revoke` — local member identities (this machine's authority).
+  - `team create|list|show|set|leader|succession|admit` — teams this machine owns.
+  - `gab` (alias `directory`) — show the federated Global Address Book (local members, owned
+    teams, remote replica).
+  - `policy show` — show effective federation policy (defaults + `policy.json`).
 
 ---
 
-## 5. Message Protocol (v1.1)
+## 5. Message Protocol (summary)
 
-### 5.1 Message Schema
+> Full schemas live in `SPECIFICATION.md`. Highlights:
 
-Every message is a single file: `msg-<uuid>.json`.
-
-```json
-{
-  "id":        "msg-<uuid>",                    // Required. Unique ID
-  "timestamp": "2026-03-27T10:30:00Z",          // Required. ISO 8601 UTC
-  "from":      "alpha",                          // Required. Sender agent ID
-  "to":        "beta",                           // Required. Recipient agent ID
-  "type":      "message",                        // Required. message|task|response|status
-  "content":   { "text": "...", "parts": [] },   // Required. text + structured parts
-  "priority":  "normal",                         // Optional. low|normal|high|critical
-  "identity":  { "agent": "alpha", "mode": "session" }, // Optional
-  "task":      null,                             // Optional. Required if type=task
-  "replyTo":   null,                             // Optional. Parent msg ID for threading
-  "ttl":       3600,                             // Optional. Seconds until expiry
-  "hmac":      "..."                             // Optional. HMAC-SHA256 signature
-}
-```
-
-### 5.2 Required Fields
-
-| Field | Type | Validation |
-|-------|------|------------|
-| `id` | string | Must start with `msg-` |
-| `timestamp` | string | ISO 8601, ends with `Z` (UTC) |
-| `from` | string | Sender agent ID |
-| `to` | string | Recipient agent ID |
-| `type` | enum | `message` / `task` / `response` / `status` |
-| `content` | object | Must contain `text` (string) and `parts` (array) |
-
-### 5.3 Task Object
-
-Required when `type == "task"`:
-
-```json
-{
-  "id":          "task-<uuid>",
-  "title":       "Run test suite",
-  "description": "Execute all integration tests",
-  "status":      "submitted",     // submitted → in-progress → completed|failed
-  "result":      null             // Filled on completion
-}
-```
-
-### 5.4 Heartbeat Schema
-
-File: `status/{agent}-heartbeat.json`. Overwritten (not appended).
-
-```json
-{
-  "agent":      "alpha",
-  "timestamp":  "2026-03-27T10:30:00Z",
-  "session_id": "12345",           // PID or "none"
-  "status":     "active",          // active | offline
-  "context":    "session started"  // Human-readable
-}
-```
-
-Agent considered stale if heartbeat > **15 seconds** old (server writes every 5s).
-
-### 5.5 Receipt Schema
-
-File: `{sender}-to-{recipient}/receipts/{msg-id}.receipt.json`.
-
-```json
-{
-  "msg_id":       "msg-<uuid>",
-  "delivered_at": "2026-03-27T10:30:00.000Z",
-  "delivered_to": "beta"
-}
-```
-
-Written by MCP server after successful push to Claude Code session.
+- Every message is a single file `msg-<uuid>.json` written to `to-<recipient>/inbox/`.
+- Required: `id`, `timestamp` (ISO 8601 UTC), `from`, `to`, `type`, `content {text, parts}`.
+- `type` ∈ `message | task | response | status | interteam`.
+- `type:"task"` carries a `task` object (`id`, `title`, `description`, `status`, `result`).
+- `type:"interteam"` (cross-team / relay) adds `from_team`, `to_team`, `intent`; `to` is the
+  destination team's leader.
+- Heartbeats (`status/<name>-heartbeat.json`) carry presence + `status_text` + `teams[]`; an agent
+  is offline after **15 s** without a fresh heartbeat.
+- Receipts (`to-<recipient>/receipts/<msg_id>.receipt.json`) confirm MCP delivery.
 
 ---
 
 ## 6. Scripts (`scripts/`)
 
 ### 6.1 `init.py` — Bridge Bootstrap
-
-**Input:** `<agent-a> <agent-b> [bridge-dir]`
-
-**Actions:**
-1. Creates mailbox directories for both directions: `{a}-to-{b}/{inbox,done}` and reverse
-2. Creates `status/` directory
-3. Generates HMAC secret → `secret.key` (skips if already exists)
-4. For each agent: copies `server.mjs`, creates `package.json`, runs `npm install`
-5. Copies hooks and scripts into bridge directory
+Creates the bridge skeleton (`to-<name>/{inbox,done,receipts}`, `status/`, identity/team files) and
+generates `secret.key` if absent. (The modern, end-to-end setup path is `scripts/cc2cc-install.sh`;
+see CONFIGURATION.md.)
 
 ### 6.2 `send.py` — Send Message
-
-**Input:** `<from> <to> <type> <content> [priority] [mode]`
-
-**Actions:**
-1. Builds message object with UUID, timestamp, fields from args
-2. Loads `secret.key` → signs message with HMAC (if secret exists)
-3. Atomic-writes to `{from}-to-{to}/inbox/msg-<uuid>.json`
+Builds a message (UUID, timestamp, fields from args), signs it with HMAC if `secret.key` exists,
+and atomic-writes to `to-<to>/inbox/msg-<uuid>.json`.
 
 ### 6.3 `receive.py` — Read Inbox
-
-**Input:** `<agent> [--peek]`
-
-**Actions:**
-1. Scans all `*-to-{agent}/inbox/*.json` directories
-2. For each message: parses JSON, verifies HMAC signature, prints summary
-3. Without `--peek`: moves file to `done/` (consume mode)
-4. With `--peek`: leaves file in inbox (read-only)
+Scans `to-<agent>/inbox/*.json`; parses JSON, verifies HMAC, prints a summary; without `--peek`
+moves the file to `done/` (consume), with `--peek` leaves it.
 
 ### 6.4 `reply.py` — Reply to Message
-
-**Input:** `<msg-id> <text> [from] [mode]`
-
-**Actions:**
-1. Searches all `*/inbox/` and `*/done/` for original message by ID
-2. Auto-detects `from` and `to` from original message
-3. If original was a task: sets `task.status = "completed"`, `task.result = reply_text`
-4. Signs and atomic-writes response to `{sender}-to-{recipient}/inbox/`
+Finds the original message by ID across inbox/done, auto-detects `from`/`to`, completes the task if
+the original was a task (`status:"completed"`, `result=text`), signs, and atomic-writes the
+response to the sender's `to-<sender>/inbox/`.
 
 ### 6.5 `task.py` — Delegate Task
-
-**Input:** `<from> <to> <title> <description> [priority] [mode]`
-
-**Actions:**
-1. Creates message with `type: "task"` and task object (`status: "submitted"`)
-2. Sets `content.text = "Task: {title} — {description}"`
-3. Signs and atomic-writes to inbox
+Creates a `type:"task"` message with a task object (`status:"submitted"`), signs, and writes to the
+recipient inbox.
 
 ### 6.6 `status.py` — Bridge Status
-
-**Input:** (none)
-
-**Output:**
-- Heartbeats: `●` (active <10min) / `○` (stale) for each agent, with age
-- Mailboxes: pending count + processed count for each direction
+Shows heartbeats (active/stale + age) and mailbox counts per recipient.
 
 ### 6.7 `validate.py` — Message Validation
-
-**Input:** `[--fix]`
-
-**Checks:**
-- JSON parseable
-- Size ≤ 1MB
-- Required fields present: `{id, timestamp, from, to, type, content}`
-- `type` ∈ `{message, task, response, status}`
-- `priority` ∈ `{low, normal, high, critical}` (if present)
-- `content` has `text` field
-- Task messages have `task` object with `{id, title, status}`
-- HMAC signature valid (if secret exists and message is signed)
-- `--fix`: removes invalid files
+Checks JSON parseable, size ≤ 1 MB, required fields, valid `type`/`priority`, `content.text`
+present, task structure, and HMAC validity (when signed). `--fix` removes invalid files.
 
 ### 6.8 `cleanup.py` — TTL-Based Cleanup
-
-**Input:** `[--max-age-hours N] [--dry-run]`
-
-**Actions:**
-1. `done/` directories: removes files older than `max_age_hours` (default: 24h)
-2. `inbox/` directories: moves files past their `ttl` field to `done/`
-3. Removes malformed JSON files unconditionally
-4. `--dry-run`: counts but doesn't delete
+`done/` files older than the retention window → deleted; `inbox/` files past their `ttl` → archived;
+malformed JSON removed. `--dry-run` counts only.
 
 ---
 
 ## 7. MCP Channel Server (`channel/server.mjs`)
 
 ### Technology
-- Node.js ES module
-- `@modelcontextprotocol/sdk ^1.12.0`
-- Communicates with Claude Code via stdio (StdioServerTransport)
+- Node.js ES module; `@modelcontextprotocol/sdk`; stdio transport (StdioServerTransport).
 
-### Configuration (Environment Variables)
+### Identity & joining
+- One MCP server per Claude Code session. It joins the mesh only after the MCP `initialized`
+  handshake **and** a resolved identity (`CC2CC_IDENTITY`/`SELF`); otherwise it stays dormant until
+  `register()` is called.
+- Identity is persisted in `identities/identity-<name>.json`; teams are seeded from `CC2CC_TEAM`
+  (else `["cc2cc"]`) on first creation, with an existing identity file winning over the env var.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BRIDGE_DIR` | `~/.cc2cc` | Bridge root |
-| `SELF` | `alpha` | This agent's ID |
-| `PEER` | `beta` | Primary peer agent's ID |
+### Capabilities & tools
+- `experimental: {"claude/channel": {}}` — channel push notifications.
+- Exposes the **15 tools** documented in SPECIFICATION.md (`whoami`, `list_agents`, `list_teams`,
+  `send`, `broadcast`, `send_team`, `reply`, `check_inbox`, `set_status`, `register`, `create_team`,
+  `request_join`, `admit`, `evict`, `register_relay`).
 
-### Behavior
+### Delivery & inbox consume
+- In daemon mode the MCP does **not** poll the filesystem; it connects to the daemon
+  (`connectToDaemon`), announces `{hello, agent}`, and reacts to `{wake}` pushes, reconnecting with
+  jittered backoff if the daemon restarts.
+- Inbox consumption piggybacks on every tool call (and on wake): the server reads
+  `to-<self>/inbox/`, pushes each message as a `notifications/claude/channel`, writes a receipt to
+  `to-<self>/receipts/`, and moves the file to `done/`.
+- Roles are recomputed from `teams.json` on every poll (race-free), so leadership/membership are
+  always current.
 
-**Server Identity:**
-- Name: `peer_channel`, version `2.0.0`
-- Instructions sent to Claude Code: how to handle channel tags and reply tool
-
-**Capabilities:**
-- `experimental: {"claude/channel": {}}` — channel push notifications
-- `tools: {}` — exposes reply tool
-
-**Polling Loop (every 3 seconds):**
-1. Reads `{PEER}-to-{SELF}/inbox/` directory
-2. For each new `.json` file (tracked by `seenFiles` Set):
-   - Parses JSON
-   - Sends `notifications/claude/channel` with content and metadata (`msg_id`, `priority`, `type`, `from`)
-   - Writes delivery receipt to `{PEER}-to-{SELF}/receipts/`
-   - Moves file from `inbox/` to `done/`
-3. Clears `seenFiles` when size > 500 (memory leak prevention)
-
-**Reply Tool:**
-- Name: `reply`
-- Input: `{ msg_id: string, text: string, type?: string, priority?: string }`
-- Lookup: searches agent's **inbox first**, then **done/** (fixes race where channel push arrives before consumeInbox moves the file)
-- Action: builds response message, atomic-writes to `{SELF}-to-{PEER}/inbox/`
-- Returns: `"Sent {id} to {PEER}"` or error
-
-**Self-Wake (init step 11):**
-- Two-stage mechanism to activate the LLM without user input
-- **Fast path (500ms):** direct `server.notification()` channel push
-- **Fallback (3000ms):** writes system message to own inbox (skipped if agent already active)
-- Result: agent boots ~1s after session start, autonomously calls `check_inbox` / `whoami`
-
-**Silent Agent Status:**
-- Agent online/offline events are **not** pushed to chat
-- Presence is reflected only in the statusline (reads heartbeat files from disk)
-
-**Orphan Cleanup (parent_pid-based):**
-- On startup, `cleanupStaleMailboxes()` scans all heartbeat files
-- Heartbeats sharing the same `parent_pid` as the current process are orphans from MCP reconnects (same Claude Code session spawned a new server)
-- Orphan heartbeats and their mailbox directories are removed even if not yet stale by time
-- Also cleans up stale heartbeats (>15s old) and orphan mailbox dirs with no heartbeat
-
-**Cross-Platform (Windows):**
-- `retryRename()` wrapper handles EPERM/EACCES from antivirus file locking (5 retries, 50ms backoff)
-- `process.on("exit")` writes offline heartbeat synchronously when SIGTERM is not emitted
-- `os.homedir()` fallback when HOME/USERPROFILE are both undefined
-
-**Logging:**
-- Structured JSON to stderr (stdout is MCP transport)
-- Fields: `ts`, `level`, `server`, `msg`, plus contextual data
+### Self-wake, presence, robustness
+- **Self-wake:** a fast channel push plus a fallback self-inbox system message boot the agent ~1 s
+  after session start so it autonomously checks its inbox.
+- **Silent presence:** online/offline events are reflected in the statusline (from heartbeat files),
+  not pushed to chat.
+- **Orphan cleanup:** stale/`parent_pid`-orphaned heartbeats and their mailbox dirs are removed on
+  startup.
+- **Cross-platform (Windows):** retry-on-EPERM rename wrapper; synchronous offline heartbeat on
+  exit; `os.homedir()` fallback.
+- **Logging:** structured JSON to stderr (stdout is the MCP transport).
 
 ---
 
-## 8. Hooks (`hooks/`)
+## 8. Daemon (`channel/daemon.mjs`)
 
-### 8.1 `session_start.py` — SessionStart Hook
-
-**Trigger:** Claude Code session begins.
-
-**Actions:**
-1. Drains stdin (hook protocol requirement)
-2. Reads `CC2CC_SELF` env (fallback: hostname)
-3. Writes heartbeat: `status/{self}-heartbeat.json` with `status: "active"`
-4. Scans all `*-to-{self}/inbox/*.json` for pending messages
-5. Prints summary: count + preview of each pending message (type, from, first 80 chars)
-
-### 8.2 `session_end.py` — SessionEnd Hook
-
-**Trigger:** Claude Code session ends.
-
-**Actions:**
-1. Drains stdin
-2. Writes heartbeat with `status: "offline"`, `session_id: "none"`
-
-### 8.3 `inbox_watcher.py` — Background Watcher
-
-**Purpose:** Desktop notifications when messages arrive.
-
-**Modes:**
-1. **Watchdog mode** (if `watchdog` package installed): filesystem event-driven, near-instant
-2. **Polling mode** (fallback): checks every 3 seconds
-
-**Features:**
-- Cross-platform notifications: `osascript` (macOS), `notify-send` (Linux), `plyer` (Windows)
-- Lock file in temp directory prevents duplicate notifications (5-minute stale timeout)
-- Debounce: 0.3s delay in watchdog mode
+- **Single instance per bridge**, enforced by binding `<bridge>/daemon.sock` (named pipe on
+  Windows). Spawned on demand by the MCP via `ensureDaemon` (detached, `stdio:"ignore"`).
+- **Sole mailbox file-watcher** (regex `to-<agent>/inbox/<x>.json`): on a new file it pushes a
+  `{wake}` to the relevant MCP over the socket.
+- **Sole hub client:** owns the relay-hub connection so sessions never contend. Loop: register
+  (every 15 s) · poll (every 3 s) · keepalive + heartbeat (every 5 s) · outbox drain.
+- **Relay boundary:** it forwards already-encrypted ciphertext unchanged; encryption/decryption
+  happens via `relay.mjs`. `relayActive = daemonMode && relayConfigured`.
+- Writes `status/daemon.json` (pid, socket, team, relay) as a liveness stamp; can be restarted
+  independently of any Claude session (MCPs simply reconnect).
 
 ---
 
-## 9. Message Lifecycle
+## 9. Relay Hub (`relay_hub.py`)
 
-### 9.1 Send → Deliver → Reply
+- FastAPI, in-memory store-and-forward queue; **zero-knowledge** (sees only ciphertext).
+- Endpoints: `POST /api/register|send|poll|ack|keepalive|heartbeat`, `GET /health`
+  (full request/response contract in SPECIFICATION.md §10).
+- Registration TTL **30 s**; lease TTL **30 s**; queue cap **1000/team**; undelivered messages held
+  **5 days**. Routing key `"{machine_id}:{team}"`.
+- **Auth:** a shared `token` authorizes the API; a per-machine `machine_secret` binds a `machine_id`
+  on first use (trust-on-first-use) and is required thereafter. The hub **refuses to start without a
+  token** (`CC2CC_RELAY_TOKEN` or `--token`). Launch via `starthub.sh`.
 
+---
+
+## 10. Hooks (`hooks/`)
+
+### `session_start.py`
+On session start: drains stdin, resolves the agent name, writes an `active` heartbeat
+(`status/<self>-heartbeat.json`), scans `to-<self>/inbox/*.json`, and prints a summary of pending
+messages.
+
+### `session_end.py`
+Writes an `offline` heartbeat (`session_id:"none"`).
+
+### `inbox_watcher.py`
+Optional desktop notifications on new messages. Watchdog mode (event-driven) if `watchdog` is
+installed, else 3 s polling. Cross-platform notifications (`osascript`/`notify-send`/`plyer`); a
+lock file prevents duplicates.
+
+---
+
+## 11. Message Lifecycle
+
+### 11.1 Same-machine send → deliver → reply
 ```
-Alpha                         Filesystem                         Beta
-  │                              │                                 │
-  │  send.py / task.py           │                                 │
-  ├─────────────────────────────►│  alpha-to-beta/inbox/msg-X.json │
-  │                              │                                 │
-  │                              │◄──── MCP server polls (3s) ─────┤
-  │                              │                                 │
-  │                              │  channel notification ─────────►│
-  │                              │  (inline in Claude Code session) │
-  │                              │                                 │
-  │                              │◄──── receipt written ───────────┤
-  │                              │  alpha-to-beta/receipts/        │
-  │                              │                                 │
-  │                              │◄──── moved to done/ ────────────┤
-  │                              │  alpha-to-beta/done/msg-X.json  │
-  │                              │                                 │
-  │                              │  reply tool call ───────────────┤
-  │  beta-to-alpha/inbox/msg-Y  │◄────────────────────────────────┤
-  │◄─────────────────────────────│                                 │
+Sender                    Filesystem / daemon              Recipient
+  │  send / send_team / reply   │                              │
+  ├────────────────────────────►│  to-<recipient>/inbox/msg-X  │
+  │                             │  daemon watcher → {wake} ────►│
+  │                             │  channel notification ──────►│  (inline in session)
+  │                             │◄── receipt written ──────────┤  to-<recipient>/receipts/
+  │                             │◄── moved to done/ ───────────┤
+  │  to-<sender>/inbox/msg-Y    │◄── reply tool call ──────────┤
+  │◄────────────────────────────│                              │
 ```
 
-### 9.2 Offline Delivery
+### 11.2 Cross-machine (relay)
+1. `send_team` to a remote team spools an `interteam` message to `outbox/`.
+2. The local daemon encrypts (`ENC:…`) and `POST /api/send` to the hub, keyed by `(machine_id, team)`.
+3. The remote daemon `POST /api/poll` drains, decrypts, writes to the leader's
+   `to-<leader>/inbox/`, then `POST /api/ack`.
+4. The leader's MCP delivers inline and forwards to local members.
 
-1. Alpha sends while Beta is offline → message sits in `alpha-to-beta/inbox/`
-2. Beta starts session → `session_start.py` reports pending messages
-3. Beta's MCP server starts polling → picks up message immediately
-4. No messages lost (files persist until consumed or expired)
+### 11.3 Offline delivery
+Messages sit in `to-<recipient>/inbox/` until the recipient starts a session (`session_start.py`
+reports them; the MCP/daemon picks them up immediately). Relay messages are held on the hub for up
+to 5 days.
 
-### 9.3 Task Lifecycle
-
-```
-Alpha                              Beta
-  │                                  │
-  │  task.py (status=submitted)      │
-  ├─────────────────────────────────►│
-  │                                  │  Receives task
-  │                                  │  Executes work
-  │                                  │
-  │  ◄──────────────────────────────┤  reply.py (status=completed, result="...")
-  │                                  │
-  │  Sees task completion            │
-```
-
-### 9.4 Cleanup Lifecycle
-
-- `done/` files older than 24h (configurable) → deleted
-- `inbox/` files past their `ttl` → moved to `done/`
-- Malformed JSON → deleted immediately
+### 11.4 Task lifecycle
+`task` (status=submitted) → recipient executes → `reply` sets status=completed + result. (`in-progress`
+and `failed` are also valid statuses.)
 
 ---
 
-## 10. Security Model
+## 12. Security Model
 
-### HMAC Signing
-- Secret generated during `cc2cc init`: 32 bytes random → hex
-- Stored at `{bridge}/secret.key`
-- All scripts load secret and sign messages automatically
-- Canonical form for signing: sorted JSON of all fields except `hmac`
-- Verification uses `hmac.compare_digest()` (timing-safe comparison)
-- Backwards compatible: unsigned messages still work, just not verified
+### Local — HMAC-SHA256 signing
+- Secret generated at setup: 32 random bytes → hex at `{bridge}/secret.key`.
+- All Python scripts sign automatically; the canonical form is sorted JSON of all fields except
+  `hmac`; verification uses timing-safe comparison. Unsigned messages still work (just unverified).
 
-### Limitations
-- **No authentication:** Any process with filesystem access can write to inbox
-- **No encryption:** Messages are plaintext JSON
-- **No access control:** Relies on OS filesystem permissions
-- **Single trust domain:** Designed for single-user, single-machine use
+### Relay — AES-256-GCM end-to-end encryption
+- Enabled by `CC2CC_ENCRYPT=1` (**mandatory for relay**). Key derived from `secret.key` via `scrypt`
+  with a fixed domain-separation salt (`cc2cc-aes-gcm/v2`); every peer derives the same key. Wire
+  format `ENC:<iv_hex>:<tag_hex>:<ct_hex>` with a random 12-byte IV per message.
+- **Fail-closed:** relayed messages missing the `ENC:` prefix are quarantined; decryption failures
+  are dropped; `send_team` to a keyless remote team refuses to send; the relay won't activate
+  without encryption configured. The hub is **zero-knowledge**.
+- Every peer in a relay mesh must share a **byte-identical `secret.key`**.
 
-### Recommended Mitigations
-- `chmod 600 secret.key`, `chmod 700 ~/.cc2cc`
-- Only use on trusted single-user machines
+### Trust & authority
+- A machine is authoritative for the identities it hosts; a team's rules are administered by its
+  `owner_machine`. Relay API access requires the shared token plus a per-machine `machine_secret`
+  (trust-on-first-use) that prevents queue-draining / `machine_id` spoofing.
 
----
-
-## 11. Configuration
-
-### Environment Variables
-
-| Variable | Used by | Default | Description |
-|----------|---------|---------|-------------|
-| `CC2CC_BRIDGE_DIR` | Python scripts, hooks | `~/.cc2cc` | Bridge root |
-| `CC2CC_SELF` | Hooks | `$(hostname -s)` | Agent ID |
-| `BRIDGE_DIR` | MCP server | `~/.cc2cc` | Bridge root (Node.js) |
-| `SELF` | MCP server | `alpha` | Agent ID (Node.js) |
-| `PEER` | MCP server | `beta` | Peer agent ID (Node.js) |
-
-### Claude Code Integration (`~/.claude/settings.json`)
-
-Each agent needs:
-1. **MCP server:** `peer_channel` pointing to `{agent}-channel/server.mjs`
-2. **channelsEnabled:** `true` (experimental feature)
-3. **Hooks:** `SessionStart` → `session_start.py`, `SessionEnd` → `session_end.py`
-
-### Scaling to N Agents
-
-For N agents: N×(N-1)/2 init calls (one per pair). Each agent gets one MCP server that watches all its inboxes (`*-to-{SELF}/inbox/`).
+### Recommended mitigations
+- `chmod 600 secret.key machine.secret`, `chmod 700 ~/.cc2cc`. Use relay only over trusted networks
+  / TLS-terminated endpoints, with encryption enabled.
 
 ---
 
-## 12. Testing
+## 13. Configuration
 
-### Test Structure
+Environment variables (see CONFIGURATION.md for the full table and setup):
+`CC2CC_BRIDGE_DIR` (alias `BRIDGE_DIR`), `CC2CC_IDENTITY` (aliases `SELF`, `CC2CC_SELF`),
+`CC2CC_TEAM`, `CC2CC_ENCRYPT`, `CC2CC_RELAY_TOKEN`, `CC2CC_HUB_TOKEN`/`PORT`/`HOST`, `CC2CC_PY`,
+`CC2CC_REMOTE_ACTIVE_MS`/`EXPIRE_MS`, `CC2CC_DEBUG`.
 
-| File | Type | Count | Description |
-|------|------|-------|-------------|
-| `test_core.py` | Unit | 5 | `atomic_write`, `bridge_path`, size limits |
-| `test_signing.py` | Unit | 5 | Secret generation, sign/verify roundtrip, tampering |
-| `test_unit.py` | Unit | ~20 | Edge cases, schema validation, Unicode, signing details |
-| `test_smoke.py` | Integration | ~20 | Full script execution via subprocess |
-| **Total** | | **~50** | |
+> `CC2CC_ROLE` and `PEER` are **not** used: roles are derived from `teams.json`, and there is no
+> single peer. The old `SELF`/`PEER`/`peer_channel` model is gone.
 
-### Key Test Scenarios
-
-- **Atomic writes:** no partial files on error, parent dir creation, overwrite, Unicode
-- **Signing:** roundtrip, tampering detection, wrong secret, extra fields, nested changes
-- **Message schema:** required fields, valid types/priorities, task structure
-- **Send/Receive:** file creation, field validation, peek vs consume, move to done
-- **Reply:** threading (replyTo), task auto-completion
-- **Task:** creation with status=submitted, completion on reply
-- **HMAC integration:** signed when secret exists, unsigned without, verified/invalid display
-- **Size limit:** oversized rejection (1MB+)
-- **Hooks:** heartbeat writing, pending message reporting, offline marking
-- **Status:** displays agents and mailbox counts
-- **Cleanup:** expired message removal
-- **Validate:** all-valid detection
-
-### CI Pipeline
-
-GitHub Actions matrix:
-- OS: `ubuntu-latest`, `macos-latest`, `windows-latest`
-- Python: `3.9`, `3.12`
-- Jobs: `test` (pytest -v) + `lint` (py_compile all scripts)
+MCP config lives in `~/.claude.json` (not `~/.claude/settings.json`). Launch via
+`claude --dangerously-load-development-channels server:cc2cc`, or use
+`scripts/cc2cc-install.sh` / `cc2cc-launch.sh`. The daemon auto-spawns from the MCP on demand.
 
 ---
 
-## 13. OS Service Templates
+## 14. Testing
 
-### macOS — LaunchAgent
-- File: `com.cc2cc.inbox-watcher.plist`
-- Trigger: `WatchPaths` on bridge directory + `ThrottleInterval: 30s`
-- Runs: `python3 inbox_watcher.py`
+| File | Type | Description |
+|------|------|-------------|
+| `tests/test_core.py` | Unit | `atomic_write`, `bridge_path`, size limits |
+| `tests/test_signing.py` | Unit | secret generation, sign/verify roundtrip, tampering |
+| `tests/test_unit.py` | Unit | edge cases, schema validation, Unicode, signing details |
+| `tests/test_smoke.py` | Integration | full script execution via subprocess |
 
-### Linux — systemd user service
-- File: `cc2cc-watcher.service`
-- Type: simple, restart on failure (10s delay)
-- Runs: `python3 inbox_watcher.py`
-
-### Windows — Task Scheduler
-- File: `cc2cc-watcher.xml`
-- Trigger: user logon
-- Runs: `python inbox_watcher.py`
-- Restart on failure: 3 attempts, 1-minute interval
+Key scenarios: atomic writes (no partial files, dir creation, Unicode), signing (roundtrip,
+tampering, wrong secret), message schema validation, send/receive (peek vs consume), reply
+(threading + task auto-completion), size limits, hooks (heartbeat + pending reporting), status, and
+cleanup. CI runs the pytest suite + lint across an OS × Python matrix.
 
 ---
 
-## 14. Dependencies
+## 15. OS Service Templates
+
+- **macOS — LaunchAgent** (`com.cc2cc.inbox-watcher.plist`): `WatchPaths` on the bridge +
+  `ThrottleInterval`.
+- **Linux — systemd user service** (`cc2cc-watcher.service`): simple, restart-on-failure.
+- **Windows — Task Scheduler** (`cc2cc-watcher.xml`): logon trigger, restart on failure.
+
+> These templates cover the optional inbox watcher. The relay **daemon** normally auto-spawns from
+> the MCP and does not require a separate service; `cc2cc-install.sh` can optionally install it as a
+> `--user` systemd unit (local scope) or a system service (global scope).
+
+---
+
+## 16. Dependencies
 
 ### Runtime
 | Dependency | Version | Required | Purpose |
 |-----------|---------|----------|---------|
-| Python | ≥ 3.8 | Yes | Scripts, hooks, CLI |
-| Node.js | ≥ 18 | Yes | MCP channel server |
-| `@modelcontextprotocol/sdk` | ^1.12.0 | Yes | MCP protocol implementation |
-| `watchdog` | any | Optional | Real-time filesystem watching |
+| Python | ≥ 3.8 | Yes | scripts, hooks, CLIs |
+| Node.js | ≥ 18 | Yes | MCP server + daemon |
+| `@modelcontextprotocol/sdk` | recent | Yes | MCP protocol implementation |
+| FastAPI + an ASGI server | recent | Relay only | `relay_hub.py` |
+| `watchdog` | any | Optional | real-time inbox watching |
 | `plyer` | any | Optional | Windows desktop notifications |
 
 ### Development
-| Dependency | Purpose |
-|-----------|---------|
-| `pytest` | Test runner |
-| `setuptools` ≥ 64 | Build backend |
+`pytest` (test runner), `setuptools` ≥ 64 (build backend).
 
 ---
 
-## 15. Known Limitations & Design Decisions
+## 17. Known Limitations & Design Decisions
 
-1. **Filesystem-only transport** — no network support by design (same-machine optimization)
-2. **No message ordering guarantee** — use `replyTo` field for threading
-3. **Polling latency** — up to 3s delay; watchdog reduces to near-instant
-4. **`channelsEnabled` is experimental** — Claude Code feature that may change
-5. **CLI delegates via `sys.argv` rewrite** — `cli.py` rewrites argv and calls script `main()` functions; `validate` and `cleanup` use subprocess instead (likely for isolation)
-6. **MCP server tracks one peer** — reply tool sends to `PEER`, but inbox polling reads from all senders
-7. **`seenFiles` Set has cap at 500** — cleared entirely to prevent memory leak in long sessions
-8. **No retry mechanism** — if MCP push fails, message stays in inbox but is marked as seen
-9. **Receipts are write-only** — no script currently reads or acts on receipt files
+1. **Two transports, one secret** — `secret.key` keys both local HMAC and the derived relay AES key;
+   all relay peers must share a byte-identical copy.
+2. **Relay is fail-closed** — no plaintext is ever placed on the wire or surfaced from it; this
+   trades graceful degradation for confidentiality.
+3. **Hub is in-memory** — undelivered messages live ≤ 5 days and do not survive a hub restart.
+4. **One daemon per host** — enforced by the socket lock; the hub connection is shared across all
+   local sessions.
+5. **Roles are derived, never stored** — recomputed from `teams.json` each poll; there is no
+   `role` field in identities.
+6. **`check_inbox` is a marker** — inbox consumption piggybacks on every tool call rather than a
+   dedicated poll.
+7. **Cross-team only via leaders** — `send_team` always routes through the target team's leader; it
+   is the sole cross-team / cross-machine path.
+8. **`channelsEnabled` is experimental** — the underlying Claude Code channel feature may change.

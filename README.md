@@ -314,7 +314,7 @@ cc2cc/
 │   └── inbox_watcher.py        # Optional: watchdog-based real-time delivery
 ├── services/                   # OS service templates (macOS launchd / Linux systemd / Windows)
 ├── tests/                      # pytest (python) + node test_*.mjs (channel/daemon/relay/teams)
-├── docs/                       # SPECIFICATION.md (the full spec), Demo.md, rise.md
+├── docs/                       # ARCHITECTURE.md, SPECIFICATION.md, CONFIGURATION.md, Demo.md, rise.md, superpowers/
 ├── LICENSE
 └── README.md                   # ← you are here
 ```
@@ -361,9 +361,9 @@ Additional mitigations:
 
 ## Documentation
 
-- **[Specification](docs/SPECIFICATION.md)** — the complete current spec: components, bridge layout,
-  message/identity/team schemas, the 15 MCP tools, teams & routing, the relay protocol, encryption,
-  configuration, and the daemon lifecycle.
+- **[Architecture](docs/ARCHITECTURE.md)** — components, the daemon model, bridge layout, teams, relay, and message lifecycle.
+- **[Specification](docs/SPECIFICATION.md)** — message/identity/team schemas, the 15 MCP tools, the relay protocol, and encryption.
+- **[Configuration](docs/CONFIGURATION.md)** — environment variables, MCP setup, team provisioning, and running a relay hub.
 - **[Demo scenarios](docs/Demo.md)** — multi-agent debate walkthroughs.
 
 ## Prior Art
