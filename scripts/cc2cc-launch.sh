@@ -19,11 +19,18 @@
 #   -e, --encrypt         force CC2CC_ENCRYPT=1 (auto-on when a relay config is present)
 #   -h, --help
 #
-# Env: CC2CC_BRIDGE_DIR (default ~/.cc2cc). Must run as a NON-ROOT user.
+# Env: CC2CC_BRIDGE_DIR (default: global /var/lib/cc2cc if present, else ~/.cc2cc). NON-ROOT user.
 set -uo pipefail
 
-BRIDGE="${CC2CC_BRIDGE_DIR:-$HOME/.cc2cc}"
+# Bridge: an explicit CC2CC_BRIDGE_DIR wins; else auto-detect a machine-wide install
+# (/var/lib/cc2cc) before falling back to the per-user local bridge (~/.cc2cc).
+if [ -n "${CC2CC_BRIDGE_DIR:-}" ]; then BRIDGE="$CC2CC_BRIDGE_DIR"
+# Detect the global install by the DIRECTORY (statable via its world-traversable parent), NOT a
+# file inside it — a login without the cc2cc group can't traverse the bridge to see secret.key.
+elif [ -d /var/lib/cc2cc ]; then BRIDGE="/var/lib/cc2cc"
+else BRIDGE="$HOME/.cc2cc"; fi
 CHANNEL="server:cc2cc"; USE_TMUX=0; IDENT=""; ENCRYPT=0; TIMEOUT="${TIMEOUT:-120}"
+ORIG_ARGS=("$@")   # preserved for a possible re-exec under the bridge group (see below)
 
 while [[ $# -gt 0 ]]; do case "$1" in
   -t|--tmux)     USE_TMUX=1; shift;;
@@ -35,8 +42,38 @@ while [[ $# -gt 0 ]]; do case "$1" in
   *)             IDENT="$1"; shift;;
 esac; done
 
-[[ "$(id -u)" -eq 0 ]] && { echo "cc2cc-launch: run as a non-root user (--dangerously-skip-permissions is blocked under root)."; exit 1; }
+# Claude blocks --dangerously-skip-permissions under root. Rather than refuse, launch root sessions
+# WITHOUT that flag (normal permission prompts apply); non-root keeps the hands-free bypass.
+if [[ "$(id -u)" -eq 0 ]]; then
+  SKIP_PERMS=""
+  echo "cc2cc-launch: running as root — launching WITHOUT --dangerously-skip-permissions (permission prompts will apply)."
+else
+  SKIP_PERMS="--dangerously-skip-permissions"
+fi
 command -v claude >/dev/null || { echo "cc2cc-launch: 'claude' not on PATH"; exit 1; }
+
+# The agent's MCP must have the bridge's group ACTIVE to read/write the shared bridge. A login that
+# predates your group membership won't have it — and tmux panes inherit the (groupless) tmux server
+# — so the agent would boot with no identity/team. If we're a member, run under the group via `sg`:
+# re-exec the launcher (so its own bridge reads + a foreground agent inherit the group) and, for
+# tmux, wrap the sent command too. If we're not a member, stop with guidance, not a broken session.
+BRIDGE_GROUP="$(stat -c '%G' "$BRIDGE" 2>/dev/null || echo "")"
+GROUP_WRAP=0
+if [ "$(id -u)" -ne 0 ] && [ -n "$BRIDGE_GROUP" ] && [ "$BRIDGE_GROUP" != "$(id -gn "$(id -un)")" ]; then
+  if id -nG "$(id -un)" 2>/dev/null | tr ' ' '\n' | grep -qx "$BRIDGE_GROUP"; then
+    GROUP_WRAP=1
+    if [ -z "${CC2CC_SG_REEXEC:-}" ] && ! id -nG | tr ' ' '\n' | grep -qx "$BRIDGE_GROUP"; then
+      echo "cc2cc-launch: activating group '$BRIDGE_GROUP' for bridge access…"
+      export CC2CC_SG_REEXEC=1
+      exec sg "$BRIDGE_GROUP" -c "$(printf '%q ' "$0" "${ORIG_ARGS[@]}")"
+    fi
+  else
+    echo "cc2cc-launch: you're not in group '$BRIDGE_GROUP', so the agent can't read/write $BRIDGE" >&2
+    echo "  (it would come up with no identity/team). Ask an admin to add you, then re-login:" >&2
+    echo "    sudo cc2cc-install install --scope global --add-user $(id -un)" >&2
+    exit 1
+  fi
+fi
 
 # Relay configured? → encryption is mandatory for the daemon, so default it on.
 if [ "$ENCRYPT" = 0 ] && { [ -f "$BRIDGE/connections.json" ] || [ -f "$BRIDGE/relay.json" ]; }; then
@@ -73,11 +110,24 @@ if [ -z "$IDENT" ]; then
   [ -n "$IDENT" ] || { echo "cc2cc-launch: no identity chosen"; exit 1; }
 fi
 
+# Identity names are lowercase letters/digits/hyphens (filesystem-safe + routing-consistent). The
+# MCP silently REJECTS anything else and boots DORMANT (no identity/team) — so lowercase a
+# capitalized name (e.g. 'John' -> 'john'), and reject anything still invalid with a clear message.
+NORM="$(printf '%s' "$IDENT" | tr '[:upper:]' '[:lower:]')"
+if [ "$NORM" != "$IDENT" ]; then
+  echo "cc2cc-launch: identity names are lowercase — launching '$IDENT' as '$NORM'."
+  IDENT="$NORM"
+fi
+if ! printf '%s' "$IDENT" | grep -qE '^[a-z0-9][a-z0-9-]{0,30}$'; then
+  echo "cc2cc-launch: invalid identity '$IDENT' — use lowercase letters/digits/hyphens, start with a letter or digit, max 31 chars." >&2
+  exit 1
+fi
+
 # ─── foreground (default): a normal interactive session; user answers prompts ──
 if [ "$USE_TMUX" = 0 ]; then
-  env=( "CC2CC_IDENTITY=$IDENT" ); [ "$ENCRYPT" = 1 ] && env+=( "CC2CC_ENCRYPT=1" )
+  env=( "CC2CC_BRIDGE_DIR=$BRIDGE" "CC2CC_IDENTITY=$IDENT" ); [ "$ENCRYPT" = 1 ] && env+=( "CC2CC_ENCRYPT=1" )
   echo "cc2cc-launch: starting '$IDENT' (channel=$CHANNEL${ENCRYPT:+, encrypted})"
-  exec env "${env[@]}" claude --dangerously-skip-permissions --dangerously-load-development-channels "$CHANNEL"
+  exec env "${env[@]}" claude $SKIP_PERMS --dangerously-load-development-channels "$CHANNEL"
 fi
 
 # ─── tmux (-t): hands-free, auto-answers the startup menus ─────────────────────
@@ -103,9 +153,13 @@ fi
 pane(){ tmux capture-pane -p -t "$TARGET" 2>/dev/null || true; }
 send(){ tmux send-keys -t "$TARGET" "$@"; }
 
-ENVPREFIX="CC2CC_IDENTITY='$IDENT'"; [ "$ENCRYPT" = 1 ] && ENVPREFIX="$ENVPREFIX CC2CC_ENCRYPT=1"
+ENVPREFIX="CC2CC_BRIDGE_DIR='$BRIDGE' CC2CC_IDENTITY='$IDENT'"; [ "$ENCRYPT" = 1 ] && ENVPREFIX="$ENVPREFIX CC2CC_ENCRYPT=1"
 echo "$(ts) cc2cc-launch: starting '$IDENT' in tmux (channel=$CHANNEL)"
-send "$ENVPREFIX claude --dangerously-skip-permissions --dangerously-load-development-channels '$CHANNEL'" Enter
+TMUX_CMD="$ENVPREFIX claude $SKIP_PERMS --dangerously-load-development-channels '$CHANNEL'"
+# tmux panes run under the tmux SERVER, which may lack the bridge group even if we have it — wrap
+# the agent command under the group so its MCP can read/write the bridge.
+[ "$GROUP_WRAP" = 1 ] && TMUX_CMD="sg $BRIDGE_GROUP -c $(printf '%q' "$TMUX_CMD")"
+send "$TMUX_CMD" Enter
 
 deadline=$((SECONDS+TIMEOUT)); lastsig=""
 while (( SECONDS < deadline )); do

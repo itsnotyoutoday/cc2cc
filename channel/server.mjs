@@ -23,10 +23,10 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { readdir, readFile, rename, mkdir, writeFile, stat, rm } from "fs/promises";
-import { writeFileSync } from "fs";
+import { writeFileSync, readFileSync } from "fs";
 import { join, basename, dirname } from "path";
 import { randomUUID, randomBytes, createCipheriv, createDecipheriv, scryptSync } from "crypto";
-import { homedir } from "os";
+import { homedir, hostname } from "os";
 import { fileURLToPath } from "url";
 import { realpathSync } from "fs";
 import { generateUniqueName, validateName, takenNames } from "./names.mjs";
@@ -45,6 +45,17 @@ const DEFAULT_TTL = 3600;
 const HOME = process.env.HOME || process.env.USERPROFILE || homedir();
 const BRIDGE_DIR =
   process.env.CC2CC_BRIDGE_DIR || process.env.BRIDGE_DIR || join(HOME, ".cc2cc");
+
+// Default team when CC2CC_TEAM is unset: this node's mesh identity (connections.json self.name,
+// established at install) else the server hostname — so agents on host "nexus" default to team
+// "nexus" rather than a generic "cc2cc". An explicit CC2CC_TEAM always wins.
+const DEFAULT_TEAM = (() => {
+  try {
+    const conn = JSON.parse(readFileSync(join(BRIDGE_DIR, "connections.json"), "utf8"));
+    if (conn?.self?.name) return String(conn.self.name);
+  } catch {}
+  return (hostname() || "cc2cc").split(".")[0];
+})();
 
 // Identity name from the launcher env (cc-launch sets CC2CC_IDENTITY; SELF is the
 // legacy alias). When present and valid, identity is stored per-name so multiple
@@ -303,7 +314,7 @@ async function saveIdentity(identity) {
 
 /** Create a new identity with the given display name, UUID, and teams/role.
  * Teams/role are seeded from CC2CC_TEAM (comma-separated) / CC2CC_ROLE when set,
- * else default to ["cc2cc"] / "member". */
+ * else default to [DEFAULT_TEAM] / "member". */
 async function createIdentity(name) {
   const envTeams = (process.env.CC2CC_TEAM || "")
     .split(",")
@@ -316,7 +327,7 @@ async function createIdentity(name) {
     agent_id: randomUUID(),
     created: new Date().toISOString(),
     last_seen: new Date().toISOString(),
-    teams: envTeams.length ? envTeams : ["cc2cc"],
+    teams: envTeams.length ? envTeams : [DEFAULT_TEAM],
   };
   await saveIdentity(identity);
   log("info", "identity created", { name, agent_id: identity.agent_id, teams: identity.teams });
@@ -348,7 +359,7 @@ async function writeHeartbeat(statusValue = "active", context = "session started
     status: statusValue,
     context,
     status_text: agentStatus,
-    teams: agentIdentity?.teams || ["cc2cc"],
+    teams: agentIdentity?.teams || [DEFAULT_TEAM],
   };
   const filePath = join(statusDir(), `${agentName}-heartbeat.json`);
   await atomicWrite(filePath, hb);
@@ -423,8 +434,8 @@ function allAgentNames() {
 function sharesTeam(agentA, agentB) {
   const aData = getAgentList().find((a) => a.name === agentA);
   const bData = getAgentList().find((a) => a.name === agentB);
-  const aTeams = aData?.teams || ["cc2cc"];
-  const bTeams = bData?.teams || ["cc2cc"];
+  const aTeams = aData?.teams || [DEFAULT_TEAM];
+  const bTeams = bData?.teams || [DEFAULT_TEAM];
   return aTeams.some((t) => bTeams.includes(t));
 }
 
@@ -945,7 +956,7 @@ async function handleReply({ msg_id, text }) {
 async function handleSendTeam({ team, text, intent = "message", priority = "normal" }) {
   if (!team || !text) return textResult("Missing required fields: team, text", true);
 
-  const senderTeams = agentIdentity?.teams || ["cc2cc"];
+  const senderTeams = agentIdentity?.teams || [DEFAULT_TEAM];
   const fromTeam = senderTeams[0]; // primary team for routing
 
   // 1. Local team leader first — BUT a team owned by another machine must route via the relay,
@@ -1061,7 +1072,7 @@ function handleListTeams() {
   }
 
   // Also include our own teams
-  const ourTeams = agentIdentity?.teams || ["cc2cc"];
+  const ourTeams = agentIdentity?.teams || [DEFAULT_TEAM];
   for (const t of ourTeams) {
     if (!teams.has(t)) {
       teams.set(t, { leader: teamLeaders.get(t) || null, members: new Set() });
@@ -1599,7 +1610,7 @@ function isRevoked(name, team) {
 
 /** The teams an agent is effectively in = its claimed teams minus any it's revoked from. */
 function effectiveTeams(name, teams) {
-  return (teams || ["cc2cc"]).filter((t) => !isRevoked(name, t));
+  return (teams || [DEFAULT_TEAM]).filter((t) => !isRevoked(name, t));
 }
 
 function leadsTeam(team) { return teamLeaders.get(team) === agentName; }
@@ -1904,7 +1915,7 @@ async function activate(candidateName) {
       log("warn", "relay disabled: encryption is mandatory (set CC2CC_ENCRYPT=1 and configure secret.key)");
       relayConfigured = false;
     } else {
-      const teamName = (agentIdentity?.teams || ["cc2cc"])[0];
+      const teamName = (agentIdentity?.teams || [DEFAULT_TEAM])[0];
       try {
         const daemonEnv = { ...process.env, CC2CC_TEAM: teamName, CC2CC_IDENTITY: agentName };
         const res = await ensureDaemon({ bridgeDir: BRIDGE_DIR, env: daemonEnv });
@@ -2037,6 +2048,9 @@ async function init() {
       log("info", "client initialized — auto-join (CC2CC_IDENTITY/SELF present)", { name: IDENTITY_NAME });
       activate(IDENTITY_NAME).catch((e) => log("error", "activate failed", { error: e?.message }));
     };
+  } else if (RAW_IDENTITY_NAME) {
+    // A name WAS provided but rejected by validateName — say so, don't pretend none was set.
+    log("warn", `cc2cc dormant — CC2CC_IDENTITY ${JSON.stringify(RAW_IDENTITY_NAME)} is not a valid name (lowercase letters/digits/hyphens, start alphanumeric, ≤31 chars); not joining. Relaunch with a valid name.`);
   } else {
     log("info", "cc2cc dormant — no CC2CC_IDENTITY/SELF set; not joining. register(name) to participate.");
   }
