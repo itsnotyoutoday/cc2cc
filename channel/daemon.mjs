@@ -26,7 +26,7 @@
 import net from "net";
 import { watch } from "fs";
 import { mkdir, unlink, writeFile } from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, statSync } from "fs";
 import { join } from "path";
 import { homedir, platform } from "os";
 import { fileURLToPath } from "url";
@@ -128,25 +128,33 @@ function handleConnection(sock) {
  * null (caller should exit). Clears a stale socket file left by a crashed daemon.
  */
 async function bindSocket(socketPath) {
-  // Probe an existing socket: if something answers, a daemon is live → bail.
-  if (platform() !== "win32" && existsSync(socketPath)) {
-    const alive = await new Promise((resolve) => {
-      const probe = net.connect(socketPath);
-      probe.on("connect", () => { probe.end(); resolve(true); });
-      probe.on("error", () => resolve(false));
-    });
-    if (alive) return null;
-    await unlink(socketPath).catch(() => {}); // stale — remove it
-  }
-  const server = net.createServer(handleConnection);
-  const ok = await new Promise((resolve) => {
-    server.once("error", (err) => {
-      if (err.code === "EADDRINUSE") resolve(false);
-      else { log("error", "socket error", { error: err.message }); resolve(false); }
-    });
-    server.listen(socketPath, () => resolve(true));
+  // M6: bind FIRST to avoid a TOCTOU window. The old probe→unlink→listen order let a second
+  // starter unlink a socket the first starter had just bound (orphaning a live daemon). Only
+  // unlink after a probe that CONFIRMS the in-use socket is dead.
+  const tryListen = () => new Promise((resolve) => {
+    const server = net.createServer(handleConnection);
+    server.once("error", (err) => resolve({ err }));
+    server.listen(socketPath, () => resolve({ server }));
   });
-  return ok ? server : null;
+
+  let r = await tryListen();
+  if (r.server) return r.server;
+  if (r.err?.code !== "EADDRINUSE" && r.err?.code !== "EEXIST") {
+    log("error", "socket error", { error: r.err?.message });
+    return null;
+  }
+  // Address in use → is a LIVE daemon holding it?
+  if (platform() === "win32") return null; // named pipe in use → assume a live owner
+  const alive = await new Promise((resolve) => {
+    const probe = net.connect(socketPath);
+    probe.on("connect", () => { probe.end(); resolve(true); });
+    probe.on("error", () => resolve(false));
+  });
+  if (alive) return null; // a real daemon owns it → we bail
+  // Confirmed dead → remove the stale socket and retry binding ONCE.
+  await unlink(socketPath).catch(() => {});
+  r = await tryListen();
+  return r.server || null;
 }
 
 // ─── Mailbox watcher ─────────────────────────────────────────────────────────
@@ -186,7 +194,15 @@ export async function stop() {
   for (const sock of allSockets) { try { sock.destroy(); } catch {} }
   allSockets.clear();
   await new Promise((r) => (server ? server.close(() => r()) : r()));
-  if (running && platform() !== "win32") await unlink(running.socketPath).catch(() => {});
+  if (running && platform() !== "win32") {
+    // M6: only remove the socket file if it's still the inode WE bound — a racing daemon may have
+    // replaced it, and we must never unlink a live socket we no longer own.
+    try {
+      if (running.ino == null || statSync(running.socketPath).ino === running.ino) {
+        await unlink(running.socketPath).catch(() => {});
+      }
+    } catch { /* already gone */ }
+  }
   server = null; watcher = null; running = null;
 }
 
@@ -204,7 +220,9 @@ export async function main(opts = {}) {
     log("info", "another daemon owns the socket", { socket: socketPath });
     return null;
   }
-  running = { bridgeDir: cfg.bridgeDir, socketPath };
+  let socketIno = null;
+  try { socketIno = statSync(socketPath).ino; } catch { /* raced away already */ }
+  running = { bridgeDir: cfg.bridgeDir, socketPath, ino: socketIno };
   log("info", "daemon up", { socket: socketPath, team: cfg.team, self: cfg.self });
 
   // Crypto is performed by the MCP (server.mjs): it encrypts before spooling to the outbox and
