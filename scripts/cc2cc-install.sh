@@ -17,6 +17,8 @@
 # ACTIONS:
 #   install            interactive wizard (or flag-driven; see --non-interactive)
 #   register-client    register THIS user's Claude (~/.claude.json) against an existing bridge
+#                      (auto-detects the global bridge /var/lib/cc2cc + staged /opt code — no path needed)
+#   unregister-client  remove THIS user's cc2cc MCP entry from ~/.claude.json (inverse of register-client)
 #   uninstall          tear down what this installer created (scope-aware, confirms data deletion)
 #   status             show what's installed
 #
@@ -28,6 +30,8 @@
 #   --hub                       run a relay HUB here (system service in global, --user/bg in local)
 #   --hub-port N                hub port (default 10322)
 #   --hub-token TOK             hub auth token (default: generated)
+#   --node-name NAME            this node's mesh identity + default team (default: hostname)
+#   --secret-key PATH           import this shared key instead of generating (non-interactive join)
 #   --venv DIR                  python venv for cc2cc-admin + hub deps (default: <bridge>/venv)
 #   --add-user NAME             (global) add NAME to the 'cc2cc' group so it can read the shared
 #                               secret.key; repeatable. Re-run global install to add more later.
@@ -43,11 +47,11 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_GUESS="$(dirname "$(dirname "$SELF")")"
 [ -f "$REPO_GUESS/channel/server.mjs" ] || REPO_GUESS="$(pwd)"
 
-ACTION="${1:-install}"; [[ "$ACTION" =~ ^(install|uninstall|register-client|status)$ ]] && shift || ACTION="install"
+ACTION="${1:-install}"; [[ "$ACTION" =~ ^(install|uninstall|register-client|unregister-client|status)$ ]] && shift || ACTION="install"
 
 SCOPE=""; REPO="$REPO_GUESS"; BRIDGE=""; WANT_RELAY=0; WANT_HUB=0
 HUB_PORT=10322; HUB_TOKEN=""; VENV=""; WANT_ENCRYPT=0; INTERACTIVE=1; ASSUME_YES=0
-SYS_USER="cc2cc"; SYS_GROUP="cc2cc"; GLOBAL_ROOT="/var/lib/cc2cc"; ETC="/etc/cc2cc"; OPT_ROOT="/opt/cc2cc"; ADD_USERS=""
+SYS_USER="cc2cc"; SYS_GROUP="cc2cc"; GLOBAL_ROOT="/var/lib/cc2cc"; ETC="/etc/cc2cc"; OPT_ROOT="/opt/cc2cc"; ADD_USERS=""; NODE_NAME=""; SECRET_SRC=""
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --scope) SCOPE="$2"; shift 2;;
@@ -57,6 +61,8 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --hub) WANT_HUB=1; shift;;
   --hub-port) HUB_PORT="$2"; shift 2;;
   --hub-token) HUB_TOKEN="$2"; shift 2;;
+  --node-name) NODE_NAME="$2"; shift 2;;
+  --secret-key) SECRET_SRC="$2"; shift 2;;
   --venv) VENV="$2"; shift 2;;
   --add-user) ADD_USERS="$ADD_USERS $2"; shift 2;;
   --encrypt) WANT_ENCRYPT=1; shift;;
@@ -115,7 +121,9 @@ ensure_venv(){ # $1 = venv dir, $2 = "run-as-sudo" flag
 ensure_secret(){ # $1 bridge, $2 sudo-flag, $3 group(optional)
   local b="$1" S="${2:-}" grp="${3:-}" src="" mode="generate"
   if [ -f "$b/secret.key" ]; then c "secret.key exists (keeping)"; return 0; fi
-  if [ "$INTERACTIVE" = 1 ]; then
+  if [ -n "${SECRET_SRC:-}" ]; then
+    src="$SECRET_SRC"; mode="import"          # non-interactive join an existing mesh: --secret-key <path>
+  elif [ "$INTERACTIVE" = 1 ]; then
     echo "  No secret.key found in $b."
     echo "    • GENERATE a new key — for a standalone node / your own new mesh."
     echo "    • IMPORT an existing shared key — REQUIRED to join an existing relay mesh"
@@ -174,22 +182,38 @@ PY
 }
 
 # ─── relay client config (canonical connections.json) ────────────────────────
-write_connections(){ # $1 bridge, $2 hub-url, $3 token, $4 sudo-flag
-  local b="$1" url="$2" tok="$3" S="${4:-}"
-  c "writing connections.json (hub=$url)"
-  $S env URL="$url" TOK="$tok" python3 - "$b" <<'PY'
+write_connections(){ # $1 bridge, $2 hub-url, $3 token, $4 sudo-flag, $5 node-name
+  local b="$1" url="$2" tok="$3" S="${4:-}" nm="${5:-}"
+  [ -n "$nm" ] || nm="$(hostname -s 2>/dev/null || echo node)"
+  local seed; seed="$(cat /etc/machine-id 2>/dev/null || hostname 2>/dev/null || echo "$b")"
+  c "writing connections.json (hub=$url, node=$nm)"
+  $S env URL="$url" TOK="$tok" NODE_NAME="$nm" MID_SEED="$seed" python3 - "$b" <<'PY'
 import json, os, sys, pathlib, hashlib
 b = pathlib.Path(sys.argv[1]); p = b / "connections.json"
 cfg = json.loads(p.read_text()) if p.exists() else {}
-mid = cfg.get("self", {}).get("id") or "machine-" + hashlib.sha1(str(b).encode()).hexdigest()[:8]
-cfg["self"] = {"id": mid, "name": cfg.get("self", {}).get("name", "agent"), "type": "client"}
+# self.id must be UNIQUE per physical host: the bridge path is identical (/var/lib/cc2cc) on every
+# global node, so a path-only hash would COLLIDE across machines and the hub couldn't tell them
+# apart. Seed from the stable host machine-id; keep any id already established (don't churn it).
+mid = cfg.get("self", {}).get("id") or "machine-" + hashlib.sha1(
+    (os.environ.get("MID_SEED", "") + "|" + str(b)).encode()).hexdigest()[:10]
+nm = os.environ.get("NODE_NAME") or cfg.get("self", {}).get("name") or "node"
+cfg["self"] = {"id": mid, "name": nm, "type": "client"}
 cfg["enabled"] = True; cfg.setdefault("poll_interval_ms", 3000)
 conns = cfg.setdefault("connections", [])
 conns[:] = [x for x in conns if x.get("id") != "primary-hub"]
 conns.insert(0, {"id": "primary-hub", "type": "server", "url": os.environ["URL"].rstrip("/"),
                  "token": os.environ["TOK"], "enabled": True})
-p.write_text(json.dumps(cfg, indent=2)); print("  connections.json ->", os.environ["URL"])
+p.write_text(json.dumps(cfg, indent=2))
+print("  connections.json -> self.id=%s name=%s hub=%s" % (mid, nm, os.environ["URL"]))
 PY
+}
+
+# Drop an inert, copy-to-activate config template into the bridge so operators can discover the
+# knobs in place. The live system uses built-in defaults until one is renamed to its *.json form.
+install_example(){ # $1 src, $2 dest
+  [ -f "$1" ] || return 0
+  $SUDO cp -f "$1" "$2"; $SUDO chgrp "$SYS_GROUP" "$2" 2>/dev/null || true; $SUDO chmod 640 "$2"
+  c "template: $2 (copy to ${2%.example} + edit to activate)"
 }
 
 # ─── systemd units ───────────────────────────────────────────────────────────
@@ -199,12 +223,14 @@ write_daemon_unit_system(){ # global daemon service
 [Unit]
 Description=cc2cc relay daemon (shared bridge $BRIDGE)
 After=network.target
+PartOf=cc2cc.target
 [Service]
 Type=simple
 User=$SYS_USER
 Group=$SYS_GROUP
 Environment=CC2CC_BRIDGE_DIR=$BRIDGE
 Environment=CC2CC_SERVICE_MODE=1
+Environment=CC2CC_TEAM=$NODE_NAME
 $( [ "$WANT_ENCRYPT" = 1 ] && echo "Environment=CC2CC_ENCRYPT=1" )
 ExecStart=$(command -v node) $REPO/channel/daemon.mjs --service
 Restart=on-failure
@@ -222,6 +248,7 @@ write_hub_unit_system(){ # global hub service
 [Unit]
 Description=cc2cc relay hub (cross-machine message queue)
 After=network.target
+PartOf=cc2cc.target
 [Service]
 Type=simple
 User=$SYS_USER
@@ -230,6 +257,21 @@ EnvironmentFile=$ETC/hub.env
 ExecStart=$PYBIN $REPO/relay_hub.py --host 127.0.0.1 --port $HUB_PORT
 Restart=on-failure
 RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# Umbrella TARGET so the whole node starts/stops/restarts as one: `systemctl start|stop|restart
+# cc2cc.target`. A target runs no process of its own — it just pulls in the daemon (+ hub) via
+# Wants=; the PartOf=cc2cc.target on those propagates a stop/restart of the target down to them.
+write_node_target(){
+  c "installing umbrella cc2cc.target (controls daemon$( [ "$WANT_HUB" = 1 ] && echo " + hub") together)"
+  $SUDO tee /etc/systemd/system/cc2cc.target >/dev/null <<EOF
+[Unit]
+Description=cc2cc relay node (daemon$( [ "$WANT_HUB" = 1 ] && echo " + hub"))
+Wants=cc2cc-daemon.service$( [ "$WANT_HUB" = 1 ] && echo " cc2cc-hub.service")
+After=cc2cc-daemon.service$( [ "$WANT_HUB" = 1 ] && echo " cc2cc-hub.service")
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -303,6 +345,10 @@ do_install(){
     fi
     VENV="${VENV:-$REPO/venv}"
     if [ "$INTERACTIVE" = 1 ]; then askyn "Run the cross-machine relay hub as a system service?" y && WANT_HUB=1; fi
+    # Node identity on the mesh — defaults to the server hostname; also becomes the default team
+    # for agents that don't set CC2CC_TEAM.
+    [ -n "$NODE_NAME" ] || NODE_NAME="$(hostname -s 2>/dev/null || echo node)"
+    if [ "$INTERACTIVE" = 1 ]; then NODE_NAME="$(ask 'Node/server name (mesh identity + default team)' "$NODE_NAME")"; fi
     WANT_ENCRYPT=1   # shared multi-user bridge → always encrypt over the wire
     c "global install → code $REPO, shared bridge $BRIDGE (group $SYS_GROUP)"
     getent group "$SYS_GROUP" >/dev/null || $SUDO groupadd --system "$SYS_GROUP"
@@ -315,7 +361,12 @@ do_install(){
     $SUDO chgrp -R "$SYS_GROUP" "$BRIDGE"
     $SUDO chmod 2770 "$BRIDGE" "$BRIDGE/status" "$BRIDGE/identities"   # setgid: shared writable
     ensure_venv "$VENV" "$SUDO"
-    $SUDO chgrp -R "$SYS_GROUP" "$REPO" 2>/dev/null || true
+    # Code in /opt is system-owned: root owns it (a regular user must NOT be able to modify code the
+    # cc2cc service runs), group cc2cc + world-read let the service read/execute it. `cp -a` above
+    # preserved the installing user's ownership, so re-own here (covers the venv too) and strip
+    # group-write so not even the service user can alter its own code.
+    $SUDO chown -R root:"$SYS_GROUP" "$REPO" 2>/dev/null || true
+    $SUDO chmod -R g-w "$REPO" 2>/dev/null || true
     # user-facing commands → /usr/local/bin ; operator/admin (governance) → /usr/local/sbin
     $SUDO ln -sf "$VENV/bin/cc2cc" /usr/local/bin/cc2cc
     $SUDO ln -sf "$REPO/scripts/cc2cc-launch.sh" /usr/local/bin/cc2cc-launch
@@ -323,13 +374,40 @@ do_install(){
     $SUDO mkdir -p /usr/local/sbin
     $SUDO ln -sf "$VENV/bin/cc2cc-admin" /usr/local/sbin/cc2cc-admin
     ensure_secret "$BRIDGE" "$SUDO" "$SYS_GROUP"
+    # Seed copy-to-activate config templates (inert; built-in defaults apply until renamed to *.json).
+    install_example "$REPO/channel/policy.example.json" "$BRIDGE/policy.json.example"
+    install_example "$REPO/channel/rules.default.json"  "$BRIDGE/rules.json.example"
     write_daemon_unit_system
     [ "$WANT_HUB" = 1 ] && { [ -z "$HUB_TOKEN" ] && HUB_TOKEN="$(gen_token)"; write_hub_unit_system; }
+    write_node_target
+    # Wire this node's OWN daemon to relay through the hub, so its agents join the cross-machine
+    # mesh (not just same-machine bridge messaging). Running a hub implies relaying through it;
+    # --relay (with or without --hub) points the daemon at the hub URL (default: the local hub).
+    if [ "$WANT_HUB" = 1 ] || [ "$WANT_RELAY" = 1 ]; then
+      [ -z "$HUB_TOKEN" ] && HUB_TOKEN="$(gen_token)"
+      write_connections "$BRIDGE" "http://127.0.0.1:$HUB_PORT" "$HUB_TOKEN" "$SUDO" "$NODE_NAME"
+      $SUDO chown "$SYS_USER:$SYS_GROUP" "$BRIDGE/connections.json"
+      $SUDO chmod 660 "$BRIDGE/connections.json"   # holds the hub token → not world-readable; daemon (cc2cc) read/write
+      WANT_RELAY=1
+    fi
+    # The bridge is the cc2cc service's data dir — own it as the service user; the setgid dirs let
+    # group members (added accounts) still collaborate. Install-time files were created via sudo
+    # (root-owned), so re-own the whole tree, then re-assert the sensitive modes.
+    $SUDO chown -R "$SYS_USER":"$SYS_GROUP" "$BRIDGE"
+    $SUDO chmod 2770 "$BRIDGE" "$BRIDGE/status" "$BRIDGE/identities"
+    [ -f "$BRIDGE/secret.key" ]       && $SUDO chmod 640 "$BRIDGE/secret.key"
+    [ -f "$BRIDGE/connections.json" ] && $SUDO chmod 660 "$BRIDGE/connections.json"
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable --now cc2cc-daemon
     [ "$WANT_HUB" = 1 ] && $SUDO systemctl enable --now cc2cc-hub
+    # On a re-install the unit env/token or connections.json may have changed, and `enable --now`
+    # won't restart an already-running service — so bounce both, keeping the hub and daemon agreed
+    # on the (possibly regenerated) token and letting the daemon pick up the relay config.
+    [ "$WANT_HUB" = 1 ]   && $SUDO systemctl restart cc2cc-hub
+    [ "$WANT_RELAY" = 1 ] && $SUDO systemctl restart cc2cc-daemon
+    $SUDO systemctl enable --now cc2cc.target   # umbrella: systemctl start|stop|restart cc2cc.target
     c "global install complete. Each account joins with:"
-    echo "    cc2cc-install.sh register-client --bridge $BRIDGE${WANT_ENCRYPT:+ --encrypt}"
+    echo "    cc2cc-install register-client       # auto-detects $BRIDGE + staged code (un-join: cc2cc-install unregister-client)"
     [ "$WANT_HUB" = 1 ] && echo "    (hub on 127.0.0.1:$HUB_PORT, token in $ETC/hub.env)"
     summary
   fi
@@ -341,10 +419,39 @@ do_register_client(){
   BRIDGE="${BRIDGE:-$GLOBAL_ROOT}"
   [ -d "$BRIDGE" ] || die "bridge $BRIDGE does not exist (run install first?)"
   [ -r "$BRIDGE/secret.key" ] || warn "can't read $BRIDGE/secret.key — are you in group $SYS_GROUP? (newgrp $SYS_GROUP / re-login)"
-  # Match the bridge: a relay-configured bridge requires CC2CC_ENCRYPT on the client too.
-  if [ "$WANT_ENCRYPT" = 0 ] && { [ -f "$BRIDGE/connections.json" ] || [ -f "$BRIDGE/relay.json" ]; }; then WANT_ENCRYPT=1; fi
-  register_mcp "$BRIDGE" "$REPO/channel/server.mjs" "$WANT_ENCRYPT"
+  # Resolve the MCP server from the globally-staged code when wiring to the global bridge, so it
+  # works no matter which copy of this script ran (repo checkout vs the /usr/local/bin symlink) —
+  # the caller never has to point at a path.
+  local srv="$REPO/channel/server.mjs"
+  if [ "$BRIDGE" = "$GLOBAL_ROOT" ] && [ -f "$OPT_ROOT/channel/server.mjs" ]; then srv="$OPT_ROOT/channel/server.mjs"; fi
+  # A global / relay-configured bridge always encrypts over the wire — match it on the client.
+  if [ "$BRIDGE" = "$GLOBAL_ROOT" ] || [ -f "$BRIDGE/connections.json" ] || [ -f "$BRIDGE/relay.json" ]; then WANT_ENCRYPT=1; fi
+  register_mcp "$BRIDGE" "$srv" "$WANT_ENCRYPT"
   c "this account is now wired to $BRIDGE. Launch: cc2cc-launch <identity>"
+}
+
+# Remove THIS user's cc2cc MCP entry (inverse of register-client). Per-user, no privilege and no
+# path needed; leaves the shared bridge and any system services untouched.
+do_unregister_client(){
+  if command -v claude >/dev/null && claude mcp remove --scope user cc2cc >/dev/null 2>&1; then
+    c "removed mcpServers.cc2cc from ~/.claude.json (via 'claude mcp remove')"
+  else
+    python3 - <<'PY'
+import json, os, pathlib, tempfile
+p = pathlib.Path(os.path.expanduser("~/.claude.json"))
+if not p.exists():
+    print("  ~/.claude.json not found — nothing to do"); raise SystemExit
+try: cfg = json.loads(p.read_text() or "{}")
+except Exception: cfg = {}
+if cfg.get("mcpServers", {}).pop("cc2cc", None) is None:
+    print("  (no cc2cc entry)")
+else:
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".claude.json.")   # atomic: temp + replace
+    with os.fdopen(fd, "w") as f: f.write(json.dumps(cfg, indent=2))
+    os.replace(tmp, p); print("  removed mcpServers.cc2cc (direct)")
+PY
+  fi
+  c "this account is no longer wired to cc2cc."
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -352,8 +459,11 @@ do_register_client(){
 # ═══════════════════════════════════════════════════════════════════════════════
 do_uninstall(){
   if [ -z "$SCOPE" ]; then SCOPE="$(ask 'Uninstall scope (local/global)' local)"; fi
-  # Always offer to remove THIS user's MCP entry.
-  if askyn "Remove mcpServers.cc2cc from ~/.claude.json?" y; then
+  # ~/.claude.json is a PER-USER artifact, not system state — only the local (non-sudo) uninstall
+  # touches it. The global uninstall runs as root (sudo $HOME=/root), so it can't even reach the
+  # invoking user's ~/.claude.json; un-registering there stays each user's own job (their own
+  # `local` uninstall, or `claude mcp remove --scope user cc2cc`).
+  if [ "$SCOPE" = local ] && askyn "Remove mcpServers.cc2cc from ~/.claude.json?" y; then
     python3 - <<'PY'
 import json, pathlib, os
 p = pathlib.Path(os.path.expanduser("~/.claude.json"))
@@ -379,6 +489,8 @@ PY
     else c "kept bridge $BRIDGE"; fi
   else  # global — tears down system services + shared state; privileged users only
     require_priv "uninstall --scope global"
+    $SUDO systemctl disable --now cc2cc.target 2>/dev/null || true   # umbrella (a .target, not .service)
+    $SUDO rm -f /etc/systemd/system/cc2cc.target
     for svc in cc2cc-hub cc2cc-daemon; do
       $SUDO systemctl disable --now "$svc" 2>/dev/null || true
       $SUDO rm -f "/etc/systemd/system/$svc.service"
@@ -395,6 +507,7 @@ PY
       $SUDO userdel "$SYS_USER" 2>/dev/null || true
       $SUDO groupdel "$SYS_GROUP" 2>/dev/null || true
     fi
+    c "per-user MCP entries (~/.claude.json) left intact — each user un-registers with: claude mcp remove --scope user cc2cc"
   fi
   c "uninstall done."
 }
@@ -419,7 +532,7 @@ summary(){
 
   scope:   $SCOPE
   bridge:  $BRIDGE   (secret.key $( [ -e "$BRIDGE/secret.key" ] && echo present || echo MISSING ))
-  mcp:     ~/.claude.json  mcpServers.cc2cc -> $REPO/channel/server.mjs
+  mcp:     server $REPO/channel/server.mjs  $( [ "$SCOPE" = global ] && echo "(per-account: cc2cc-install register-client)" || echo "(registered in ~/.claude.json)" )
   relay:   $( [ "$WANT_RELAY" = 1 ] && echo "client -> connections.json" || echo "(none)" )
   hub:     $( [ "$WANT_HUB" = 1 ] && echo "running (port $HUB_PORT)" || echo "(none)" )
   encrypt: $( [ "$WANT_ENCRYPT" = 1 ] && echo "CC2CC_ENCRYPT=1 (required)" || echo "off (local plaintext)" )
@@ -432,8 +545,9 @@ EOF
 }
 
 case "$ACTION" in
-  install)         do_install;;
-  register-client) do_register_client;;
-  uninstall)       do_uninstall;;
-  status)          do_status;;
+  install)            do_install;;
+  register-client)    do_register_client;;
+  unregister-client)  do_unregister_client;;
+  uninstall)          do_uninstall;;
+  status)             do_status;;
 esac
