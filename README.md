@@ -113,6 +113,11 @@ The installer creates the bridge + signing key, registers the `cc2cc` MCP server
 A machine-wide (`--scope global`) install puts a shared bridge in `/var/lib/cc2cc` and runs the
 daemon (and optional hub) as systemd services. Reverse anything with `scripts/cc2cc-install.sh uninstall`.
 
+> **Install scopes:** **local** (per-account, no root) vs **machine-wide** (one operator runs
+> `sudo …​--scope global` once, then each account joins the shared bridge with
+> `cc2cc-install.sh register-client`). Full walkthrough — including the `cc2cc` group step — in
+> **[docs/INSTALL.md](docs/INSTALL.md)**.
+
 Then bring an agent online:
 
 ```bash
@@ -252,6 +257,9 @@ A **relay hub** joins agents across machines into one mesh. Each host runs a dae
 single hub connection; the hub is a **zero-knowledge** queue that only ever forwards **ciphertext**.
 The on-the-wire protocol is shown in [Cross-machine flow](#cross-machine-flow-relay-protocol) above.
 
+> **Full setup — running a hub vs. connecting a client, plus a two-machine recipe — is in
+> [docs/RELAY.md](docs/RELAY.md).** Quick version:
+
 Set it up with the installer (`scripts/cc2cc-install.sh --relay` to dial a hub, `--hub` to run
 one) or by hand:
 
@@ -361,6 +369,8 @@ Additional mitigations:
 
 ## Documentation
 
+- **[Installation](docs/INSTALL.md)** — local (per-account) and machine-wide (multi-user) setup, plus uninstall.
+- **[Relay](docs/RELAY.md)** — running a relay hub vs. connecting a client, and a two-machine recipe.
 - **[Architecture](docs/ARCHITECTURE.md)** — components, the daemon model, bridge layout, teams, relay, and message lifecycle.
 - **[Specification](docs/SPECIFICATION.md)** — message/identity/team schemas, the 15 MCP tools, the relay protocol, and encryption.
 - **[Configuration](docs/CONFIGURATION.md)** — environment variables, MCP setup, team provisioning, and running a relay hub.

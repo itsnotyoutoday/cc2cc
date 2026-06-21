@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # cc2cc-install.sh — unified, interactive, idempotent installer + uninstaller for cc2cc.
 #
-# DRAFT proposal by tom (team nexus). Not yet wired into the repo. Safe to read; do NOT run
-# against an account whose ~/.cc2cc / ~/.claude.json you care about without reviewing first.
+# Idempotent — safe to re-run. Local scope needs no root; global scope requires root/sudo.
+# Full guide: docs/INSTALL.md (and docs/RELAY.md for cross-machine relay).
 #
 # Two install SCOPES:
 #   local   — per-account. Bridge in ~/.cc2cc, MCP registered in this user's ~/.claude.json.
@@ -29,6 +29,8 @@
 #   --hub-port N                hub port (default 10322)
 #   --hub-token TOK             hub auth token (default: generated)
 #   --venv DIR                  python venv for cc2cc-admin + hub deps (default: <bridge>/venv)
+#   --add-user NAME             (global) add NAME to the 'cc2cc' group so it can read the shared
+#                               secret.key; repeatable. Re-run global install to add more later.
 #   --encrypt                   require CC2CC_ENCRYPT=1 (mandatory if --relay/--hub)
 #   --non-interactive           never prompt; use flags + defaults
 #   --yes                       assume "yes" to destructive confirms (uninstall)
@@ -45,7 +47,7 @@ ACTION="${1:-install}"; [[ "$ACTION" =~ ^(install|uninstall|register-client|stat
 
 SCOPE=""; REPO="$REPO_GUESS"; BRIDGE=""; WANT_RELAY=0; WANT_HUB=0
 HUB_PORT=10322; HUB_TOKEN=""; VENV=""; WANT_ENCRYPT=0; INTERACTIVE=1; ASSUME_YES=0
-SYS_USER="cc2cc"; SYS_GROUP="cc2cc"; GLOBAL_ROOT="/var/lib/cc2cc"; ETC="/etc/cc2cc"; OPT_ROOT="/opt/cc2cc"
+SYS_USER="cc2cc"; SYS_GROUP="cc2cc"; GLOBAL_ROOT="/var/lib/cc2cc"; ETC="/etc/cc2cc"; OPT_ROOT="/opt/cc2cc"; ADD_USERS=""
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --scope) SCOPE="$2"; shift 2;;
@@ -56,6 +58,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --hub-port) HUB_PORT="$2"; shift 2;;
   --hub-token) HUB_TOKEN="$2"; shift 2;;
   --venv) VENV="$2"; shift 2;;
+  --add-user) ADD_USERS="$ADD_USERS $2"; shift 2;;
   --encrypt) WANT_ENCRYPT=1; shift;;
   --non-interactive) INTERACTIVE=0; shift;;
   --yes) ASSUME_YES=1; shift;;
@@ -303,6 +306,10 @@ do_install(){
     c "global install → code $REPO, shared bridge $BRIDGE (group $SYS_GROUP)"
     getent group "$SYS_GROUP" >/dev/null || $SUDO groupadd --system "$SYS_GROUP"
     id "$SYS_USER" >/dev/null 2>&1 || $SUDO useradd --system --no-create-home --gid "$SYS_GROUP" --shell /usr/sbin/nologin "$SYS_USER"
+    for u in $ADD_USERS; do
+      if id "$u" >/dev/null 2>&1; then c "adding '$u' to group $SYS_GROUP (re-login / newgrp to take effect)"; $SUDO usermod -aG "$SYS_GROUP" "$u" || warn "could not add $u to $SYS_GROUP";
+      else warn "--add-user: no such user '$u'"; fi
+    done
     $SUDO mkdir -p "$BRIDGE/status" "$BRIDGE/identities"
     $SUDO chgrp -R "$SYS_GROUP" "$BRIDGE"
     $SUDO chmod 2770 "$BRIDGE" "$BRIDGE/status" "$BRIDGE/identities"   # setgid: shared writable
