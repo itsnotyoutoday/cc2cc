@@ -224,7 +224,9 @@ The agent uses the cc2cc MCP tools directly. Full surface:
 - `set_status(text)` — set your status line (e.g. "reviewing PR #42")
 
 **Teams (membership & governance)**
-- `create_team(name)` — create a team; you become its leader
+- `create_team(name)` — create a NEW team; you become its leader
+- `claim_team(name)` — adopt an existing **leaderless** team (leader=null) or one referenced by
+  members but with no owning policy yet; you become its leader and existing members are folded in
 - `request_join(team)` — ask a team's leader to admit you
 - `admit(name)` / `evict(name)` — **leaders only**, for their own team
 

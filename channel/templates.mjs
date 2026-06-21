@@ -28,7 +28,10 @@ export const DEFAULT_TEMPLATES = {
   admitted: 'Admitted "{{agent}}" to "{{team}}".',
   evicted: 'Removed "{{agent}}" from "{{team}}".',
   team_created: 'Created team "{{team}}" — you are its leader.',
-  team_exists: 'Team "{{team}}" already exists.',
+  team_exists: 'Team "{{team}}" already exists — if it is leaderless, use claim_team to adopt it.',
+  team_claimed: 'Claimed leadership of "{{team}}" — you are now its leader.',
+  team_has_leader: 'Team "{{team}}" already has a leader ({{leader}}). Use request_join, or ask them to hand off.',
+  team_remote_owned: 'Team "{{team}}" is owned by another machine — claim it there.',
   not_registered: 'You are not in the cc2cc system yet — register first.',
 
   // ── Message age / staleness (shown to the RECIPIENT on read) ──

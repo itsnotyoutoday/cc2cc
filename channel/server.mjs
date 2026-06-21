@@ -4,9 +4,9 @@
  * CC2CC MCP Channel Server v3.6
  *
  * Unified multi-agent communication server with dynamic identity.
- * Auto-generates a unique name on startup, discovers peers via heartbeats, and exposes 15 MCP
+ * Auto-generates a unique name on startup, discovers peers via heartbeats, and exposes 16 MCP
  * tools: whoami, list_agents, list_teams, send, send_team, broadcast, reply, check_inbox,
- * register, register_relay, set_status, create_team, request_join, admit, evict.
+ * register, register_relay, set_status, create_team, claim_team, request_join, admit, evict.
  *
  * Ephemeral mailboxes: on startup, stale agent directories are cleaned up.
  * Sending to offline agents is rejected — mailboxes only exist for active sessions.
@@ -22,7 +22,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readdir, readFile, rename, mkdir, writeFile, stat, rm } from "fs/promises";
+import { readdir, readFile, rename, mkdir, writeFile, stat, rm, chmod } from "fs/promises";
 import { writeFileSync, readFileSync } from "fs";
 import { join, basename, dirname } from "path";
 import { randomUUID, randomBytes, createCipheriv, createDecipheriv, scryptSync } from "crypto";
@@ -234,12 +234,35 @@ async function retryRename(src, dst, retries = 5, delayMs = 50) {
 }
 
 /** Atomic write: tmp file → rename */
+// The bridge dir is shared by every agent in the `cc2cc` group, each running its server as a
+// DIFFERENT OS user. If a write inherits a restrictive umask (notably root's), the resulting
+// file/dir is unreadable/unwritable to the other group members — which is exactly how teams.json
+// became root:600 (peers saw leader=null) and how a peer's inbox dir lost group-write (cross-user
+// reply → EACCES). Force group rw on files (0o660) and setgid + group rwx on the dirs we create
+// (0o2770) so collaboration survives whatever umask the writing user happens to have. Best-effort:
+// chmod can fail when we are not the file's owner (another user wrote it first) — that's fine, the
+// owner already created it group-accessible, so we ignore the error rather than abort the write.
+async function chmodQuiet(path, mode) {
+  try { await chmod(path, mode); } catch { /* not owner / race — acceptable */ }
+}
+
+// Create a bridge dir as setgid + group-rwx (0o2770) so a peer running as a different OS user can
+// write/move/scan it regardless of the creator's umask. Use this for EVERY bridge dir — not just
+// ones that later receive an atomicWrite — because some dirs are populated by rename (done/) or
+// scanned cross-agent (cleanup), paths atomicWrite's own dir-chmod never covers.
+async function ensureDir(path) {
+  await mkdir(path, { recursive: true });
+  await chmodQuiet(path, 0o2770);
+}
+
 async function atomicWrite(targetPath, data) {
   const dir = dirname(targetPath);
-  await mkdir(dir, { recursive: true });
+  await ensureDir(dir);
   const tmpPath = join(dir, `.tmp-${randomUUID()}.json`);
   await writeFile(tmpPath, JSON.stringify(data, null, 2));
+  await chmodQuiet(tmpPath, 0o660);
   await retryRename(tmpPath, targetPath);
+  await chmodQuiet(targetPath, 0o660);
 }
 
 /** Build a message object (encrypts content.text if encryption enabled) */
@@ -653,6 +676,17 @@ const TOOLS = [
       required: ["team", "agent"],
     },
   },
+  {
+    name: "claim_team",
+    description: "Claim leadership of an existing LEADERLESS team (leader=null), or adopt a team referenced by members that has no owning policy on this machine. You become its leader. Refuses if the team already has a leader (use request_join, or have the leader hand off) or is owned by another machine.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Team to claim leadership of" },
+      },
+      required: ["team"],
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -697,6 +731,8 @@ server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
         result = await handleAdmit(args); break;
       case "evict":
         result = await handleEvict(args); break;
+      case "claim_team":
+        result = await handleClaimTeam(args); break;
       default:
         return textResult(`Unknown tool: ${toolName}`, true);
     }
@@ -806,7 +842,7 @@ async function handleSend({ to, text, type = "message", priority = "normal" }) {
 
   const msg = buildMessage({ from: agentName, to, text, type, priority });
   const targetInbox = inboxDir(to);
-  await mkdir(targetInbox, { recursive: true });
+  await ensureDir(targetInbox);
   await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
 
   log("info", "message sent", { id: msg.id, to });
@@ -827,7 +863,7 @@ async function handleBroadcast({ text, priority = "normal" }) {
   for (const to of targets) {
     const msg = buildMessage({ from: agentName, to, text, type: "message", priority });
     const targetInbox = inboxDir(to);
-    await mkdir(targetInbox, { recursive: true });
+    await ensureDir(targetInbox);
     await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
     results.push({ to, id: msg.id, online: isAgentOnline(to) });
   }
@@ -944,7 +980,7 @@ async function handleReply({ msg_id, text }) {
   });
 
   const targetInbox = inboxDir(to);
-  await mkdir(targetInbox, { recursive: true });
+  await ensureDir(targetInbox);
   await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
 
   log("info", "reply sent", { id: msg.id, to, replyTo: msg_id });
@@ -988,7 +1024,7 @@ async function handleSendTeam({ team, text, intent = "message", priority = "norm
     };
 
     const targetInbox = inboxDir(leader);
-    await mkdir(targetInbox, { recursive: true });
+    await ensureDir(targetInbox);
     await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
 
     log("info", "cross-team message sent", { id: msg.id, from_team: fromTeam, to_team: team, leader });
@@ -1125,16 +1161,16 @@ async function handleRegister({ name: newName }) {
     agentIdentity.display_name = newName;
     await saveIdentity(agentIdentity);
   }
-  await mkdir(inboxDir(agentName), { recursive: true });
-  await mkdir(doneDir(agentName), { recursive: true });
-  await mkdir(receiptsDir(agentName), { recursive: true });
+  await ensureDir(inboxDir(agentName));
+  await ensureDir(doneDir(agentName));
+  await ensureDir(receiptsDir(agentName));
   await writeHeartbeat("active", `renamed from ${oldName}`);
 
   const targets = allAgentNames();
   for (const to of targets) {
     const msg = buildMessage({ from: agentName, to, text: `Agent "${oldName}" is now "${agentName}"`, type: "status" });
     const targetInbox = inboxDir(to);
-    await mkdir(targetInbox, { recursive: true });
+    await ensureDir(targetInbox);
     try {
       await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
     } catch (err) {
@@ -1168,8 +1204,8 @@ async function consumeInbox() {
 async function _consumeInbox() {
   if (!agentName) return []; // dormant session (no identity yet) → no inbox to consume
   const primary = inboxDir(agentName);
-  await mkdir(primary, { recursive: true });
-  await mkdir(doneDir(agentName), { recursive: true });
+  await ensureDir(primary);
+  await ensureDir(doneDir(agentName));
 
   const inboxPaths = [primary];
 
@@ -1200,7 +1236,7 @@ async function _consumeInbox() {
         const msg = decryptMessage(JSON.parse(raw));
         if (!msg) {
           const done = doneDir(agentName);
-          await mkdir(done, { recursive: true });
+          await ensureDir(done);
           await retryRename(filePath, join(done, file));
           continue;
         }
@@ -1210,7 +1246,7 @@ async function _consumeInbox() {
           const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
           if (age > msg.ttl) {
             const done = doneDir(agentName);
-            await mkdir(done, { recursive: true });
+            await ensureDir(done);
             await retryRename(filePath, join(done, file));
 
             // Security (B1): msg.from is attacker-controllable on relayed mail. Only echo an
@@ -1225,7 +1261,7 @@ async function _consumeInbox() {
                 replyTo: msg.id,
               });
               const senderInbox = inboxDir(msg.from);
-              await mkdir(senderInbox, { recursive: true });
+              await ensureDir(senderInbox);
               try {
                 await atomicWrite(join(senderInbox, `${expNotice.id}.json`), expNotice);
               } catch { /* best effort */ }
@@ -1237,7 +1273,7 @@ async function _consumeInbox() {
 
         // Write delivery receipt
         const receiptPath = receiptsDir(agentName);
-        await mkdir(receiptPath, { recursive: true });
+        await ensureDir(receiptPath);
         await atomicWrite(join(receiptPath, `${msg.id}.receipt.json`), {
           msg_id: msg.id,
           delivered_at: new Date().toISOString(),
@@ -1246,7 +1282,7 @@ async function _consumeInbox() {
 
         // Move to done/
         const done = doneDir(agentName);
-        await mkdir(done, { recursive: true });
+        await ensureDir(done);
         await retryRename(filePath, join(done, file));
 
         // Mark as seen so pollInbox won't re-notify
@@ -1378,7 +1414,7 @@ async function _pollInbox() {
         const raw = await readFile(filePath, "utf8");
         const msg = decryptMessage(JSON.parse(raw));
         if (!msg) {
-          await mkdir(doneDir(agentName), { recursive: true });
+          await ensureDir(doneDir(agentName));
           await retryRename(filePath, join(doneDir(agentName), file));
           continue;
         }
@@ -1387,7 +1423,7 @@ async function _pollInbox() {
         if (msg.timestamp && msg.ttl) {
           const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
           if (age > msg.ttl) {
-            await mkdir(doneDir(agentName), { recursive: true });
+            await ensureDir(doneDir(agentName));
             await retryRename(filePath, join(doneDir(agentName), file));
             log("info", "message expired (poll)", { id: msg.id });
             continue;
@@ -1615,6 +1651,23 @@ function effectiveTeams(name, teams) {
 
 function leadsTeam(team) { return teamLeaders.get(team) === agentName; }
 
+/** Names of all agents whose identity file lists `team` in its teams[] — the set of members
+ *  that already consider themselves part of the team, online or not. Used by claim_team to fold
+ *  existing members into the owning roster on adoption. */
+async function membersReferencing(team) {
+  const out = new Set();
+  let files;
+  try { files = await readdir(join(BRIDGE_DIR, "identities")); } catch { return out; }
+  await Promise.all(files.map(async (f) => {
+    if (!f.startsWith("identity-") || !f.endsWith(".json")) return;
+    try {
+      const id = JSON.parse(await readFile(join(BRIDGE_DIR, "identities", f), "utf8"));
+      if (id?.display_name && Array.isArray(id.teams) && id.teams.includes(team)) out.add(id.display_name);
+    } catch { /* unreadable/malformed identity — skip */ }
+  }));
+  return out;
+}
+
 async function loadOrInitTeam(team) {
   let t = await loadTeamFile(team);
   if (!t) {
@@ -1686,6 +1739,55 @@ async function handleCreateTeam({ name, admission, retention_days } = {}) {
   reconcileTeamLeaders();
   log("info", "team created", { team: name, by: agentName });
   return textResult(tpl("team_created", { team: name }));
+}
+
+// MCP runtime: claim leadership of an existing LEADERLESS team, or adopt a team that
+// members reference (teams=[...]) but which has no owning policy on this machine. This is
+// the missing in-session path between create_team (NEW teams only) and admit/evict (need
+// to already lead). Two invariants close the bugs this fixes:
+//   1) Refuse if the team already has a leader (avoid coups) or is owned elsewhere (federation).
+//   2) Fold every agent that already references the team into admitted[], so adoption does not
+//      leave existing members in the GAB-but-not-in-roster limbo (the follow-on inconsistency).
+async function handleClaimTeam({ team } = {}) {
+  if (!participating || !agentIdentity) return textResult(tpl("not_registered"), true);
+  if (!team || !validateName(team)) return textResult(`Invalid team name "${team}".`, true);
+  await loadTeamPolicies();
+  const current = teamLeaders.get(team) || null;
+  if (current && current !== agentName) {
+    return textResult(tpl("team_has_leader", { team, leader: current }), true);
+  }
+  const mid = relay.getRelayStatus?.()?.machine_id || "local";
+  const existing = await loadTeamFile(team);
+  // A team owned by another machine (federated replica, or a local entry stamped elsewhere)
+  // must be claimed on its owner — adopting it here would fork ownership.
+  const replica = await loadTeamsReplica();
+  const remoteOwner = existing?.owner_machine || replica[team]?.owner_machine;
+  if (remoteOwner && remoteOwner !== mid) {
+    return textResult(tpl("team_remote_owned", { team }), true);
+  }
+  const t = await loadOrInitTeam(team);
+  t.owner_machine = mid;
+  t.leader = agentName;
+  // Fold in everyone who already considers themselves on this team (identity teams=[...]),
+  // preserving any prior admitted entries. Read from the identity files on disk — not just live
+  // heartbeats — so members that are currently OFFLINE are still adopted rather than stranded in
+  // the GAB-but-not-in-roster limbo. Excludes agents revoked from the team.
+  const members = new Set(t.admitted || []);
+  members.add(agentName);
+  for (const name of await membersReferencing(team)) {
+    if (!isRevoked(name, team)) members.add(name);
+  }
+  t.admitted = [...members];
+  t.revoked = (t.revoked || []).filter((n) => n !== agentName);
+  await saveTeamFile(t);
+  if (!agentIdentity.teams.includes(team)) {
+    agentIdentity.teams.push(team);
+    await saveIdentity(agentIdentity);
+  }
+  await loadTeamPolicies();
+  reconcileTeamLeaders();
+  log("info", "team claimed", { team, by: agentName, admitted: t.admitted.length });
+  return textResult(tpl("team_claimed", { team }));
 }
 
 /**
@@ -1868,10 +1970,10 @@ async function activate(candidateName) {
   await cleanupStaleMailboxes();
 
   // 6. Create directories
-  await mkdir(inboxDir(agentName), { recursive: true });
-  await mkdir(doneDir(agentName), { recursive: true });
-  await mkdir(receiptsDir(agentName), { recursive: true });
-  await mkdir(statusDir(), { recursive: true });
+  await ensureDir(inboxDir(agentName));
+  await ensureDir(doneDir(agentName));
+  await ensureDir(receiptsDir(agentName));
+  await ensureDir(statusDir());
 
   // 7. Write initial heartbeat (includes teams from identity)
   await writeHeartbeat("active", "session started");
@@ -1894,9 +1996,9 @@ async function activate(candidateName) {
     agentIdentity.display_name = newName;
     await saveIdentity(agentIdentity);
     // Re-create directories and write heartbeat with new name
-    await mkdir(inboxDir(agentName), { recursive: true });
-    await mkdir(doneDir(agentName), { recursive: true });
-    await mkdir(receiptsDir(agentName), { recursive: true });
+    await ensureDir(inboxDir(agentName));
+    await ensureDir(doneDir(agentName));
+    await ensureDir(receiptsDir(agentName));
     await writeHeartbeat("active", "session started");
   }
 
