@@ -296,25 +296,24 @@ export function getRemoteTeamStatus(team) {
 }
 
 export function getRemoteAgents() {
-  // STUB until v3.6 §3: this returns [] in practice because the relay client does
-  // not yet send the local agent roster to the Hub (register/keepalive carry no
-  // agents), so remoteTeams[].agents is always empty. Cross-machine agent-level
-  // visibility (v3.5 AC4) is descoped to v3.6 §3. The consume side below is already
-  // built; only link #1 (sending the roster) is missing.
+  // Returns the cross-machine roster. doHeartbeat folds the local agent roster (name →
+  // {status_text, role}) into /api/heartbeat, which the hub stores and serves back via
+  // online_teams; the poll loop persists it to remote-teams.json. Each entry carries role
+  // stamped by the owning machine, so leader/member is correct without a separate lookup.
   pruneExpiredRemoteTeams();
   const agents = [];
   for (const [team, data] of remoteTeams) {
     const active = isActive(data);
     for (const [agentName, agentData] of Object.entries(data.agents || {})) {
-      const statusText = (typeof agentData === "object" && agentData !== null)
-        ? (agentData.status_text || "Idle")
-        : "Idle";
+      const obj = (typeof agentData === "object" && agentData !== null) ? agentData : {};
+      const statusText = obj.status_text || "Idle";
       agents.push({
         name: agentName,
         team,
         machine_id: data.machine_id,
         status: active ? "online" : "offline",
         status_text: active ? statusText : null,
+        role: obj.role || undefined, // stamped by the owner; merge layer may fall back if absent
         last_seen: data.polled_at || null,
         is_remote: true,
       });
@@ -606,6 +605,22 @@ async function doRegister(bridgeDir, teamName) {
 export async function doHeartbeat(bridgeDir, teamName) {
   if (!config) return;
 
+  // Federate the team policies THIS machine owns. Read first so we know the team's leader and
+  // can stamp role onto each agent below — role then travels WITH the synced roster
+  // (remote-teams.json), not via the separate policy replica which can lag the roster and make
+  // every remote agent look like a "member". (rlead's correction of the two-file coupling.)
+  let ownedPolicies = {};
+  try {
+    const reg = JSON.parse(await readFile(join(bridgeDir, "teams.json"), "utf8"));
+    for (const [tname, pol] of Object.entries(reg.teams || {})) {
+      // Federate teams this machine OWNS, OR the team this daemon is registered for on the hub
+      // (it authoritatively holds that (machine, team) slot). The second clause guards against a
+      // stale/mismatched owner_machine silently suppressing federation.
+      if (pol && (pol.owner_machine === config.machine_id || tname === teamName)) ownedPolicies[tname] = pol;
+    }
+  } catch { /* no teams.json */ }
+  const teamLeader = ownedPolicies[teamName]?.leader || null;
+
   let agents = {};
   const statusDir = join(bridgeDir, "status");
   try {
@@ -626,25 +641,13 @@ export async function doHeartbeat(bridgeDir, teamName) {
       // Freshness: use HEARTBEAT_STALE_S for presence accuracy
       if (hbAge > HEARTBEAT_STALE_S) continue;
 
-      agents[agentName] = { status_text: hb.status_text || "Idle" };
+      // Stamp role from the authoritative owner so it rides the synced roster (per-agent value
+      // stays an object → no structural change to reg.agents/online_teams/remote-teams.json).
+      agents[agentName] = { status_text: hb.status_text || "Idle", role: agentName === teamLeader ? "leader" : "member" };
     }
   } catch (_) {
     // Status directory may not exist — non-fatal
   }
-
-  // Federate the team policies THIS machine owns (teams.json entries owner_machine == us).
-  let ownedPolicies = {};
-  try {
-    const reg = JSON.parse(await readFile(join(bridgeDir, "teams.json"), "utf8"));
-    for (const [tname, pol] of Object.entries(reg.teams || {})) {
-      // Federate teams this machine OWNS, OR the team this daemon is registered for on the hub
-      // (it authoritatively holds that (machine, team) slot). The second clause guards against a
-      // stale/mismatched owner_machine silently suppressing federation — observed cross-account:
-      // a team created before the relay's machine_id was settled keeps an owner_machine that no
-      // longer equals config.machine_id, so its policy was never published and never synced.
-      if (pol && (pol.owner_machine === config.machine_id || tname === teamName)) ownedPolicies[tname] = pol;
-    }
-  } catch { /* no teams.json */ }
 
   // Fold agents + owned team policies into /api/heartbeat (keepalive is separate)
   try {

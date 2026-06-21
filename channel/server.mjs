@@ -749,11 +749,11 @@ function handleListAgents() {
   const local = getAgentList();
   let remote = [];
   if (relayActive()) {
-    // Enrich remote agents with role: the team leader is already federated into teamLeaders
-    // (via team_policies), and roleOf derives role purely from that registry — so a remote
-    // agent's leader/member role is correct without storing it in the relayed roster. (tom's
-    // find; root-caused by rlead — fix at the merge layer, no heartbeat/hub change.)
-    remote = relay.getRemoteAgents().map((a) => ({ ...a, role: a.team ? roleOf(a.name, [a.team]) : undefined }));
+    // Remote agents carry role stamped by their owning machine (rides remote-teams.json with
+    // the roster). Prefer that; fall back to deriving from teamLeaders only when it's absent
+    // (e.g. an agent seen before the role-in-roster upgrade). (tom's find; rlead's root-cause +
+    // correction of the earlier two-file-coupling approach.)
+    remote = relay.getRemoteAgents().map((a) => ({ ...a, role: a.role || (a.team ? roleOf(a.name, [a.team]) : undefined) }));
   }
   return jsonResult([...local, ...remote]);
 }
