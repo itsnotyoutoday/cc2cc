@@ -5,12 +5,10 @@
  *   - machine B (remote): agent "rlead", LEADER/owner of team remote.
  * Drives the real Hub ← Daemon ← MCP stack (spawning server.mjs auto-launches the daemon).
  *
- * Scenario: tom requests to join remote; rlead admits tom; we assert tom actually BECOMES a
- * member (whoami.teams includes remote) and the owner sees him as a remote member.
- *
- * NOTE: this currently REPRODUCES the gap rlead reported — admit is a one-sided owner-roster
- * write, so membership does not propagate to the admitted agent. The membership assertions are
- * the spec for the fix; flip `EXPECT_MEMBERSHIP_FIXED` once admit-propagation lands.
+ * Scenario: tom requests to join remote; rlead admits tom; tom actually BECOMES a member —
+ * whoami.teams includes remote, via federated admitted[] -> self-membership reconcile.
+ * (Regression test for the admit-propagation fix. Part 2 — the owner seeing tom heartbeat
+ * under remote, which needs multi-team daemon registration — is tracked separately.)
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -29,7 +27,6 @@ const { StdioClientTransport } = await import(`${SDK}/stdio.js`);
 
 const TOKEN = "membership-test-token";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const EXPECT_MEMBERSHIP_FIXED = process.env.EXPECT_MEMBERSHIP_FIXED === "1";
 
 let hub;
 const bridges = [];
@@ -98,20 +95,13 @@ describe("cross-machine membership (request_join → admit → propagation)", ()
     const admitRes = txt(await rlead.callTool({ name: "admit", arguments: { team: "remote", agent: "tom" } }));
     assert.match(admitRes, /admitted/i, "leader-side admit succeeds");
 
-    // 4. Does membership propagate to tom? (the reported gap)
+    // 4. Membership propagates to tom via federated admitted[] -> self-reconcile.
     let toms = null;
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 30; i++) {
       await sleep(500);
       toms = await callJSON(tom, "whoami");
       if (toms.teams.includes("remote")) break;
     }
-
-    if (EXPECT_MEMBERSHIP_FIXED) {
-      assert.ok(toms.teams.includes("remote"), "tom's whoami reflects remote membership after admit");
-    } else {
-      // Document the CURRENT behavior so the harness is green until the fix lands.
-      assert.ok(!toms.teams.includes("remote"),
-        "KNOWN GAP: admit is a one-sided roster write — tom never gains remote membership");
-    }
+    assert.ok(toms.teams.includes("remote"), "tom's whoami reflects remote membership after admit");
   });
 });

@@ -1475,6 +1475,44 @@ async function pollStatus() {
   // picked up, breaking send_team routing and list_teams. Doing it every poll closes
   // the race and also drops leaders that have gone offline.
   reconcileTeamLeaders();
+  // Fold any team I've been admitted to (local OR federated) into my own membership. Without
+  // this, admit was a one-sided owner-roster write — the admitted agent never gained membership.
+  await reconcileSelfMembership();
+}
+
+/**
+ * Self-membership reconcile: an agent folds into its OWN teams any team whose admitted[] includes
+ * it (and revoked[] does not) — covering both local teams.json and federated remote-team replicas
+ * (remote-teams.json .policy). Conversely, an explicit revoke removes the team (except a team it
+ * leads). This is what makes `admit` actually grant membership to the admitted agent; the change
+ * rides writeHeartbeat into the roster (and, for a team the daemon registers, federates onward).
+ * NOTE (cross-machine, part 2): for an owner on another machine to see this agent as a real member
+ * heartbeating under the team, the agent's daemon must also REGISTER that team with the hub
+ * (multi-team daemon registration) — tracked separately.
+ */
+async function reconcileSelfMembership() {
+  if (!agentIdentity || !agentName) return;
+  const local = await loadTeamsRegistry();   // teams this machine owns
+  const replica = await loadTeamsReplica();  // teams owned elsewhere, federated here
+  const all = { ...replica, ...local };      // local wins on overlap
+  const teams = new Set(agentIdentity.teams || []);
+  let changed = false;
+  for (const [name, t] of Object.entries(all)) {
+    if (!t) continue;
+    const admitted = Array.isArray(t.admitted) ? t.admitted : [];
+    const revoked = Array.isArray(t.revoked) ? t.revoked : [];
+    if (revoked.includes(agentName) && t.leader !== agentName) {
+      if (teams.delete(name)) changed = true;            // revoke/evict propagates
+    } else if (admitted.includes(agentName) && !teams.has(name)) {
+      teams.add(name); changed = true;                   // admit propagates
+    }
+  }
+  if (changed) {
+    agentIdentity.teams = [...teams];
+    await saveIdentity(agentIdentity);
+    await writeHeartbeat("active", "membership reconciled");
+    log("info", "self-membership reconciled", { teams: agentIdentity.teams });
+  }
 }
 
 /** Load bridge policy.json over the built-in defaults (shallow per-section merge). */
