@@ -24,7 +24,7 @@ const { Client } = await import(`${SDK}/index.js`);
 const { StdioClientTransport } = await import(`${SDK}/stdio.js`);
 const SERVER = join(HERE, "..", "channel", "server.mjs");
 const REPO = join(HERE, "..");
-const PYBIN = "/opt/cc2cc/venv/bin/python3";
+const PYBIN = process.env.PYTHON || "/opt/cc2cc/venv/bin/python3"; // CI-portable: honor PYTHON (fastapi venv)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const txt = (r) => r.content?.[0]?.text ?? "";
 
