@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev-teams-relay]
+  pull_request:
+    branches: [main, dev-teams-relay]
+  schedule:
+    - cron: '0 7 * * *'   # nightly 07:00 UTC — deep contention hammer
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.9', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax check
+        run: |
+          python3 -m py_compile scripts/send.py
+          python3 -m py_compile scripts/reply.py
+          python3 -m py_compile scripts/task.py
+          python3 -m py_compile scripts/validate.py
+          python3 -m py_compile scripts/cleanup.py
+          python3 -m py_compile scripts/init.py
+          python3 -m py_compile scripts/receive.py
+          python3 -m py_compile scripts/status.py
+          python3 -m py_compile hooks/session_start.py
+          python3 -m py_compile hooks/session_end.py
+          python3 -m py_compile hooks/inbox_watcher.py
+
+  # Node MCP/daemon suite + the relay hub fixtures. Needs fastapi/uvicorn for the
+  # hub-backed tests and the channel npm deps (MCP SDK) for the server.
+  node-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install hub deps (fastapi/uvicorn)
+        run: pip install fastapi uvicorn
+      - name: Install channel deps
+        run: npm ci --prefix channel
+      - name: Run node suite
+        env:
+          PYTHON: python3
+        run: node --test --test-force-exit tests/*.mjs
+
+  # Regression fence for the teams.json write-lock contention bugs (breakStaleLock TOCTOU /
+  # re-stat false-positive). These only surface under repeated concurrent load, so we hammer:
+  # 20x on every push/PR (~0.3% miss for a 25% flake), 50x nightly (~6e-7).
+  lock-contention-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          pip install fastapi uvicorn
+          npm ci --prefix channel
+      - name: Hammer lock suites
+        env:
+          PYTHON: python3
+        run: |
+          ITERS=20
+          if [ "${{ github.event_name }}" = "schedule" ]; then ITERS=50; fi
+          bash scripts/ci/hammer-lock.sh "$ITERS"
