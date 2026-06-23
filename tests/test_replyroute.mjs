@@ -42,8 +42,11 @@ async function findMsg(bridge, agent, pred) {
 }
 
 describe("replyRoute (opaque preserve + echo)", () => {
-  let bridge; const clients = [];
-  after(async () => { for (const c of clients) { try { await c.close(); } catch {} } if (bridge) await rm(bridge, { recursive: true, force: true }); });
+  let bridge, bridge2; const clients = [];
+  after(async () => {
+    for (const c of clients) { try { await c.close(); } catch {} }
+    for (const b of [bridge, bridge2]) { if (b) await rm(b, { recursive: true, force: true }); }
+  });
 
   it("preserves replyRoute to the recipient, echoes it back on reply, and omits it when unset", async () => {
     bridge = await mkdtemp(join(tmpdir(), "cc2cc-rr-"));
@@ -100,5 +103,62 @@ describe("replyRoute (opaque preserve + echo)", () => {
     for (let i = 0; i < 24 && !plain; i++) { await sleep(500); plain = await findMsg(bridge, "bob", (m) => m.from === "alice" && /plain/.test(JSON.stringify(m.content || ""))); }
     assert.ok(plain, "plain message reached bob");
     assert.equal("replyRoute" in plain, false, "no replyRoute field when unset");
+  });
+
+  // Threading guarantee (triton, pre-commit review): the bridge is intentionally SHAPE-AGNOSTIC — it
+  // round-trips replyRoute as a fully opaque blob. Threading (v2) carries a threadId INSIDE this token
+  // (plugin-side, e.g. ciphertext in john's AES-GCM payload), in triton's [threadId, metadata?] array
+  // shape. This pins that an ARBITRARY DEEPLY-NESTED token survives proactive-send → echo VERBATIM, so
+  // the plugin can choose any token shape without a bridge change — and a future handleSend refactor
+  // can't silently regress it. The bridge must never need to understand threadId.
+  it("preserves an arbitrary deeply-nested token (threadId-in-replyRoute) through proactive-send→echo", async () => {
+    bridge2 = await mkdtemp(join(tmpdir(), "cc2cc-rr-thread-"));
+    await writeFile(join(bridge2, "teams.json"), JSON.stringify({ teams: {
+      t: { name: "t", owner_machine: "local", leader: "alice", admitted: ["alice", "bob"], revoked: [], rules: { retention_days: 4, admission: "open", sticky_leader: true } },
+    }}));
+    await identity(bridge2, "alice", ["t"]);
+    await identity(bridge2, "bob", ["t"]);
+    const a = await connect(bridge2, "alice"); clients.push(a.client);
+    const b = await connect(bridge2, "bob"); clients.push(b.client);
+    // Same MUTUAL readiness as test 1 (see its comment): both peers must see self + the other online,
+    // so the reply takes the direct-delivery path, not the team-relay fallback.
+    const sees = (roster, peer) =>
+      roster.some((r) => r.is_self && r.status === "online" && (r.teams || []).includes("t")) &&
+      roster.some((r) => r.name === peer && r.status === "online");
+    let ready = false;
+    for (let i = 0; i < 40 && !ready; i++) {
+      await sleep(750);
+      const aRoster = JSON.parse(txt(await a.client.callTool({ name: "list_agents", arguments: {} })));
+      const bRoster = JSON.parse(txt(await b.client.callTool({ name: "list_agents", arguments: {} })));
+      ready = sees(aRoster, "bob") && sees(bRoster, "alice");
+    }
+    assert.ok(ready, "alice and bob each see self + the other online before send/reply");
+
+    // An arbitrary, deeply-nested opaque token: triton's [threadId, metadata?] array shape, plus mixed
+    // types (objects, arrays, number, null, unicode) the bridge must preserve byte-for-byte.
+    const threadRoute = {
+      session: "sess-THREAD-7",
+      plugin: "openclaw-cc2cc",
+      thread: ["main:thread:bob", { channel: "nexus", origin: "main", v: 1 }],
+      meta: { nested: { deep: [1, "two", { three: 3 }, null], note: "ünïcode ✓" } },
+    };
+
+    // 1) PROACTIVE send (not a reply) carries the nested token verbatim to the recipient.
+    const sres = txt(await a.client.callTool({ name: "send", arguments: { to: "bob", text: "thread hi", replyRoute: threadRoute } }));
+    assert.match(sres, /sent|delivered/i, `send returned: ${sres}`);
+    let toBob = null;
+    for (let i = 0; i < 24 && !toBob; i++) { await sleep(500); toBob = await findMsg(bridge2, "bob", (m) => m.from === "alice" && m.replyRoute); }
+    assert.ok(toBob, "alice's threaded message reached bob's store");
+    assert.deepEqual(toBob.replyRoute, threadRoute, "nested threadId-bearing token preserved verbatim to recipient");
+    const originalId = toBob.id;
+
+    // 2) bob's reply ECHOES the same nested token back to alice — completing the round-trip the
+    //    threading reply-routing depends on.
+    const rres = txt(await b.client.callTool({ name: "reply", arguments: { msg_id: originalId, text: "thread re" } }));
+    assert.match(rres, /sent|reply/i, `reply returned: ${rres}`);
+    let toAlice = null;
+    for (let i = 0; i < 24 && !toAlice; i++) { await sleep(500); toAlice = await findMsg(bridge2, "alice", (m) => m.from === "bob" && m.replyTo === originalId); }
+    assert.ok(toAlice, "bob's reply reached alice's store");
+    assert.deepEqual(toAlice.replyRoute, threadRoute, "nested token echoed back VERBATIM on reply");
   });
 });
