@@ -267,8 +267,8 @@ async function atomicWrite(targetPath, data) {
 }
 
 /** Build a message object (encrypts content.text if encryption enabled) */
-function buildMessage({ from, to, text, type = "message", priority = "normal", replyTo = null, task = null }) {
-  return {
+function buildMessage({ from, to, text, type = "message", priority = "normal", replyTo = null, task = null, replyRoute = null }) {
+  const msg = {
     id: `msg-${randomUUID()}`,
     timestamp: new Date().toISOString(),
     from,
@@ -281,6 +281,13 @@ function buildMessage({ from, to, text, type = "message", priority = "normal", r
     replyTo,
     ttl: DEFAULT_TTL,
   };
+  // Opaque reply-route metadata: the bridge PRESERVES it end-to-end (whole-envelope local delivery +
+  // the relay spreads {...msg.message} cross-machine) and ECHOES it on replies (see handleReply), but
+  // NEVER interprets it. Lets a client (e.g. an openclaw plugin) carry a session-routing token that
+  // round-trips back on the reply so the reply lands in the originating session — works for ANY MCP
+  // client because the echo is server-side. Only included when set, to keep envelopes clean.
+  if (replyRoute != null) msg.replyRoute = replyRoute;
+  return msg;
 }
 
 /** Decrypt content.text if encrypted. Returns null on failure — caller must skip/remove the file. */
@@ -531,6 +538,10 @@ const TOOLS = [
           default: "normal",
           description: "Message priority",
         },
+        replyRoute: {
+          type: "object",
+          description: "Optional OPAQUE reply-route metadata (e.g. {session, plugin}). Preserved end-to-end and echoed back on the recipient's reply so it lands in the originating session. The bridge never interprets it.",
+        },
       },
       required: ["to", "text"],
     },
@@ -563,6 +574,10 @@ const TOOLS = [
           description: "Message ID to reply to (from channel notification)",
         },
         text: { type: "string", description: "Reply content" },
+        replyRoute: {
+          type: "object",
+          description: "Optional OPAQUE reply-route override. If omitted, the server auto-echoes the original message's replyRoute back to the sender (the normal path); set it only to re-stamp.",
+        },
       },
       required: ["msg_id", "text"],
     },
@@ -832,7 +847,7 @@ function handleListAgents() {
 
 // ── send ──
 
-async function handleSend({ to, text, type = "message", priority = "normal" }) {
+async function handleSend({ to, text, type = "message", priority = "normal", replyRoute = null }) {
   if (!to || !text) return textResult("Missing required fields: to, text", true);
 
   // Bug 0d fix: if the target is a known REMOTE agent (another machine), a local inbox write
@@ -853,7 +868,7 @@ async function handleSend({ to, text, type = "message", priority = "normal" }) {
     return textResult(`Agent "${to}" is offline. Message not sent. Use list_agents to see who is online.`, true);
   }
 
-  const msg = buildMessage({ from: agentName, to, text, type, priority });
+  const msg = buildMessage({ from: agentName, to, text, type, priority, replyRoute });
   const targetInbox = inboxDir(to);
   await ensureDir(targetInbox);
   await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
@@ -887,7 +902,7 @@ async function handleBroadcast({ text, priority = "normal" }) {
 
 // ── reply ──
 
-async function handleReply({ msg_id, text }) {
+async function handleReply({ msg_id, text, replyRoute = null }) {
   if (!msg_id || !text) return textResult("Missing required fields: msg_id, text", true);
 
   // Try to find the original message — check inbox first (channel push
@@ -990,6 +1005,10 @@ async function handleReply({ msg_id, text }) {
     text,
     type: replyType,
     replyTo: msg_id,
+    // ECHO the original message's opaque reply-route back to the sender so the reply lands in the
+    // originating session. An explicit replyRoute arg overrides (lets a client re-stamp); otherwise we
+    // copy the original's verbatim. Works for ANY MCP client replying — the echo is server-side.
+    replyRoute: replyRoute != null ? replyRoute : (originalMsg?.replyRoute ?? null),
   });
 
   const targetInbox = inboxDir(to);
