@@ -850,6 +850,14 @@ function handleListAgents() {
 async function handleSend({ to, text, type = "message", priority = "normal", replyRoute = null }) {
   if (!to || !text) return textResult("Missing required fields: to, text", true);
 
+  // Self-delivery guard (from==to): a message addressed to oneself lands in the sender's own
+  // inbox, wakes the sender's peer session, and its reply routes back to itself → echo loop.
+  // This loop took the gateway lead (triton) down. Reject at the source. Mirrors the gateway-side
+  // plugin guard (clawman 760b9f1); enforced in core so NON-gateway agents are protected too.
+  if (to === agentName) {
+    return textResult("Cannot send a message to yourself — self-delivery is rejected (prevents a self-DM echo loop).", true);
+  }
+
   // Bug 0d fix: if the target is a known REMOTE agent (another machine), a local inbox write
   // would strand. Relay via that agent's team instead (reaches the team leader).
   const remote = relayActive() ? relay.getRemoteAgents().find((a) => a.name === to) : null;
@@ -979,6 +987,11 @@ async function handleReply({ msg_id, text, replyRoute = null }) {
   if (!validateName(to)) {
     return textResult(`Cannot reply: original sender name "${to}" is malformed.`, true);
   }
+  // Self-delivery guard (from==to): replying to one's own message would deliver back to self and
+  // loop. Reject — same contract as handleSend (see clawman 760b9f1).
+  if (to === agentName) {
+    return textResult(`Cannot reply to your own message ${msg_id} — self-delivery is rejected (prevents a self-DM echo loop).`, true);
+  }
 
   // Auto-complete task type: if original was a task, reply as response
   const replyType = originalMsg.type === "task" ? "response" : "message";
@@ -1036,6 +1049,11 @@ async function handleSendTeam({ team, text, intent = "message", priority = "norm
   const isRemoteTeamTarget = relayActive() && relay.isRemoteTeam(team);
   const leader = teamLeaders.get(team);
   if (leader && !isRemoteTeamTarget) {
+    // Self-delivery guard (from==to): if we ARE the leader, send_team would deliver to our own
+    // inbox and loop. There's no separate recipient to reach. Reject (same contract as handleSend).
+    if (leader === agentName) {
+      return textResult(`You are the leader of "${team}" — send_team delivers to the team leader, so this is a self-delivery (rejected to prevent a loop).`, true);
+    }
     if (!isAgentOnline(leader)) {
       return textResult(tpl("leader_offline", { team, leader }), true);
     }
@@ -1265,7 +1283,24 @@ async function _consumeInbox() {
       try {
         const filePath = join(inbox, file);
         const raw = await readFile(filePath, "utf8");
-        const msg = decryptMessage(JSON.parse(raw));
+        const parsed = JSON.parse(raw);
+
+        // Self-delivery guard (from==to), defense in depth: this is OUR inbox, so a message whose
+        // sender is us is self-addressed. The envelope from/to are plaintext (only content.text is
+        // encrypted), so check BEFORE decrypt — this also retires an undecryptable self-message.
+        // Even if one slipped past the send-side guards (or predates them), DROP it silently — do
+        // NOT write a receipt, notify, or echo an expiry notice, any of which would wake our own
+        // session and re-arm the echo loop. Just retire it to done/.
+        if (parsed.from === agentName) {
+          const done = doneDir(agentName);
+          await ensureDir(done);
+          await retryRename(filePath, join(done, file));
+          seenFiles.add(file);
+          log("warn", "self-delivery dropped", { id: parsed.id });
+          continue;
+        }
+
+        const msg = decryptMessage(parsed);
         if (!msg) {
           const done = doneDir(agentName);
           await ensureDir(done);
