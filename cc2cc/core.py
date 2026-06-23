@@ -11,8 +11,22 @@ MAX_MESSAGE_SIZE = 1_000_000  # 1 MB
 
 
 def bridge_path() -> Path:
-    """Resolve the bridge directory from env or default."""
-    return Path(os.environ.get("CC2CC_BRIDGE_DIR", os.path.expanduser("~/.cc2cc")))
+    """Resolve the bridge directory, MIRRORING cc2cc-launch so cc2cc-admin and the scripts operate on
+    the SAME bridge the daemon + agents use: an explicit CC2CC_BRIDGE_DIR wins; else auto-detect a
+    machine-wide install (/var/lib/cc2cc) before falling back to the per-user local bridge (~/.cc2cc).
+
+    Without this, cc2cc-admin defaulted straight to ~/.cc2cc, so operator team/member writes on a
+    global install silently landed in the wrong (local) store and never took effect on the live mesh.
+    Detect the global install by the DIRECTORY (not a file inside it — a login lacking the cc2cc group
+    can't traverse the bridge to stat secret.key), matching cc2cc-launch's check.
+    """
+    env = os.environ.get("CC2CC_BRIDGE_DIR")
+    if env:
+        return Path(env)
+    global_bridge = Path("/var/lib/cc2cc")
+    if global_bridge.is_dir():
+        return global_bridge
+    return Path(os.path.expanduser("~/.cc2cc"))
 
 
 def room_inbox_path(recipient: str, room_id: str) -> Path:
