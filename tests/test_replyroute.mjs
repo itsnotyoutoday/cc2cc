@@ -57,15 +57,23 @@ describe("replyRoute (opaque preserve + echo)", () => {
     // Wait until alice's roster shows BOTH itself (is_self) and bob online — sharesTeam() needs self
     // folded into the roster (else it falls back to DEFAULT_TEAM and a non-default-team send is
     // wrongly blocked). Self-heartbeat can take a few seconds to land, so poll rather than fixed-sleep.
+    // MUTUAL readiness: alice must see bob AND bob must see alice (each with self folded into its own
+    // roster), on team "t", before any traffic. The reply step is the subtle one — handleReply delivers
+    // directly only when the replier sees the original sender online locally (isAgentOnline); otherwise it
+    // takes the team-relay fallback (handleSendTeam to the leader), whose envelope has no from===bob /
+    // replyTo linkage, so the test's direct-delivery assertion never lands. Waiting only for ALICE's view
+    // (the old check) let bob reply before bob's self-heartbeat folded in → relay fallback → flaky miss.
+    const sees = (roster, peer) =>
+      roster.some((r) => r.is_self && r.status === "online" && (r.teams || []).includes("t")) &&
+      roster.some((r) => r.name === peer && r.status === "online");
     let ready = false;
-    for (let i = 0; i < 20 && !ready; i++) {
+    for (let i = 0; i < 40 && !ready; i++) {   // ~30s: self-heartbeat can be slow on a COLD first run
       await sleep(750);
-      const roster = JSON.parse(txt(await a.client.callTool({ name: "list_agents", arguments: {} })));
-      const self = roster.some((r) => r.is_self && r.status === "online" && (r.teams || []).includes("t"));
-      const peer = roster.some((r) => r.name === "bob" && r.status === "online");
-      ready = self && peer;
+      const aRoster = JSON.parse(txt(await a.client.callTool({ name: "list_agents", arguments: {} })));
+      const bRoster = JSON.parse(txt(await b.client.callTool({ name: "list_agents", arguments: {} })));
+      ready = sees(aRoster, "bob") && sees(bRoster, "alice");
     }
-    assert.ok(ready, "alice sees itself + bob online (same team) before sending");
+    assert.ok(ready, "alice and bob each see self + the other online (same team) before send/reply");
 
     const route = { session: "sess-ABC123", plugin: "openclaw-cc2cc" };
 
@@ -73,7 +81,7 @@ describe("replyRoute (opaque preserve + echo)", () => {
     const sres = txt(await a.client.callTool({ name: "send", arguments: { to: "bob", text: "hi bob", replyRoute: route } }));
     assert.match(sres, /sent|delivered/i, `send returned: ${sres}`);
     let toBob = null;
-    for (let i = 0; i < 10 && !toBob; i++) { await sleep(500); toBob = await findMsg(bridge, "bob", (m) => m.from === "alice" && m.replyRoute); }
+    for (let i = 0; i < 24 && !toBob; i++) { await sleep(500); toBob = await findMsg(bridge, "bob", (m) => m.from === "alice" && m.replyRoute); } // ~12s: cold-start delivery margin
     assert.ok(toBob, "alice's message reached bob's store");
     assert.deepEqual(toBob.replyRoute, route, "replyRoute preserved verbatim to recipient");
     const originalId = toBob.id;
@@ -82,14 +90,14 @@ describe("replyRoute (opaque preserve + echo)", () => {
     const rres = txt(await b.client.callTool({ name: "reply", arguments: { msg_id: originalId, text: "hi alice" } }));
     assert.match(rres, /sent|reply/i, `reply returned: ${rres}`);
     let toAlice = null;
-    for (let i = 0; i < 10 && !toAlice; i++) { await sleep(500); toAlice = await findMsg(bridge, "alice", (m) => m.from === "bob" && m.replyTo === originalId); }
+    for (let i = 0; i < 24 && !toAlice; i++) { await sleep(500); toAlice = await findMsg(bridge, "alice", (m) => m.from === "bob" && m.replyTo === originalId); }
     assert.ok(toAlice, "bob's reply reached alice's store");
     assert.deepEqual(toAlice.replyRoute, route, "reply ECHOED the original replyRoute back to the originator");
 
     // 3) a normal send with NO replyRoute must NOT carry the field (clean envelope, no leakage).
     await a.client.callTool({ name: "send", arguments: { to: "bob", text: "plain" } });
     let plain = null;
-    for (let i = 0; i < 10 && !plain; i++) { await sleep(500); plain = await findMsg(bridge, "bob", (m) => m.from === "alice" && /plain/.test(JSON.stringify(m.content || ""))); }
+    for (let i = 0; i < 24 && !plain; i++) { await sleep(500); plain = await findMsg(bridge, "bob", (m) => m.from === "alice" && /plain/.test(JSON.stringify(m.content || ""))); }
     assert.ok(plain, "plain message reached bob");
     assert.equal("replyRoute" in plain, false, "no replyRoute field when unset");
   });
