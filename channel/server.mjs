@@ -998,19 +998,23 @@ async function handleReply({ msg_id, text, replyRoute = null }) {
   const fromTeam = originalMsg.from_team;
   const myTeams = agentIdentity?.teams || [];
 
-  // Bug 0d fix: the original sender may be on another team / another machine. Writing to a
-  // local inbox would strand the reply (no one there reads it). If the original came
-  // cross-team, or the sender isn't reachable locally, RELAY the reply via send_team to the
-  // sender's team (reaches that team's leader, who can forward).
-  const localOnline = isAgentOnline(to);
-  if (fromTeam && (!myTeams.includes(fromTeam) || !localOnline)) {
-    log("info", "reply relayed via team", { to, team: fromTeam, replyTo: msg_id });
-    const r = await handleSendTeam({ team: fromTeam, text, intent: "reply" });
-    return r;
+  // Route the reply by REACHABILITY, not by transient presence (QA: presence-flap reply-loss bug).
+  // The original sender PROVED they exist by messaging us, and a LOCAL sender's inbox is always writable
+  // (inboxes are async). Gating direct delivery on isAgentOnline() lost the reply (same-team) or
+  // misrouted it to the team leader (cross-team) whenever the sender's heartbeat was momentarily stale
+  // or they were simply idle. So: a genuinely REMOTE sender (another machine, only reachable via the
+  // relay) routes via their team; a LOCAL sender always gets the direct inbox write below — regardless
+  // of online status. (Cross-team-but-local replies keep leader-mediated relay, governance unchanged.)
+  const remoteSender = relayActive() ? relay.getRemoteAgents().find((a) => a.name === to) : null;
+  if (remoteSender && remoteSender.team) {
+    log("info", "reply relayed via remote team", { to, team: remoteSender.team, replyTo: msg_id });
+    return await handleSendTeam({ team: remoteSender.team, text, intent: "reply" });
   }
-  if (!localOnline) {
-    return textResult(`Original sender "${to}" is not reachable locally (likely on another machine) — reply with send_team to their team.`, true);
+  if (fromTeam && !myTeams.includes(fromTeam)) {
+    log("info", "reply relayed via cross-team leader", { to, team: fromTeam, replyTo: msg_id });
+    return await handleSendTeam({ team: fromTeam, text, intent: "reply" });
   }
+  // Local sender (same-team, or no team metadata) → fall through to the direct inbox write below.
 
   const msg = buildMessage({
     from: agentName,

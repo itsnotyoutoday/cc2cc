@@ -33,8 +33,11 @@ async function connect(bridge, name) {
 async function exists(p) { try { await stat(p); return true; } catch { return false; } }
 
 describe("self-delivery guard (from==to rejected)", () => {
-  let bridge; const clients = [];
-  after(async () => { for (const c of clients) { try { await c.close(); } catch {} } if (bridge) await rm(bridge, { recursive: true, force: true }); });
+  let bridge, bridge2; const clients = [];
+  after(async () => {
+    for (const c of clients) { try { await c.close(); } catch {} }
+    for (const b of [bridge, bridge2]) { if (b) await rm(b, { recursive: true, force: true }); }
+  });
 
   it("rejects self send + self send_team(leader), and drops a planted self-addressed inbox message", async () => {
     bridge = await mkdtemp(join(tmpdir(), "cc2cc-sd-"));
@@ -84,5 +87,42 @@ describe("self-delivery guard (from==to rejected)", () => {
     assert.equal(await exists(join(bridge, "to-alice", "done", `${selfMsg.id}.json`)), true, "planted self message retired to done/");
     assert.equal(await exists(join(bridge, "to-alice", "receipts", `${selfMsg.id}.receipt.json`)), false, "dropped self-delivery must NOT write a receipt");
     assert.equal(/planted self loop/.test(resp), false, "dropped self-delivery must NOT surface in the response");
+  });
+
+  // Directly exercise the handleReply self-reject branch (to===originalMsg.from===self). rlead noted
+  // this branch was code-review-only because the receive-side drop removes a self-msg from the inbox
+  // before it can be replied to. Plant the self-addressed original in done/ instead (handleReply looks
+  // up inbox+done; done is not re-consumed, so the drop never touches it) → reply must be rejected.
+  it("rejects replying to one's OWN message (handleReply self-reject branch)", async () => {
+    bridge2 = await mkdtemp(join(tmpdir(), "cc2cc-sd2-"));
+    await writeFile(join(bridge2, "teams.json"), JSON.stringify({ teams: {
+      t: { name: "t", owner_machine: "local", leader: "alice", admitted: ["alice"], revoked: [], rules: { retention_days: 4, admission: "open", sticky_leader: true } },
+    }}));
+    await identity(bridge2, "alice", ["t"]);
+    const a = await connect(bridge2, "alice"); clients.push(a.client);
+    let ready = false;
+    for (let i = 0; i < 20 && !ready; i++) {
+      await sleep(750);
+      const roster = JSON.parse(txt(await a.client.callTool({ name: "list_agents", arguments: {} })));
+      ready = roster.some((r) => r.is_self && r.status === "online");
+    }
+    assert.ok(ready, "alice sees itself online");
+
+    // Plant a self-addressed (from===to===alice) original in alice's done/.
+    const origId = "msg-selfreply-orig-1";
+    const done = join(bridge2, "to-alice", "done");
+    await mkdir(done, { recursive: true });
+    await writeFile(join(done, `${origId}.json`), JSON.stringify({
+      id: origId, timestamp: new Date().toISOString(), from: "alice", to: "alice",
+      type: "message", priority: "normal", content: { text: "my own note", parts: [] }, ttl: 3600,
+    }));
+
+    const rres = txt(await a.client.callTool({ name: "reply", arguments: { msg_id: origId, text: "loop me" } }));
+    assert.match(rres, /yourself|self-delivery|rejected/i, `self-reply must be rejected, got: ${rres}`);
+    // And nothing was written to alice's own inbox by the rejected reply.
+    const inbox = join(bridge2, "to-alice", "inbox");
+    await mkdir(inbox, { recursive: true });
+    const leaked = (await readdir(inbox)).filter((f) => f.endsWith(".json"));
+    assert.deepEqual(leaked, [], `rejected self-reply must not write a message, found: ${leaked}`);
   });
 });
