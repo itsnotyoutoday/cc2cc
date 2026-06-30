@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from cc2cc import core
 from cc2cc.core import atomic_write, bridge_path, MAX_MESSAGE_SIZE
 
 
@@ -37,10 +38,21 @@ class TestBridgePath:
         monkeypatch.setenv("CC2CC_BRIDGE_DIR", str(tmp_path))
         assert bridge_path() == tmp_path
 
-    def test_default_home(self, monkeypatch):
+    def test_default_home(self, tmp_path, monkeypatch):
+        # No env override and NO global install present -> per-user home bridge (~/.cc2cc).
+        # Patch GLOBAL_BRIDGE to a path that does not exist so the test is hermetic regardless
+        # of whether the test host actually has /var/lib/cc2cc.
         monkeypatch.delenv("CC2CC_BRIDGE_DIR", raising=False)
+        monkeypatch.setattr(core, "GLOBAL_BRIDGE", tmp_path / "nonexistent-global")
         result = bridge_path()
         assert result.name == ".cc2cc"
+
+    def test_global_autodetect(self, tmp_path, monkeypatch):
+        # No env override but a machine-wide install dir exists -> resolve to it (matches
+        # cc2cc-launch), NOT the per-user home bridge. This is the f9c6db6 behavior.
+        monkeypatch.delenv("CC2CC_BRIDGE_DIR", raising=False)
+        monkeypatch.setattr(core, "GLOBAL_BRIDGE", tmp_path)  # tmp_path exists
+        assert bridge_path() == tmp_path
 
 
 class TestSizeLimit:

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "description": "Default federation GAB policy for this cc2cc server (the home machine). AUTHORITY: 'identities', 'directory', and 'relay' are SERVER-LEVEL and authoritative — they are NOT overridable by team policy (a machine owns its members' lifecycle and its relay security). 'teams' and 'messages' are DEFAULTS that a team's rules (teams.json) may override per-team (admission, retention).",
+  "messages": {
+    "retention_days": 4,
+    "stale_after_hours": 24,
+    "max_age_days": 5
+  },
+  "teams": {
+    "default_admission": "open",
+    "sticky_leader": true
+  },
+  "identities": {
+    "offline_after_seconds": 15,
+    "expire_days": 30
+  },
+  "directory": {
+    "active_seconds": 60,
+    "expire_days": 4
+  },
+  "relay": {
+    "encrypt_required": true
+  }
+}

@@ -25,3 +25,5 @@ Thumbs.db
 
 # Bridge runtime data (created by init.sh, lives at ~/.cc2cc)
 /tmp/
+.pytest_cache/
+*.log

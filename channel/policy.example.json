@@ -1,0 +1,23 @@
+{
+  "_comment": "OPTIONAL override for cc2cc's built-in policy. The MCP runs fine WITHOUT this file — these are the same values as the built-in DEFAULT_POLICY. To activate: copy to 'policy.json' in the bridge and edit. Only the sections/keys you set override the defaults (shallow per-section merge). JSON has no comments, so the '_comment' fields are inert and ignored by the loader.",
+  "messages": {
+    "_comment": "message retention + staleness windows",
+    "retention_days": 4,
+    "stale_after_hours": 24,
+    "max_age_days": 5
+  },
+  "teams": {
+    "_comment": "default_admission: 'open' (anyone may join) or 'closed' (admit-only). sticky_leader keeps a leader until explicit succession.",
+    "default_admission": "open",
+    "sticky_leader": true
+  },
+  "directory": {
+    "_comment": "active_seconds: how recently an agent must heartbeat to show 'active' in the directory. expire_days: drop from the directory after this.",
+    "active_seconds": 60,
+    "expire_days": 4
+  },
+  "relay": {
+    "_comment": "encrypt_required: refuse plaintext over the relay. Keep true on global/relay bridges.",
+    "encrypt_required": true
+  }
+}

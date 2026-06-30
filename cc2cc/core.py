@@ -9,10 +9,33 @@ from pathlib import Path
 
 MAX_MESSAGE_SIZE = 1_000_000  # 1 MB
 
+# Machine-wide install location, auto-detected when no explicit CC2CC_BRIDGE_DIR is set.
+# Module-level so tests can patch it to deterministically exercise both the global-detect
+# and the per-user home-fallback branches regardless of what exists on the test host.
+GLOBAL_BRIDGE = Path("/var/lib/cc2cc")
+
 
 def bridge_path() -> Path:
-    """Resolve the bridge directory from env or default."""
-    return Path(os.environ.get("CC2CC_BRIDGE_DIR", os.path.expanduser("~/.cc2cc")))
+    """Resolve the bridge directory, MIRRORING cc2cc-launch so cc2cc-admin and the scripts operate on
+    the SAME bridge the daemon + agents use: an explicit CC2CC_BRIDGE_DIR wins; else auto-detect a
+    machine-wide install (/var/lib/cc2cc) before falling back to the per-user local bridge (~/.cc2cc).
+
+    Without this, cc2cc-admin defaulted straight to ~/.cc2cc, so operator team/member writes on a
+    global install silently landed in the wrong (local) store and never took effect on the live mesh.
+    Detect the global install by the DIRECTORY (not a file inside it — a login lacking the cc2cc group
+    can't traverse the bridge to stat secret.key), matching cc2cc-launch's check.
+    """
+    env = os.environ.get("CC2CC_BRIDGE_DIR")
+    if env:
+        return Path(env)
+    if GLOBAL_BRIDGE.is_dir():
+        return GLOBAL_BRIDGE
+    return Path(os.path.expanduser("~/.cc2cc"))
+
+
+def room_inbox_path(recipient: str, room_id: str) -> Path:
+    """Return the path to a recipient's inbox within a specific room."""
+    return bridge_path() / "rooms" / room_id / f"to-{recipient}" / "inbox"
 
 
 def retry_replace(src: str, dst: str, retries: int = 5, delay: float = 0.05) -> None:

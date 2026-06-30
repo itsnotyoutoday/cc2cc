@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * CC2CC MCP Channel Server v3.0
+ * CC2CC MCP Channel Server v3.6
  *
  * Unified multi-agent communication server with dynamic identity.
- * Auto-generates a unique name on startup, discovers peers via heartbeats,
- * and exposes 7 MCP tools: whoami, list_agents, send, broadcast, reply, check_inbox, register.
+ * Auto-generates a unique name on startup, discovers peers via heartbeats, and exposes 16 MCP
+ * tools: whoami, list_agents, list_teams, send, send_team, broadcast, reply, check_inbox,
+ * register, register_relay, set_status, create_team, claim_team, request_join, admit, evict.
  *
  * Ephemeral mailboxes: on startup, stale agent directories are cleaned up.
  * Sending to offline agents is rejected — mailboxes only exist for active sessions.
@@ -21,12 +22,18 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readdir, readFile, rename, mkdir, writeFile, stat, rm } from "fs/promises";
-import { writeFileSync } from "fs";
+import { readdir, readFile, rename, mkdir, writeFile, stat, rm, chmod, link, unlink } from "fs/promises";
+import { writeFileSync, readFileSync, chmodSync } from "fs";
 import { join, basename, dirname } from "path";
-import { randomUUID, createCipheriv, createDecipheriv, scryptSync } from "crypto";
-import { homedir } from "os";
+import { randomUUID, randomBytes, createCipheriv, createDecipheriv, scryptSync } from "crypto";
+import { homedir, hostname } from "os";
+import { fileURLToPath } from "url";
+import { realpathSync } from "fs";
 import { generateUniqueName, validateName, takenNames } from "./names.mjs";
+import * as relay from "./relay.mjs";
+import { ensureDaemon, connectToDaemon } from "./daemon-client.mjs";
+import { readServiceMarker } from "./daemon.mjs";
+import { render as tpl, loadTemplateOverrides } from "./templates.mjs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -40,6 +47,30 @@ const HOME = process.env.HOME || process.env.USERPROFILE || homedir();
 const BRIDGE_DIR =
   process.env.CC2CC_BRIDGE_DIR || process.env.BRIDGE_DIR || join(HOME, ".cc2cc");
 
+// Default team when CC2CC_TEAM is unset: this node's mesh identity (connections.json self.name,
+// established at install) else the server hostname — so agents on host "nexus" default to team
+// "nexus" rather than a generic "cc2cc". An explicit CC2CC_TEAM always wins.
+const DEFAULT_TEAM = (() => {
+  try {
+    const conn = JSON.parse(readFileSync(join(BRIDGE_DIR, "connections.json"), "utf8"));
+    if (conn?.self?.name) return String(conn.self.name);
+  } catch {}
+  return (hostname() || "cc2cc").split(".")[0];
+})();
+
+// Identity name from the launcher env (cc-launch sets CC2CC_IDENTITY; SELF is the
+// legacy alias). When present and valid, identity is stored per-name so multiple
+// agents can share one bridge with distinct names/teams/roles. Falls back to the
+// legacy single identity.json when no (valid) name is supplied.
+const RAW_IDENTITY_NAME = process.env.CC2CC_IDENTITY || process.env.SELF || null;
+const IDENTITY_NAME =
+  RAW_IDENTITY_NAME && validateName(RAW_IDENTITY_NAME) ? RAW_IDENTITY_NAME : null;
+const IDENTITY_PATH = join(
+  BRIDGE_DIR,
+  "identities",
+  IDENTITY_NAME ? `identity-${IDENTITY_NAME}.json` : "identity.json",
+);
+
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let agentName = null; // set during init
@@ -48,22 +79,55 @@ const onlineSince = new Date().toISOString();
 const sessionId = String(process.pid);
 const seenFiles = new Set();
 let knownAgents = new Map(); // name → heartbeat data
+let agentStatus = "Idle"; // Default status (v3.6)
 let pollTimer = null;
 let statusTimer = null;
 let heartbeatTimer = null;
+// Daemon mode (v3.7): the standalone daemon owns the hub connection; this MCP does not poll
+// the hub. daemonMode = a daemon is ensured + we're connected for wake pushes.
+let daemonMode = false;
+let relayConfigured = false;
+let daemonClient = null;
+/** Relay is reachable for this session iff a daemon owns it and a hub is configured. */
+function relayActive() { return daemonMode && relayConfigured; }
 let wakeAcknowledged = false; // set true when direct push succeeds
+let agentIdentity = null; // loaded during init — {display_name, agent_id, created, teams}
+let participating = false; // opt-in: false until the session joins (env identity or register)
+let lastIdentityTouch = 0; // throttle for persisting identity last_seen
+let teamLeaders = new Map(); // team_name → leader_agent_name
+// Operator/governance policy from cc2cc_admin (team-<name>.json on this bridge):
+let operatorLeaders = new Map(); // team → leader (AUTHORITATIVE, overrides heartbeat-derived)
+let teamRevoked = new Map();      // team → Set(member) whose participation was revoked
+
+// Default federation GAB policy — message-handling + governance defaults for this server.
+// A bridge-level policy.json overrides these; team rules can override per-team.
+const DEFAULT_POLICY = {
+  messages: { retention_days: 4, stale_after_hours: 24, max_age_days: 5 },
+  teams: { default_admission: "open", sticky_leader: true },
+  // identities: when an agent is considered offline (no heartbeat) vs. fully EXPIRED
+  // (absent long enough to be treated as non-existent and garbage-collected).
+  identities: { offline_after_seconds: 15, expire_days: 30 },
+  directory: { active_seconds: 60, expire_days: 4 },
+  relay: { encrypt_required: true },
+};
+let policy = DEFAULT_POLICY;
 
 // ─── Encryption (optional, enabled via CC2CC_ENCRYPT=1) ─────────────────────
 
 const ENCRYPT_ENABLED = process.env.CC2CC_ENCRYPT === "1";
 let encryptionKey = null; // derived from secret.key via scrypt
+/** Test-only: set encryption key for decryptMessage tests. */
+export function setEncryptionKey(key) { encryptionKey = key; }
 
 async function loadEncryptionKey() {
   if (!ENCRYPT_ENABLED) return;
   try {
     const secretPath = join(BRIDGE_DIR, "secret.key");
     const secret = (await readFile(secretPath, "utf8")).trim();
-    encryptionKey = scryptSync(secret, "cc2cc-aes", 32);
+    // m2: stronger KDF — longer domain-separated salt + higher scrypt cost (N=2^15). MUST stay
+    // deterministic and identical on every machine: both peers derive the AES key from the same
+    // shared secret.key and have to land on the same key, so the salt cannot be random per-deploy.
+    encryptionKey = scryptSync(secret, "cc2cc-aes-gcm/v2", 32, { N: 2 ** 15, r: 8, p: 1, maxmem: 96 * 1024 * 1024 });
   } catch {
     encryptionKey = null;
   }
@@ -71,7 +135,7 @@ async function loadEncryptionKey() {
 
 function encryptText(plaintext) {
   if (!encryptionKey) return plaintext;
-  const iv = Buffer.from(randomUUID().replace(/-/g, ""), "hex").subarray(0, 12);
+  const iv = randomBytes(12); // m1: full 96-bit random nonce (was a truncated UUID — version nibble fixed)
   const cipher = createCipheriv("aes-256-gcm", encryptionKey, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
@@ -85,9 +149,40 @@ function decryptText(data) {
     const decipher = createDecipheriv("aes-256-gcm", encryptionKey, Buffer.from(ivHex, "hex"));
     decipher.setAuthTag(Buffer.from(tagHex, "hex"));
     return decipher.update(Buffer.from(encHex, "hex"), null, "utf8") + decipher.final("utf8");
-  } catch {
-    return data; // return as-is if decryption fails (unencrypted message)
+  } catch (err) {
+    log("error", "GCM decryption failed, possible tampering", { error: err.message });
+    throw new Error("Decryption failed: Invalid authentication tag");
   }
+}
+
+// ─── Status Management (v3.6) ────────────────────────────────────────────────
+
+async function handleSetStatus({ status }) {
+  if (typeof status !== "string") {
+    return {
+      content: [{ type: "text", text: "Status must be a string." }],
+      isError: true,
+    };
+  }
+
+  const maxLength = 120;
+  if (status.length > maxLength) {
+    return {
+      content: [{ type: "text", text: `Status is too long (max ${maxLength} chars).` }],
+      isError: true,
+    };
+  }
+
+  // Sanitize: strip control characters
+  const sanitizedStatus = status.replace(/[\r\n\x00-\x1F\x7F-\x9F]/g, "");
+  agentStatus = sanitizedStatus || "Idle";
+
+  // Trigger immediate heartbeat to broadcast change
+  await writeHeartbeat("active", "status update");
+
+  return {
+    content: [{ type: "text", text: `Status updated to: "${agentStatus}"` }],
+  };
 }
 
 // ─── Logging (structured JSON → stderr; stdout is MCP transport) ─────────────
@@ -106,6 +201,11 @@ function log(level, msg, data = {}) {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function inboxDir(name) {
+  // Security (B1): names reaching here may be message-derived (msg.from, a reply target, a
+  // federated leader) and are NOT otherwise trusted. validateName rejects anything containing
+  // path separators or dots, so this is the single chokepoint guaranteeing inbox writes stay
+  // inside BRIDGE_DIR. Every legitimate agent name passes; only spoofed/traversal names throw.
+  if (!validateName(name)) throw new Error(`invalid agent name for inbox path: ${JSON.stringify(name)}`);
   return join(BRIDGE_DIR, `to-${name}`, "inbox");
 }
 function doneDir(name) {
@@ -135,17 +235,40 @@ async function retryRename(src, dst, retries = 5, delayMs = 50) {
 }
 
 /** Atomic write: tmp file → rename */
+// The bridge dir is shared by every agent in the `cc2cc` group, each running its server as a
+// DIFFERENT OS user. If a write inherits a restrictive umask (notably root's), the resulting
+// file/dir is unreadable/unwritable to the other group members — which is exactly how teams.json
+// became root:600 (peers saw leader=null) and how a peer's inbox dir lost group-write (cross-user
+// reply → EACCES). Force group rw on files (0o660) and setgid + group rwx on the dirs we create
+// (0o2770) so collaboration survives whatever umask the writing user happens to have. Best-effort:
+// chmod can fail when we are not the file's owner (another user wrote it first) — that's fine, the
+// owner already created it group-accessible, so we ignore the error rather than abort the write.
+async function chmodQuiet(path, mode) {
+  try { await chmod(path, mode); } catch { /* not owner / race — acceptable */ }
+}
+
+// Create a bridge dir as setgid + group-rwx (0o2770) so a peer running as a different OS user can
+// write/move/scan it regardless of the creator's umask. Use this for EVERY bridge dir — not just
+// ones that later receive an atomicWrite — because some dirs are populated by rename (done/) or
+// scanned cross-agent (cleanup), paths atomicWrite's own dir-chmod never covers.
+async function ensureDir(path) {
+  await mkdir(path, { recursive: true });
+  await chmodQuiet(path, 0o2770);
+}
+
 async function atomicWrite(targetPath, data) {
   const dir = dirname(targetPath);
-  await mkdir(dir, { recursive: true });
+  await ensureDir(dir);
   const tmpPath = join(dir, `.tmp-${randomUUID()}.json`);
   await writeFile(tmpPath, JSON.stringify(data, null, 2));
+  await chmodQuiet(tmpPath, 0o660);
   await retryRename(tmpPath, targetPath);
+  await chmodQuiet(targetPath, 0o660);
 }
 
 /** Build a message object (encrypts content.text if encryption enabled) */
-function buildMessage({ from, to, text, type = "message", priority = "normal", replyTo = null, task = null }) {
-  return {
+function buildMessage({ from, to, text, type = "message", priority = "normal", replyTo = null, task = null, replyRoute = null }) {
+  const msg = {
     id: `msg-${randomUUID()}`,
     timestamp: new Date().toISOString(),
     from,
@@ -158,14 +281,101 @@ function buildMessage({ from, to, text, type = "message", priority = "normal", r
     replyTo,
     ttl: DEFAULT_TTL,
   };
+  // Opaque reply-route metadata: the bridge PRESERVES it end-to-end (whole-envelope local delivery +
+  // the relay spreads {...msg.message} cross-machine) and ECHOES it on replies (see handleReply), but
+  // NEVER interprets it. Lets a client (e.g. an openclaw plugin) carry a session-routing token that
+  // round-trips back on the reply so the reply lands in the originating session — works for ANY MCP
+  // client because the echo is server-side. Only included when set, to keep envelopes clean.
+  if (replyRoute != null) msg.replyRoute = replyRoute;
+  return msg;
 }
 
-/** Decrypt content.text if encrypted */
-function decryptMessage(msg) {
-  if (msg?.content?.text) {
-    msg.content.text = decryptText(msg.content.text);
+/** Decrypt content.text if encrypted. Returns null on failure — caller must skip/remove the file. */
+export function decryptMessage(msg) {
+  const text = msg?.content?.text;
+  // M1 fail-closed: a relayed message (arrived over the wire — carries _relay_meta) MUST be
+  // encrypted when encryption is enabled. A non-ENC: payload means it was stripped or sent in the
+  // clear — quarantine rather than surface plaintext. Local (non-relayed) messages may be plaintext.
+  if (ENCRYPT_ENABLED && msg?._relay_meta && typeof text === "string" && !text.startsWith("ENC:")) {
+    log("error", "relayed message not encrypted — discarding (encryption required)", { msg_id: msg.id, from: msg.from });
+    return null;
+  }
+  if (text && text.startsWith("ENC:")) {
+    try {
+      msg.content.text = decryptText(text);
+    } catch (err) {
+      log("error", "message decryption failed, discarding", { msg_id: msg.id, from: msg.from });
+      return null; // quarantine — never surface ciphertext
+    }
   }
   return msg;
+}
+
+// ─── Identity ─────────────────────────────────────────────────────────────────
+
+/**
+ * Load identity from BRIDGE_DIR/identity.json.
+ * Returns null if file doesn't exist, is corrupted, or has missing fields.
+ * Backs up corrupted files before returning null.
+ */
+async function loadIdentity() {
+  try {
+    const raw = await readFile(IDENTITY_PATH, "utf8");
+    const data = JSON.parse(raw);
+    if (!data.display_name || !data.agent_id || !data.created || !Array.isArray(data.teams)) {
+      log("warn", "identity.json missing required fields, regenerating");
+      return null;
+    }
+    return data;
+  } catch (err) {
+    if (err.code === "ENOENT") return null; // first boot
+    // Corrupted — back up
+    try {
+      await rename(IDENTITY_PATH, IDENTITY_PATH + ".corrupted");
+      log("warn", "identity.json corrupted, backed up as identity.json.corrupted and regenerating");
+    } catch { /* best effort backup */ }
+    return null;
+  }
+}
+
+/** Save identity object atomically to IDENTITY_PATH. */
+async function saveIdentity(identity) {
+  await atomicWrite(IDENTITY_PATH, identity);
+}
+
+/** Create a new identity with the given display name, UUID, and teams/role.
+ * Teams/role are seeded from CC2CC_TEAM (comma-separated) / CC2CC_ROLE when set,
+ * else default to [DEFAULT_TEAM] / "member". */
+async function createIdentity(name) {
+  const envTeams = (process.env.CC2CC_TEAM || "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  // Identity = who you are (name, id, teams you're in). It does NOT carry a role —
+  // leadership/membership-role is defined by the team registry (teams.json) and derived.
+  const identity = {
+    display_name: name,
+    agent_id: randomUUID(),
+    created: new Date().toISOString(),
+    last_seen: new Date().toISOString(),
+    teams: envTeams.length ? envTeams : [DEFAULT_TEAM],
+  };
+  await saveIdentity(identity);
+  log("info", "identity created", { name, agent_id: identity.agent_id, teams: identity.teams });
+  return identity;
+}
+
+/**
+ * Load existing identity or create a new one with the candidate name.
+ * Existing identity always takes precedence (display_name is source of truth).
+ */
+async function ensureIdentity(candidateName) {
+  const existing = await loadIdentity();
+  if (existing) {
+    log("info", "identity loaded", { name: existing.display_name, agent_id: existing.agent_id });
+    return existing;
+  }
+  return await createIdentity(candidateName);
 }
 
 /** Write heartbeat to status/{name}-heartbeat.json */
@@ -179,9 +389,34 @@ async function writeHeartbeat(statusValue = "active", context = "session started
     parent_pid: String(process.ppid),
     status: statusValue,
     context,
+    status_text: agentStatus,
+    teams: agentIdentity?.teams || [DEFAULT_TEAM],
   };
   const filePath = join(statusDir(), `${agentName}-heartbeat.json`);
   await atomicWrite(filePath, hb);
+
+  // Persist last_seen into the identity file (throttled) so expiry can be computed from the
+  // identity alone — even after the (transient) heartbeat is gone.
+  if (agentIdentity) {
+    const nowMs = Date.now();
+    if (nowMs - lastIdentityTouch >= 30000) {
+      lastIdentityTouch = nowMs;
+      agentIdentity.last_seen = new Date().toISOString();
+      saveIdentity(agentIdentity).catch(() => {});
+    }
+  }
+}
+
+/** Seconds after which a heartbeat counts as offline — operator-tunable via
+ *  policy.identities.offline_after_seconds (reloaded every poll). Falls back to the built-in. */
+function offlineAfterS() {
+  const v = policy?.identities?.offline_after_seconds;
+  return Number.isFinite(v) && v > 0 ? v : HEARTBEAT_STALE_S;
+}
+/** Heartbeat WRITE cadence, derived from the staleness window: ~3 writes per window so up to 2
+ *  late/missed writes don't trip a false-offline. offlineAfterS/3 is the floor; never thinner. */
+function heartbeatMs() {
+  return Math.max(1000, Math.floor((offlineAfterS() * 1000) / 3));
 }
 
 /** Check if a heartbeat is stale */
@@ -189,7 +424,7 @@ function isStale(heartbeatData) {
   const ts = heartbeatData.timestamp || heartbeatData.heartbeat;
   if (!ts) return true;
   const age = (Date.now() - new Date(ts).getTime()) / 1000;
-  return age > HEARTBEAT_STALE_S;
+  return age > offlineAfterS();
 }
 
 /** Check if an agent is online based on known heartbeat data */
@@ -200,31 +435,51 @@ function isAgentOnline(name) {
   return !isStale(hb);
 }
 
-/** Get list of all agents with status info */
+/** Role is DERIVED from the team registry: an agent is "leader" if it leads any team it's
+ *  in, else "member". Not stored on the identity/heartbeat. */
+function roleOf(name, teams) {
+  return (teams || []).some((t) => teamLeaders.get(t) === name) ? "leader" : "member";
+}
+
+/** Get list of all agents with status info (teams + derived role for team-aware filtering) */
 function getAgentList() {
   const agents = [];
   for (const [name, hb] of knownAgents) {
     const online = hb.status === "active" && !isStale(hb);
+    const teams = effectiveTeams(name, hb.teams); // GAB policy: revoked memberships excluded
     agents.push({
       name,
       status: online ? "online" : "offline",
+      status_text: online ? (hb.status_text || "Idle") : null,
       last_seen: hb.timestamp || hb.heartbeat,
       is_self: name === agentName,
+      teams,
+      role: roleOf(name, teams), // derived from teams.json, not stored
     });
   }
   return agents;
 }
 
-/** Get names of online agents (excluding self) */
-function onlineAgentNames() {
+/** Get names of online agents (excluding self), optionally filtered by team */
+function onlineAgentNames(teamFilter) {
   return getAgentList()
     .filter((a) => a.status === "online" && !a.is_self)
+    .filter((a) => !teamFilter || (a.teams && a.teams.includes(teamFilter)))
     .map((a) => a.name);
 }
 
-/** Get all known agent names (for broadcast) */
+/** Get all known agent names (for broadcast notifications) */
 function allAgentNames() {
   return [...knownAgents.keys()].filter((n) => n !== agentName);
+}
+
+/** Check if two agents share at least one team. */
+function sharesTeam(agentA, agentB) {
+  const aData = getAgentList().find((a) => a.name === agentA);
+  const bData = getAgentList().find((a) => a.name === agentB);
+  const aTeams = aData?.teams || [DEFAULT_TEAM];
+  const bTeams = bData?.teams || [DEFAULT_TEAM];
+  return aTeams.some((t) => bTeams.includes(t));
 }
 
 // ─── MCP Server Setup ───────────────────────────────────────────────────────
@@ -232,7 +487,7 @@ function allAgentNames() {
 const server = new Server(
   {
     name: "cc2cc_channel",
-    version: "3.0.0",
+    version: "3.6.0",
     instructions: [
       "You are connected to CC2CC — an agent-to-agent communication bridge.",
       "Other agents can send you messages. Incoming messages appear as INCOMING MESSAGES blocks in tool responses.",
@@ -265,7 +520,7 @@ const TOOLS = [
   },
   {
     name: "send",
-    description: "Send a message to another agent. Notes if the recipient is offline.",
+    description: "Send a message to another agent on the same team. Cross-team sends are blocked — use send_team instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -283,13 +538,17 @@ const TOOLS = [
           default: "normal",
           description: "Message priority",
         },
+        replyRoute: {
+          type: "object",
+          description: "Optional OPAQUE reply-route metadata (e.g. {session, plugin}). Preserved end-to-end and echoed back on the recipient's reply so it lands in the originating session. The bridge never interprets it.",
+        },
       },
       required: ["to", "text"],
     },
   },
   {
     name: "broadcast",
-    description: "Send a message to all known agents",
+    description: "Send a message to all online agents on the same team. Cross-team broadcasting is not allowed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -315,6 +574,10 @@ const TOOLS = [
           description: "Message ID to reply to (from channel notification)",
         },
         text: { type: "string", description: "Reply content" },
+        replyRoute: {
+          type: "object",
+          description: "Optional OPAQUE reply-route override. If omitted, the server auto-echoes the original message's replyRoute back to the sender (the normal path); set it only to re-stamp.",
+        },
       },
       required: ["msg_id", "text"],
     },
@@ -326,16 +589,130 @@ const TOOLS = [
   },
   {
     name: "register",
-    description: "Change this agent's name. Validates, renames directories, updates heartbeat, and notifies other agents.",
+    description: "Join the cc2cc system (if not already), or change this agent's name. Leadership is NOT set here — use create_team or ask a team leader (roles live in the team registry).",
     inputSchema: {
       type: "object",
       properties: {
         name: {
           type: "string",
-          description: "New agent name (lowercase alphanumeric with hyphens, max 31 chars)",
+          description: "Your agent name (lowercase alphanumeric with hyphens, max 31 chars)",
         },
       },
       required: ["name"],
+    },
+  },
+  {
+    name: "send_team",
+    description: "Send a cross-team message to another team via their team leader. The leader's inbox receives the message.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Target team name" },
+        text: { type: "string", description: "Message content" },
+        type: {
+          type: "string",
+          enum: ["message", "task", "response", "status"],
+          default: "message",
+          description: "Message type",
+        },
+        priority: {
+          type: "string",
+          enum: ["low", "normal", "high", "critical"],
+          default: "normal",
+          description: "Message priority",
+        },
+      },
+      required: ["team", "text"],
+    },
+  },
+  {
+    name: "list_teams",
+    description: "Lists all known teams with their designated leader, total member count, and currently online count.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "set_status",
+    description: "Set this agent's status text, broadcast to other agents via heartbeat.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", description: "Status text (max 120 chars)" },
+      },
+      required: ["status"],
+    },
+  },
+  {
+    name: "register_relay",
+    description: "Configure cross-machine relay. Sets up relay.json and registers with the Relay Hub. Requires a running relay hub.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        hub_url: { type: "string", description: "Relay Hub URL (e.g., http://192.168.1.50:8080)" },
+        token: { type: "string", description: "Relay auth token" },
+        team: { type: "string", description: "Team name to register under (default: same as identity team)" },
+        enabled: { type: "boolean", default: true, description: "Enable or disable relay" },
+      },
+      required: ["hub_url"],
+    },
+  },
+  {
+    name: "create_team",
+    description: "Create a new team (you become its leader). In-session equivalent of launching with CC2CC_TEAM or `cc2cc_admin team create`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "New team name (lowercase a-z, 0-9, hyphens)" },
+        admission: { type: "string", enum: ["open", "approved"], description: "Join policy (default open)" },
+        retention_days: { type: "integer", description: "Message retention for this team (default 4)" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "request_join",
+    description: "Request to join a team. Routes a join request to that team's leader (via standard cross-team messaging); the leader admits at their discretion. Any agent may call this.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Team you want to join" },
+        note: { type: "string", description: "Optional message to the leader (why you want to join)" },
+      },
+      required: ["team"],
+    },
+  },
+  {
+    name: "admit",
+    description: "Team leader: admit an agent into a team you lead. Updates the team roster (team-<name>.json). Only the team's leader may call this.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Team to admit into (must be one you lead)" },
+        agent: { type: "string", description: "Agent name to admit" },
+      },
+      required: ["team", "agent"],
+    },
+  },
+  {
+    name: "evict",
+    description: "Team leader: revoke an agent's participation in a team you lead (emits a tombstone). Does NOT delete the agent's identity. Only the team's leader may call this.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Team to evict from (must be one you lead)" },
+        agent: { type: "string", description: "Agent name to evict" },
+      },
+      required: ["team", "agent"],
+    },
+  },
+  {
+    name: "claim_team",
+    description: "Claim leadership of an existing LEADERLESS team (leader=null), or adopt a team referenced by members that has no owning policy on this machine. You become its leader. Refuses if the team already has a leader (use request_join, or have the leader hand off) or is owned by another machine.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Team to claim leadership of" },
+      },
+      required: ["team"],
     },
   },
 ];
@@ -366,6 +743,24 @@ server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
         result = textResult("Inbox checked."); break;
       case "register":
         result = await handleRegister(args); break;
+      case "send_team":
+        result = await handleSendTeam(args); break;
+      case "list_teams":
+        result = handleListTeams(); break;
+      case "set_status":
+        result = await handleSetStatus(args); break;
+      case "register_relay":
+        result = await relay.handleRegisterRelay(BRIDGE_DIR, args); break;
+      case "create_team":
+        result = await handleCreateTeam(args); break;
+      case "request_join":
+        result = await handleRequestJoin(args); break;
+      case "admit":
+        result = await handleAdmit(args); break;
+      case "evict":
+        result = await handleEvict(args); break;
+      case "claim_team":
+        result = await handleClaimTeam(args); break;
       default:
         return textResult(`Unknown tool: ${toolName}`, true);
     }
@@ -403,33 +798,87 @@ function jsonResult(data) {
 
 // ── whoami ──
 
+// 12b: In the daemon model the DAEMON owns the relay loop, so the MCP's own relayEnabled flag
+// is always false even while the relay is live. Report liveness from the daemon link instead,
+// so whoami doesn't contradict list_agents (which correctly shows remote peers online).
+function relayStatusForUi() {
+  const s = relay.getRelayStatus();
+  if (daemonMode) s.enabled = relayActive();
+  return s;
+}
+
 function handleWhoami() {
-  return jsonResult({
+  const peers = getAgentList().filter((a) => a.status === "online" && !a.is_self);
+  const whoami = {
     name: agentName,
+    agent_id: agentIdentity?.agent_id || "unset",
+    teams: agentIdentity?.teams || [],
+    role: roleOf(agentName, agentIdentity?.teams || []), // derived from teams.json
+    registered: !!agentIdentity,
+    identity_file: IDENTITY_PATH,
     online_since: onlineSince,
     bridge_dir: BRIDGE_DIR,
-    online_agents: onlineAgentNames(),
-  });
+    online_agents: peers.map((a) => a.name),
+    // Structured roster so callers can name peers (and their team/role) directly.
+    online_roster: peers.map((a) => ({ name: a.name, teams: a.teams, role: a.role })),
+    relay: relayStatusForUi(),
+    // Presentation guidance for the agent relaying this to a human.
+    _note:
+      "Refer to agents by `name` (e.g. \"alpha-mem\") when reporting to the user — never by agent_id. " +
+      "`agent_id` is an internal UUID, not a human-facing identifier.",
+  };
+  return jsonResult(whoami);
 }
 
 // ── list_agents ──
 
 function handleListAgents() {
-  return jsonResult(getAgentList());
+  const local = getAgentList();
+  let remote = [];
+  if (relayActive()) {
+    // Remote agents carry role stamped by their owning machine (rides remote-teams.json with
+    // the roster). Prefer that; fall back to deriving from teamLeaders only when it's absent
+    // (e.g. an agent seen before the role-in-roster upgrade). (tom's find; rlead's root-cause +
+    // correction of the earlier two-file-coupling approach.)
+    remote = relay.getRemoteAgents().map((a) => ({ ...a, role: a.role || (a.team ? roleOf(a.name, [a.team]) : undefined) }));
+  }
+  return jsonResult([...local, ...remote]);
 }
 
 // ── send ──
 
-async function handleSend({ to, text, type = "message", priority = "normal" }) {
+async function handleSend({ to, text, type = "message", priority = "normal", replyRoute = null }) {
   if (!to || !text) return textResult("Missing required fields: to, text", true);
+
+  // Self-delivery guard (from==to): a message addressed to oneself lands in the sender's own
+  // inbox, wakes the sender's peer session, and its reply routes back to itself → echo loop.
+  // This loop took the gateway lead (triton) down. Reject at the source. Mirrors the gateway-side
+  // plugin guard (clawman 760b9f1); enforced in core so NON-gateway agents are protected too.
+  if (to === agentName) {
+    return textResult("Cannot send a message to yourself — self-delivery is rejected (prevents a self-DM echo loop).", true);
+  }
+
+  // Bug 0d fix: if the target is a known REMOTE agent (another machine), a local inbox write
+  // would strand. Relay via that agent's team instead (reaches the team leader).
+  const remote = relayActive() ? relay.getRemoteAgents().find((a) => a.name === to) : null;
+  if (remote && remote.team) {
+    log("info", "direct send relayed via remote team", { to, team: remote.team });
+    return handleSendTeam({ team: remote.team, text, intent: type });
+  }
+
+  // Block cross-team direct sends (check before offline check — remote agents
+  // may be offline on this machine but reachable via send_team relay)
+  if (!sharesTeam(agentName, to)) {
+    return textResult(tpl("cross_team_blocked", { to }), true);
+  }
 
   if (!isAgentOnline(to)) {
     return textResult(`Agent "${to}" is offline. Message not sent. Use list_agents to see who is online.`, true);
   }
 
-  const msg = buildMessage({ from: agentName, to, text, type, priority });
+  const msg = buildMessage({ from: agentName, to, text, type, priority, replyRoute });
   const targetInbox = inboxDir(to);
-  await mkdir(targetInbox, { recursive: true });
+  await ensureDir(targetInbox);
   await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
 
   log("info", "message sent", { id: msg.id, to });
@@ -441,16 +890,16 @@ async function handleSend({ to, text, type = "message", priority = "normal" }) {
 async function handleBroadcast({ text, priority = "normal" }) {
   if (!text) return textResult("Missing required field: text", true);
 
-  const targets = onlineAgentNames();
+  const targets = onlineAgentNames().filter((t) => sharesTeam(agentName, t));
   if (targets.length === 0) {
-    return textResult("No other agents online. Nobody to broadcast to.");
+    return textResult("No team members online. Broadcast is same-team only.");
   }
 
   const results = [];
   for (const to of targets) {
     const msg = buildMessage({ from: agentName, to, text, type: "message", priority });
     const targetInbox = inboxDir(to);
-    await mkdir(targetInbox, { recursive: true });
+    await ensureDir(targetInbox);
     await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
     results.push({ to, id: msg.id, online: isAgentOnline(to) });
   }
@@ -461,7 +910,7 @@ async function handleBroadcast({ text, priority = "normal" }) {
 
 // ── reply ──
 
-async function handleReply({ msg_id, text }) {
+async function handleReply({ msg_id, text, replyRoute = null }) {
   if (!msg_id || !text) return textResult("Missing required fields: msg_id, text", true);
 
   // Try to find the original message — check inbox first (channel push
@@ -533,9 +982,39 @@ async function handleReply({ msg_id, text }) {
   if (!to) {
     return textResult(`Cannot find original message ${msg_id}. Unable to determine recipient.`, true);
   }
+  // Security (B1): the recipient is taken from the original message body; reject a malformed
+  // name before it can drive an inbox path.
+  if (!validateName(to)) {
+    return textResult(`Cannot reply: original sender name "${to}" is malformed.`, true);
+  }
+  // Self-delivery guard (from==to): replying to one's own message would deliver back to self and
+  // loop. Reject — same contract as handleSend (see clawman 760b9f1).
+  if (to === agentName) {
+    return textResult(`Cannot reply to your own message ${msg_id} — self-delivery is rejected (prevents a self-DM echo loop).`, true);
+  }
 
   // Auto-complete task type: if original was a task, reply as response
   const replyType = originalMsg.type === "task" ? "response" : "message";
+  const fromTeam = originalMsg.from_team;
+  const myTeams = agentIdentity?.teams || [];
+
+  // Route the reply by REACHABILITY, not by transient presence (QA: presence-flap reply-loss bug).
+  // The original sender PROVED they exist by messaging us, and a LOCAL sender's inbox is always writable
+  // (inboxes are async). Gating direct delivery on isAgentOnline() lost the reply (same-team) or
+  // misrouted it to the team leader (cross-team) whenever the sender's heartbeat was momentarily stale
+  // or they were simply idle. So: a genuinely REMOTE sender (another machine, only reachable via the
+  // relay) routes via their team; a LOCAL sender always gets the direct inbox write below — regardless
+  // of online status. (Cross-team-but-local replies keep leader-mediated relay, governance unchanged.)
+  const remoteSender = relayActive() ? relay.getRemoteAgents().find((a) => a.name === to) : null;
+  if (remoteSender && remoteSender.team) {
+    log("info", "reply relayed via remote team", { to, team: remoteSender.team, replyTo: msg_id });
+    return await handleSendTeam({ team: remoteSender.team, text, intent: "reply" });
+  }
+  if (fromTeam && !myTeams.includes(fromTeam)) {
+    log("info", "reply relayed via cross-team leader", { to, team: fromTeam, replyTo: msg_id });
+    return await handleSendTeam({ team: fromTeam, text, intent: "reply" });
+  }
+  // Local sender (same-team, or no team metadata) → fall through to the direct inbox write below.
 
   const msg = buildMessage({
     from: agentName,
@@ -543,14 +1022,165 @@ async function handleReply({ msg_id, text }) {
     text,
     type: replyType,
     replyTo: msg_id,
+    // ECHO the original message's opaque reply-route back to the sender so the reply lands in the
+    // originating session. An explicit replyRoute arg overrides (lets a client re-stamp); otherwise we
+    // copy the original's verbatim. Works for ANY MCP client replying — the echo is server-side.
+    replyRoute: replyRoute != null ? replyRoute : (originalMsg?.replyRoute ?? null),
   });
 
   const targetInbox = inboxDir(to);
-  await mkdir(targetInbox, { recursive: true });
+  await ensureDir(targetInbox);
   await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
 
   log("info", "reply sent", { id: msg.id, to, replyTo: msg_id });
   return textResult(`Reply ${msg.id} sent to ${to}` + (replyType === "response" ? " (task response)" : ""));
+}
+
+// ── send_team ──
+
+async function handleSendTeam({ team, text, intent = "message", priority = "normal" }) {
+  if (!team || !text) return textResult("Missing required fields: team, text", true);
+
+  const senderTeams = agentIdentity?.teams || [DEFAULT_TEAM];
+  const fromTeam = senderTeams[0]; // primary team for routing
+
+  // 1. Local team leader first — BUT a team owned by another machine must route via the relay,
+  //    even when we hold a federated leader replica for it (teams-remote.json). Without this
+  //    guard a remote leader entry traps the message in the local branch (the remote leader is
+  //    never locally "online"), returns leader_offline, and never spools to the outbox for the
+  //    daemon to relay. Refresh the cross-machine map first so isRemoteTeam() is current.
+  if (relayActive()) await relay.refreshRemoteState(BRIDGE_DIR);
+  const isRemoteTeamTarget = relayActive() && relay.isRemoteTeam(team);
+  const leader = teamLeaders.get(team);
+  if (leader && !isRemoteTeamTarget) {
+    // Self-delivery guard (from==to): if we ARE the leader, send_team would deliver to our own
+    // inbox and loop. There's no separate recipient to reach. Reject (same contract as handleSend).
+    if (leader === agentName) {
+      return textResult(`You are the leader of "${team}" — send_team delivers to the team leader, so this is a self-delivery (rejected to prevent a loop).`, true);
+    }
+    if (!isAgentOnline(leader)) {
+      return textResult(tpl("leader_offline", { team, leader }), true);
+    }
+
+    // Local delivery — build inter-team message and deliver to leader's inbox
+    const msg = {
+      id: `msg-${randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      from: agentName,
+      from_team: fromTeam,
+      to_team: team,
+      to: leader,
+      type: "interteam",
+      intent, // "message" | "join_request" | … — lets the leader recognize the ask
+      priority,
+      content: { text, parts: [] },
+      ttl: DEFAULT_TTL,
+    };
+
+    const targetInbox = inboxDir(leader);
+    await ensureDir(targetInbox);
+    await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
+
+    log("info", "cross-team message sent", { id: msg.id, from_team: fromTeam, to_team: team, leader });
+    return textResult(`Cross-team message sent to ${team} leader (${leader}) — ${msg.id}`);
+  }
+
+  // 2. Remote team → spool to the outbox; the DAEMON owns the hub connection and relays it
+  //    (drains the outbox with retry). The MCP never talks to the hub directly.
+  if (relayActive()) {
+    // (remote map already refreshed above for the routing decision)
+    if (!relay.isRemoteTeam(team)) {
+      return textResult(`Team "${team}" is not reachable — no local leader and not registered with the relay hub.`, true);
+    }
+
+    // M1 fail-closed: never put plaintext on the wire when encryption is required. A missing key
+    // must refuse the send, not silently downgrade.
+    if (ENCRYPT_ENABLED && !encryptionKey) {
+      return textResult(`Refusing to relay to "${team}": encryption is required but no key is loaded (check ${BRIDGE_DIR}/secret.key).`, true);
+    }
+    // B5: Encrypt text before it is spooled (the hub only ever sees ciphertext).
+    const relayText = ENCRYPT_ENABLED && encryptionKey ? encryptText(text) : text;
+    const msg = {
+      id: `msg-${randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      from: agentName,
+      from_team: fromTeam,
+      to_team: team,
+      type: "interteam",
+      intent,
+      priority,
+      content: { text: relayText, parts: [] },
+      ttl: DEFAULT_TTL,
+    };
+
+    try {
+      await atomicWrite(join(BRIDGE_DIR, "outbox", `${msg.id}.json`),
+        { id: msg.id, from_team: fromTeam, to_team: team, msg, created: new Date().toISOString() });
+      const st = relay.getRemoteTeamStatus(team);
+      const online = st.online_members?.length || 0;
+      log("info", "relay message spooled for daemon", { id: msg.id, from_team: fromTeam, to_team: team, target_active: st.active, online });
+      const out = (st.active && online > 0)
+        ? tpl("relay_queued_online", { team, id: msg.id, online })
+        : tpl("relay_queued_dark", { team, id: msg.id, lastSeenSuffix: st.last_seen ? ` (last seen ${new Date(st.last_seen).toISOString()})` : "" });
+      return textResult(out);
+    } catch (err) {
+      log("error", "relay spool failed", { to_team: team, error: err.message });
+      return textResult(tpl("relay_unreachable", { team, error: err.message, retryNote: "" }), true);
+    }
+  }
+
+  return textResult(tpl("team_unreachable", { team }), true);
+}
+
+// ── request_join ──
+// Thin convenience over send_team: routes a join ask to the team's leader (local or via
+// relay), tagged intent="join_request" so the leader recognizes it. The leader decides
+// whether to admit (via the admit tool) per its own policy/prompting. Plain send_team works
+// just as well — this only adds a recognizable type.
+async function handleRequestJoin({ team, note } = {}) {
+  if (!team) return textResult("Missing required field: team", true);
+  const text = (note && note.trim())
+    ? `Join request from "${agentName}": ${note.trim()}`
+    : `Join request from "${agentName}" — requesting to join team "${team}".`;
+  return handleSendTeam({ team, text, intent: "join_request" });
+}
+
+// ── list_teams ──
+
+function handleListTeams() {
+  const teams = new Map(); // team_name → { leader, members_set }
+
+  // Build team data from all known agents
+  for (const [name, hb] of knownAgents) {
+    const agentTeams = effectiveTeams(name, hb.teams); // exclude revoked participation
+    for (const t of agentTeams) {
+      if (!teams.has(t)) {
+        teams.set(t, { leader: teamLeaders.get(t) || null, members: new Set() });
+      }
+      teams.get(t).members.add(name);
+    }
+  }
+
+  // Also include our own teams
+  const ourTeams = agentIdentity?.teams || [DEFAULT_TEAM];
+  for (const t of ourTeams) {
+    if (!teams.has(t)) {
+      teams.set(t, { leader: teamLeaders.get(t) || null, members: new Set() });
+    }
+  }
+
+  const result = [];
+  for (const [name, data] of teams) {
+    const onlineAgents = onlineAgentNames(name);
+    result.push({
+      name,
+      leader: data.leader || null,
+      member_count: data.members.size + (ourTeams.includes(name) ? 1 : 0),
+      online_count: onlineAgents.length,
+    });
+  }
+
+  return jsonResult(result);
 }
 
 // ── register ──
@@ -561,7 +1191,11 @@ async function handleRegister({ name: newName }) {
     return textResult(`Invalid name "${newName}". Use lowercase a-z, 0-9, hyphens, max 31 chars.`, true);
   }
 
-  // Check if name is taken
+  // Voluntary join: a dormant session (launched without CC2CC_IDENTITY/SELF) opts into the
+  // mesh by registering. (Role is NOT set here — leadership comes from teams.json/create_team.)
+  const wasDormant = !participating;
+  if (wasDormant) await activate(newName);
+
   const taken = await takenNames(BRIDGE_DIR);
   if (taken.has(newName) && newName !== agentName) {
     return textResult(`Name "${newName}" is already taken by an active agent.`, true);
@@ -569,41 +1203,34 @@ async function handleRegister({ name: newName }) {
 
   const oldName = agentName;
   if (oldName === newName) {
-    return textResult(`Already registered as "${newName}".`);
+    return textResult(wasDormant
+      ? `Registered as "${newName}" — you are now in the cc2cc system.`
+      : `Already registered as "${newName}".`);
   }
 
-  // Write offline heartbeat for old name
+  // Rename: offline old, switch name, persist identity, recreate mailboxes, announce.
   await writeHeartbeat("offline", `renamed to ${newName}`);
-
-  // Update agent name
   agentName = newName;
-
-  // Create new directories
-  await mkdir(inboxDir(agentName), { recursive: true });
-  await mkdir(doneDir(agentName), { recursive: true });
-  await mkdir(receiptsDir(agentName), { recursive: true });
-
-  // Write active heartbeat with new name
+  if (agentIdentity) {
+    agentIdentity.display_name = newName;
+    await saveIdentity(agentIdentity);
+  }
+  await ensureDir(inboxDir(agentName));
+  await ensureDir(doneDir(agentName));
+  await ensureDir(receiptsDir(agentName));
   await writeHeartbeat("active", `renamed from ${oldName}`);
 
-  // Notify other agents about the name change
   const targets = allAgentNames();
   for (const to of targets) {
-    const msg = buildMessage({
-      from: agentName,
-      to,
-      text: `Agent "${oldName}" is now "${agentName}"`,
-      type: "status",
-    });
+    const msg = buildMessage({ from: agentName, to, text: `Agent "${oldName}" is now "${agentName}"`, type: "status" });
     const targetInbox = inboxDir(to);
-    await mkdir(targetInbox, { recursive: true });
+    await ensureDir(targetInbox);
     try {
       await atomicWrite(join(targetInbox, `${msg.id}.json`), msg);
     } catch (err) {
       log("warn", "register notify failed", { to, error: err.message });
     }
   }
-
   log("info", "agent renamed", { from: oldName, to: newName });
   return textResult(`Renamed from "${oldName}" to "${agentName}". ${targets.length} agents notified.`);
 }
@@ -614,10 +1241,25 @@ async function handleRegister({ name: newName }) {
  * Read all pending messages from inbox, move to done, return array of messages.
  * Called on every tool invocation so the agent sees new messages immediately.
  */
+// m8: serialize inbox file operations. pollInbox (timer) and consumeInbox (tool calls) both read,
+// move-to-done, and write the same files; interleaving caused swallowed ENOENT and rare
+// double-notify. A simple promise chain runs them one at a time.
+let inboxOp = Promise.resolve();
+function serializeInbox(fn) {
+  const p = inboxOp.then(fn, fn);
+  inboxOp = p.then(() => {}, () => {}); // keep the chain alive regardless of outcome
+  return p;
+}
+
 async function consumeInbox() {
+  return serializeInbox(_consumeInbox);
+}
+
+async function _consumeInbox() {
+  if (!agentName) return []; // dormant session (no identity yet) → no inbox to consume
   const primary = inboxDir(agentName);
-  await mkdir(primary, { recursive: true });
-  await mkdir(doneDir(agentName), { recursive: true });
+  await ensureDir(primary);
+  await ensureDir(doneDir(agentName));
 
   const inboxPaths = [primary];
 
@@ -645,17 +1287,43 @@ async function consumeInbox() {
       try {
         const filePath = join(inbox, file);
         const raw = await readFile(filePath, "utf8");
-        const msg = decryptMessage(JSON.parse(raw));
+        const parsed = JSON.parse(raw);
+
+        // Self-delivery guard (from==to), defense in depth: this is OUR inbox, so a message whose
+        // sender is us is self-addressed. The envelope from/to are plaintext (only content.text is
+        // encrypted), so check BEFORE decrypt — this also retires an undecryptable self-message.
+        // Even if one slipped past the send-side guards (or predates them), DROP it silently — do
+        // NOT write a receipt, notify, or echo an expiry notice, any of which would wake our own
+        // session and re-arm the echo loop. Just retire it to done/.
+        if (parsed.from === agentName) {
+          const done = doneDir(agentName);
+          await ensureDir(done);
+          await retryRename(filePath, join(done, file));
+          seenFiles.add(file);
+          log("warn", "self-delivery dropped", { id: parsed.id });
+          continue;
+        }
+
+        const msg = decryptMessage(parsed);
+        if (!msg) {
+          const done = doneDir(agentName);
+          await ensureDir(done);
+          await retryRename(filePath, join(done, file));
+          continue;
+        }
 
         // TTL expiration check
         if (msg.timestamp && msg.ttl) {
           const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
           if (age > msg.ttl) {
             const done = doneDir(agentName);
-            await mkdir(done, { recursive: true });
+            await ensureDir(done);
             await retryRename(filePath, join(done, file));
 
-            if (msg.from && msg.from !== agentName) {
+            // Security (B1): msg.from is attacker-controllable on relayed mail. Only echo an
+            // expiry notice back to a well-formed local agent name — never let a spoofed
+            // name drive a filesystem path in this auto-triggered background path.
+            if (msg.from && msg.from !== agentName && validateName(msg.from)) {
               const expNotice = buildMessage({
                 from: agentName,
                 to: msg.from,
@@ -664,7 +1332,7 @@ async function consumeInbox() {
                 replyTo: msg.id,
               });
               const senderInbox = inboxDir(msg.from);
-              await mkdir(senderInbox, { recursive: true });
+              await ensureDir(senderInbox);
               try {
                 await atomicWrite(join(senderInbox, `${expNotice.id}.json`), expNotice);
               } catch { /* best effort */ }
@@ -676,7 +1344,7 @@ async function consumeInbox() {
 
         // Write delivery receipt
         const receiptPath = receiptsDir(agentName);
-        await mkdir(receiptPath, { recursive: true });
+        await ensureDir(receiptPath);
         await atomicWrite(join(receiptPath, `${msg.id}.receipt.json`), {
           msg_id: msg.id,
           delivered_at: new Date().toISOString(),
@@ -685,7 +1353,7 @@ async function consumeInbox() {
 
         // Move to done/
         const done = doneDir(agentName);
-        await mkdir(done, { recursive: true });
+        await ensureDir(done);
         await retryRename(filePath, join(done, file));
 
         // Mark as seen so pollInbox won't re-notify
@@ -705,6 +1373,24 @@ async function consumeInbox() {
 /**
  * Format consumed messages as a text block to append to tool responses.
  */
+function humanAge(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 3600) return `${Math.max(1, Math.floor(s / 60))}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+/** If a delivered message is older than policy.messages.stale_after_hours, return an
+ *  "this may be stale" note (template msg_old_on_read); else "". */
+function staleNote(msg) {
+  const ts = msg.timestamp;
+  if (!ts) return "";
+  const ageMs = Date.now() - new Date(ts).getTime();
+  const thresholdMs = (policy.messages?.stale_after_hours || 24) * 3600 * 1000;
+  if (!(ageMs >= thresholdMs)) return "";
+  return tpl("msg_old_on_read", { age: humanAge(ageMs), sentAt: ts, readAt: new Date().toISOString(), from: msg.from });
+}
+
 function formatPendingMessages(messages) {
   if (messages.length === 0) return "";
 
@@ -717,6 +1403,8 @@ function formatPendingMessages(messages) {
     const replyInfo = msg.replyTo ? ` (reply to ${msg.replyTo})` : "";
     lines.push(`[${msg.id}] from ${msg.from} (${msg.type}${taskInfo}${replyInfo}):`);
     lines.push(`  ${msg.content?.text || "(empty)"}`);
+    const stale = staleNote(msg);
+    if (stale) lines.push(`  ${stale}`);
   }
   lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━");
   lines.push("Reply using: reply(msg_id=\"...\", text=\"...\")");
@@ -762,6 +1450,11 @@ function formatNotification(msg) {
  * without waiting for the next tool call (piggyback).
  */
 async function pollInbox() {
+  return serializeInbox(_pollInbox);
+}
+
+async function _pollInbox() {
+  if (!agentName) return; // dormant session (no identity yet) → nothing to poll
   const primary = inboxDir(agentName);
   const inboxPaths = [primary];
 
@@ -791,12 +1484,17 @@ async function pollInbox() {
         const filePath = join(inbox, file);
         const raw = await readFile(filePath, "utf8");
         const msg = decryptMessage(JSON.parse(raw));
+        if (!msg) {
+          await ensureDir(doneDir(agentName));
+          await retryRename(filePath, join(doneDir(agentName), file));
+          continue;
+        }
 
         // TTL check — expired messages are moved to done immediately
         if (msg.timestamp && msg.ttl) {
           const age = (Date.now() - new Date(msg.timestamp).getTime()) / 1000;
           if (age > msg.ttl) {
-            await mkdir(doneDir(agentName), { recursive: true });
+            await ensureDir(doneDir(agentName));
             await retryRename(filePath, join(doneDir(agentName), file));
             log("info", "message expired (poll)", { id: msg.id });
             continue;
@@ -837,6 +1535,9 @@ async function pollInbox() {
 // ─── Status Polling (join/leave detection) ───────────────────────────────────
 
 async function pollStatus() {
+  // In daemon mode, refresh the cross-machine map the daemon maintains so the roster + remote
+  // routing stay current (the MCP no longer polls the hub itself).
+  if (daemonMode) await relay.refreshRemoteState(BRIDGE_DIR).catch(() => {});
   const sDir = statusDir();
   let files;
   try {
@@ -884,6 +1585,435 @@ async function pollStatus() {
   }
 
   knownAgents = newAgents;
+
+  // Refresh operator/governance policy (cc2cc_admin team-<name>.json) before reconciling.
+  await loadTeamPolicies();
+  // Hot-reload bridge config so cc2cc_admin edits take effect in running sessions (≤1 poll) without
+  // a restart. Dumb re-parse every poll: these are tiny idempotent parse-and-assign loads, so it's
+  // microseconds — and mtime-gating would risk a same-second missed reload. policy.json also drives
+  // the presence cadence (offline_after_seconds), which is why this runs before any staleness check.
+  await loadPolicy(BRIDGE_DIR);
+  await loadRules();
+  await loadTemplateOverrides(BRIDGE_DIR);
+  // Reconcile team leaders from the just-refreshed heartbeats. Init-only discovery
+  // was a startup race: a leader that came online AFTER this agent started was never
+  // picked up, breaking send_team routing and list_teams. Doing it every poll closes
+  // the race and also drops leaders that have gone offline.
+  reconcileTeamLeaders();
+  // Fold any team I've been admitted to (local OR federated) into my own membership. Without
+  // this, admit was a one-sided owner-roster write — the admitted agent never gained membership.
+  await reconcileSelfMembership();
+}
+
+/**
+ * Self-membership reconcile: an agent folds into its OWN teams any team whose admitted[] includes
+ * it (and revoked[] does not) — covering both local teams.json and federated remote-team replicas
+ * (remote-teams.json .policy). Conversely, an explicit revoke removes the team (except a team it
+ * leads). This is what makes `admit` actually grant membership to the admitted agent; the change
+ * rides writeHeartbeat into the roster (and, for a team the daemon registers, federates onward).
+ * NOTE (cross-machine, part 2): for an owner on another machine to see this agent as a real member
+ * heartbeating under the team, the agent's daemon must also REGISTER that team with the hub
+ * (multi-team daemon registration) — tracked separately.
+ */
+async function reconcileSelfMembership() {
+  if (!agentIdentity || !agentName) return;
+  const local = await loadTeamsRegistry();   // teams this machine owns
+  const replica = await loadTeamsReplica();  // teams owned elsewhere, federated here
+  const all = { ...replica, ...local };      // local wins on overlap
+  const teams = new Set(agentIdentity.teams || []);
+  let changed = false;
+  for (const [name, t] of Object.entries(all)) {
+    if (!t) continue;
+    const admitted = Array.isArray(t.admitted) ? t.admitted : [];
+    const revoked = Array.isArray(t.revoked) ? t.revoked : [];
+    if (revoked.includes(agentName) && t.leader !== agentName) {
+      if (teams.delete(name)) changed = true;            // revoke/evict propagates
+    } else if (admitted.includes(agentName) && !teams.has(name)) {
+      teams.add(name); changed = true;                   // admit propagates
+    }
+  }
+  if (changed) {
+    agentIdentity.teams = [...teams];
+    await saveIdentity(agentIdentity);
+    await writeHeartbeat("active", "membership reconciled");
+    log("info", "self-membership reconciled", { teams: agentIdentity.teams });
+  }
+}
+
+/** Load bridge policy.json over the built-in defaults (shallow per-section merge). */
+async function loadPolicy(bridgeDir) {
+  try {
+    const o = JSON.parse(await readFile(join(bridgeDir, "policy.json"), "utf8")) || {};
+    policy = {
+      messages: { ...DEFAULT_POLICY.messages, ...(o.messages || {}) },
+      teams: { ...DEFAULT_POLICY.teams, ...(o.teams || {}) },
+      identities: { ...DEFAULT_POLICY.identities, ...(o.identities || {}) },
+      directory: { ...DEFAULT_POLICY.directory, ...(o.directory || {}) },
+      relay: { ...DEFAULT_POLICY.relay, ...(o.relay || {}) },
+    };
+  } catch {
+    policy = DEFAULT_POLICY;
+  }
+}
+
+// ─── Governance: central team registry (teams.json) ──────────────────────────
+// One central file holds all team data (teams change rarely — unlike per-agent
+// identities which write at heartbeat frequency, so those stay per-file). The
+// team's owner machine is authoritative; cc2cc_admin and leader tools write here.
+
+const TEAMS_PATH = join(BRIDGE_DIR, "teams.json");
+
+// ── teams.json write lock ──
+// teams.json is the one bridge file with MULTIPLE writers (this runtime's saveTeamFile + the Python
+// cc2cc-admin), each doing read-merge-write. Without serialization, two concurrent mutations race:
+// the second write clobbers the first (a lost admit / leadership change — a real correctness bug).
+// We serialize with a sidecar lock <bridge>/teams.json.lock (NOT a lock on teams.json itself —
+// atomicWrite renames a new inode into place, so a lock on the file's fd protects nothing).
+//
+// The lock must appear ATOMICALLY WITH ITS HOLDER PAYLOAD. A naive O_EXCL-create-then-write leaves a
+// window where the file exists but is EMPTY; a concurrent waiter reads "", can't parse a holder, and
+// (mis)judges it stale → steals → two holders → the exact lost-update we're preventing (QA-found).
+// Fix: write the payload to a temp file, then hardlink() it into place — link is atomic and fails
+// EEXIST if held, so the lock is NEVER observable without its {pid,ts}. Cross-language because both
+// Node and Python hit the same link/rename/stat syscalls on the (local-FS) bridge — never use NFS.
+// Steal a DEAD or OVER-AGED holder via an atomic rename-to-claim so only one breaker wins the race;
+// release only if WE still own it (re-read pid+ts) so a stolen-from holder can't delete the new lock.
+const TEAMS_LOCK = TEAMS_PATH + ".lock";
+// max_hold must be >> the longest plausible deschedule of a HEALTHY holder mid-section (real section
+// is ~1ms): if a live holder is starved past this, a peer assumes it crashed, steals, and the holder
+// resumes and clobbers. 30s leaves enormous margin under any realistic load while still reclaiming a
+// genuinely dead holder within 30s. (Inherent to time-based stealing; native flock(2) would avoid it
+// but needs a compiled dep cc2cc deliberately omits.) acquire-timeout fails loud sooner; caller retries.
+// Env-overridable (CC2CC_LOCK_MAX_HOLD_MS) so QA can shrink it to provoke the steal window without a
+// 30s wall-clock wait — must stay >> the real section in production.
+const LOCK_MAX_HOLD_MS = (() => { const v = Number(process.env.CC2CC_LOCK_MAX_HOLD_MS); return Number.isFinite(v) && v > 0 ? v : 30000; })();
+const LOCK_ACQUIRE_TIMEOUT_MS = (() => { const v = Number(process.env.CC2CC_LOCK_ACQUIRE_TIMEOUT_MS); return Number.isFinite(v) && v > 0 ? v : 5000; })();
+const lockSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const lockSuffix = () => `${process.pid}.${Math.random().toString(36).slice(2)}`;
+
+function pidAlive(pid) {
+  if (!pid || typeof process.kill !== "function") return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } // EPERM = exists, different owner
+}
+
+/** Remove a lock we've judged stale — but ONLY if it's STILL that same stale thing right now.
+ *  Re-read immediately before the rename and bail if it changed, so we can't clobber a FRESH lock a
+ *  sibling created in the gap between our judgment and the rename (the breakStaleLock TOCTOU). The
+ *  rename-aside-then-delete keeps the removal itself atomic across racers. `expected` = the stale
+ *  holder {pid,ts} we judged; null = "an aged file with no parseable holder". */
+async function breakStaleLock(expected) {
+  let cur = null;
+  try { cur = JSON.parse(await readFile(TEAMS_LOCK, "utf8")); } catch { /* gone/torn → cur stays null */ }
+  if (expected) {
+    if (!cur || cur.pid !== expected.pid || cur.ts !== expected.ts) return; // changed/fresh → not ours to break
+  } else if (cur) {
+    return; // we judged it unparseable, but it's a parseable (fresh) holder now → don't break
+  }
+  const brk = `${TEAMS_LOCK}.break.${lockSuffix()}`;
+  try { await rename(TEAMS_LOCK, brk); await unlink(brk).catch(() => {}); }
+  catch (e) { if (e.code !== "ENOENT") throw e; } // ENOENT → another racer already broke/took it
+}
+
+/** Acquire the lock; returns the holder token {pid,ts} we wrote (needed for owner-checked release). */
+async function acquireTeamsLock() {
+  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  for (;;) {
+    const token = { pid: process.pid, ts: Date.now() };
+    const tmp = `${TEAMS_LOCK}.tmp.${lockSuffix()}`;
+    await writeFile(tmp, JSON.stringify(token));
+    await chmodQuiet(tmp, 0o660);
+    try {
+      await link(tmp, TEAMS_LOCK);            // atomic create-WITH-content; throws EEXIST if held
+      await unlink(tmp).catch(() => {});
+      return token;                           // we hold it; payload was never observable empty
+    } catch (e) {
+      await unlink(tmp).catch(() => {});
+      if (e.code !== "EEXIST") throw e;
+    }
+    // Held by someone. Decide wait vs steal.
+    let holder = null;
+    try { holder = JSON.parse(await readFile(TEAMS_LOCK, "utf8")); } catch { /* vanished / legacy-empty */ }
+    if (!holder) {
+      // Parseable read failed. Two cases: (a) the file VANISHED — a sibling mid release→reacquire;
+      // do NOT break (renaming here would clobber a fresh lock the sibling is about to/just created —
+      // the TOCTOU) — just fall through to backoff + retry the link. (b) a PRESENT but aged torn/legacy
+      // lock → break it (conditionally). Only (b) steals.
+      let st = null; try { st = await stat(TEAMS_LOCK); } catch { /* gone → retry link, no break */ }
+      if (st && Date.now() - st.mtimeMs > LOCK_MAX_HOLD_MS) { await breakStaleLock(null); continue; }
+    } else if (!pidAlive(holder.pid) || Date.now() - (holder.ts || 0) > LOCK_MAX_HOLD_MS) {
+      await breakStaleLock(holder); continue;  // dead, or held longer than any real section: reclaim (conditional)
+    } else if (Date.now() > deadline) {
+      throw new Error(`teams.json lock busy (held by pid ${holder.pid}); aborting to avoid a lost mutation`);
+    }
+    await lockSleep(15 + Math.floor(Math.random() * 35)); // jittered backoff
+  }
+}
+
+/** Release only if the on-disk lock is still OURS (pid+ts match) — never delete a lock that was
+ *  stolen from us and re-acquired by someone else. */
+async function releaseTeamsLock(token) {
+  try {
+    const cur = JSON.parse(await readFile(TEAMS_LOCK, "utf8"));
+    if (cur && cur.pid === token.pid && cur.ts === token.ts) await unlink(TEAMS_LOCK);
+  } catch { /* already gone or unreadable → nothing to release */ }
+}
+
+// The token of the lock THIS process currently holds (set while inside withTeamsLock). Used by the
+// re-stat guard below. Safe as a module global: the file lock serializes critical sections so at most
+// one withTeamsLock body runs at a time per process.
+let currentLockToken = null;
+
+/** Defense-in-depth against the steal window: a steal can only happen if our lock AGED past max_hold
+ *  (a >max_hold mid-section deschedule). Re-stat right before the final write confirms we still own a
+ *  FRESH lock; the only thing after is atomicWrite's sub-ms temp+rename, far too short to age out. So
+ *  re-stat→write is effectively atomic wrt the steal heuristic — closing the window, not just narrowing
+ *  it. If we've been stolen, abort LOUD so the existing fail-loud→retry contract re-applies cleanly.
+ *  No-op when not under a lock (single-writer paths). */
+function assertLockOwned() {
+  if (!currentLockToken) return;
+  let h = null;
+  try { h = JSON.parse(readFileSync(TEAMS_LOCK, "utf8")); } catch { /* gone/torn → not ours */ }
+  if (!h || h.pid !== currentLockToken.pid || h.ts !== currentLockToken.ts) {
+    throw new Error("teams.json lock no longer owned (stolen after a long deschedule); aborting to avoid a lost mutation");
+  }
+}
+
+/** Run fn() holding the teams.json lock. FAIL LOUD on acquire-timeout — never silently drop a team
+ *  mutation (a swallowed failure would reintroduce the exact lost-update we're preventing). */
+async function withTeamsLock(fn) {
+  const token = await acquireTeamsLock();
+  currentLockToken = token;
+  try { return await fn(); } finally { currentLockToken = null; await releaseTeamsLock(token); }
+}
+
+async function loadTeamsRegistry() {
+  try {
+    const o = JSON.parse(await readFile(TEAMS_PATH, "utf8"));
+    return (o && o.teams) || {};
+  } catch { return {}; }
+}
+
+async function loadTeamFile(team) {
+  const reg = await loadTeamsRegistry();
+  return reg[team] || null;
+}
+
+async function saveTeamFile(t) {
+  t.updated = new Date().toISOString();
+  const reg = await loadTeamsRegistry();
+  reg[t.name] = t;
+  assertLockOwned(); // re-stat: confirm our lock wasn't stolen during a long deschedule before writing
+  await atomicWrite(TEAMS_PATH, { teams: reg });
+}
+
+/** Refresh operatorLeaders + teamRevoked from the central teams.json registry.
+ *  These are the operator/governance authority; the GAB policy governs. */
+async function loadTeamsReplica() {
+  // Teams owned by OTHER machines, replicated via the relay (federation). Now unified into
+  // remote-teams.json: each team entry carries { ..., policy }. Cached locally so a disconnected
+  // node still knows the leader/rules of its remote teams.
+  const out = {};
+  try {
+    const o = JSON.parse(await readFile(join(BRIDGE_DIR, "remote-teams.json"), "utf8"));
+    for (const [team, data] of Object.entries(o || {})) {
+      if (data && data.policy) out[team] = data.policy;
+    }
+  } catch { /* no unified state yet */ }
+  // Legacy fallback (one release): the old standalone teams-remote.json policy replica.
+  try {
+    const legacy = JSON.parse(await readFile(join(BRIDGE_DIR, "teams-remote.json"), "utf8"));
+    for (const [team, pol] of Object.entries(legacy.teams || {})) {
+      if (!out[team]) out[team] = pol;
+    }
+  } catch { /* no legacy file */ }
+  return out;
+}
+
+async function loadTeamPolicies() {
+  const nextLeaders = new Map();
+  const nextRevoked = new Map();
+  // Remote replica first, then local teams.json overrides (a team we own wins).
+  const merged = { ...(await loadTeamsReplica()), ...(await loadTeamsRegistry()) };
+  for (const [name, t] of Object.entries(merged)) {
+    if (t && t.leader) nextLeaders.set(name, t.leader);
+    if (t && Array.isArray(t.revoked) && t.revoked.length) nextRevoked.set(name, new Set(t.revoked));
+  }
+  operatorLeaders = nextLeaders;
+  teamRevoked = nextRevoked;
+}
+
+/** Has this member's participation in `team` been revoked by the team owner? */
+function isRevoked(name, team) {
+  return teamRevoked.get(team)?.has(name) || false;
+}
+
+/** The teams an agent is effectively in = its claimed teams minus any it's revoked from. */
+function effectiveTeams(name, teams) {
+  return (teams || [DEFAULT_TEAM]).filter((t) => !isRevoked(name, t));
+}
+
+function leadsTeam(team) { return teamLeaders.get(team) === agentName; }
+
+/** Names of all agents whose identity file lists `team` in its teams[] — the set of members
+ *  that already consider themselves part of the team, online or not. Used by claim_team to fold
+ *  existing members into the owning roster on adoption. */
+async function membersReferencing(team) {
+  const out = new Set();
+  let files;
+  try { files = await readdir(join(BRIDGE_DIR, "identities")); } catch { return out; }
+  await Promise.all(files.map(async (f) => {
+    if (!f.startsWith("identity-") || !f.endsWith(".json")) return;
+    try {
+      const id = JSON.parse(await readFile(join(BRIDGE_DIR, "identities", f), "utf8"));
+      if (id?.display_name && Array.isArray(id.teams) && id.teams.includes(team)) out.add(id.display_name);
+    } catch { /* unreadable/malformed identity — skip */ }
+  }));
+  return out;
+}
+
+async function loadOrInitTeam(team) {
+  let t = await loadTeamFile(team);
+  if (!t) {
+    const mid = relay.getRelayStatus?.()?.machine_id || "local";
+    const now = new Date().toISOString();
+    t = {
+      name: team, owner_machine: mid, leader: teamLeaders.get(team) || null,
+      succession: [], rules: { retention_days: 4, admission: "open", sticky_leader: true },
+      admitted: [], revoked: [], created: now, updated: now,
+    };
+  }
+  return t;
+}
+
+// MCP runtime: a LEADER admits/evicts members of its own team (day-to-day ops).
+// Higher governance (rules/retention/leader-designation) is cc2cc_admin's job.
+async function handleAdmit({ team, agent } = {}) {
+  if (!team || !agent) return textResult("Missing required fields: team, agent", true);
+  if (!leadsTeam(team)) return textResult(`Only the leader of "${team}" can admit members.`, true);
+  await withTeamsLock(async () => {
+    const t = await loadOrInitTeam(team);
+    t.revoked = (t.revoked || []).filter((n) => n !== agent);
+    if (!t.admitted.includes(agent)) t.admitted.push(agent);
+    await saveTeamFile(t);
+  });
+  await loadTeamPolicies();
+  log("info", "member admitted", { team, agent, by: agentName });
+  return textResult(tpl("admitted", { agent, team }));
+}
+
+async function handleEvict({ team, agent } = {}) {
+  if (!team || !agent) return textResult("Missing required fields: team, agent", true);
+  if (!leadsTeam(team)) return textResult(`Only the leader of "${team}" can evict members.`, true);
+  await withTeamsLock(async () => {
+    const t = await loadOrInitTeam(team);
+    t.admitted = (t.admitted || []).filter((n) => n !== agent);
+    t.revoked = t.revoked || [];
+    if (!t.revoked.includes(agent)) t.revoked.push(agent);
+    if (t.leader === agent) t.leader = null;
+    await saveTeamFile(t);
+  });
+  const mid = relay.getRelayStatus?.()?.machine_id || "local";
+  await atomicWrite(join(BRIDGE_DIR, "tombstones", `${team}__${agent}.json`),
+    { type: "revoke", team, member: agent, by_machine: mid, at: new Date().toISOString() });
+  await loadTeamPolicies();
+  log("info", "member evicted", { team, agent, by: agentName });
+  return textResult(tpl("evicted", { agent, team }));
+}
+
+// MCP runtime: create a new team (in-Claude equivalent of CC2CC_TEAM at launch or
+// `cc2cc_admin team create`). The creator becomes the team's leader.
+async function handleCreateTeam({ name, admission, retention_days } = {}) {
+  if (!participating || !agentIdentity) return textResult(tpl("not_registered"), true);
+  if (!name || !validateName(name)) return textResult(`Invalid team name "${name}".`, true);
+  const mid = relay.getRelayStatus?.()?.machine_id || "local";
+  const now = new Date().toISOString();
+  // Existence check + create under one lock so two concurrent creates of the same name can't both win.
+  const exists = await withTeamsLock(async () => {
+    if (await loadTeamFile(name)) return true;
+    const t = {
+      name, owner_machine: mid, leader: agentName, succession: [],
+      rules: {
+        retention_days: Number.isInteger(retention_days) ? retention_days : policy.messages.retention_days,
+        admission: (admission === "approved" || admission === "open") ? admission : policy.teams.default_admission,
+        sticky_leader: policy.teams.sticky_leader,
+      },
+      admitted: [agentName], revoked: [], created: now, updated: now,
+    };
+    await saveTeamFile(t);
+    return false;
+  });
+  if (exists) return textResult(tpl("team_exists", { team: name }), true);
+  if (!agentIdentity.teams.includes(name)) {
+    agentIdentity.teams.push(name);
+    await saveIdentity(agentIdentity);
+  }
+  await loadTeamPolicies();
+  reconcileTeamLeaders();
+  log("info", "team created", { team: name, by: agentName });
+  return textResult(tpl("team_created", { team: name }));
+}
+
+// MCP runtime: claim leadership of an existing LEADERLESS team, or adopt a team that
+// members reference (teams=[...]) but which has no owning policy on this machine. This is
+// the missing in-session path between create_team (NEW teams only) and admit/evict (need
+// to already lead). Two invariants close the bugs this fixes:
+//   1) Refuse if the team already has a leader (avoid coups) or is owned elsewhere (federation).
+//   2) Fold every agent that already references the team into admitted[], so adoption does not
+//      leave existing members in the GAB-but-not-in-roster limbo (the follow-on inconsistency).
+async function handleClaimTeam({ team } = {}) {
+  if (!participating || !agentIdentity) return textResult(tpl("not_registered"), true);
+  if (!team || !validateName(team)) return textResult(`Invalid team name "${team}".`, true);
+  await loadTeamPolicies();
+  const current = teamLeaders.get(team) || null;
+  if (current && current !== agentName) {
+    return textResult(tpl("team_has_leader", { team, leader: current }), true);
+  }
+  const mid = relay.getRelayStatus?.()?.machine_id || "local";
+  const existing = await loadTeamFile(team);
+  // A team owned by another machine (federated replica, or a local entry stamped elsewhere)
+  // must be claimed on its owner — adopting it here would fork ownership.
+  const replica = await loadTeamsReplica();
+  const remoteOwner = existing?.owner_machine || replica[team]?.owner_machine;
+  if (remoteOwner && remoteOwner !== mid) {
+    return textResult(tpl("team_remote_owned", { team }), true);
+  }
+  let admittedCount = 0;
+  await withTeamsLock(async () => {
+    const t = await loadOrInitTeam(team);
+    t.owner_machine = mid;
+    t.leader = agentName;
+    // Fold in everyone who already considers themselves on this team (identity teams=[...]),
+    // preserving any prior admitted entries. Read from the identity files on disk — not just live
+    // heartbeats — so members that are currently OFFLINE are still adopted rather than stranded in
+    // the GAB-but-not-in-roster limbo. Excludes agents revoked from the team.
+    const members = new Set(t.admitted || []);
+    members.add(agentName);
+    for (const name of await membersReferencing(team)) {
+      if (!isRevoked(name, team)) members.add(name);
+    }
+    t.admitted = [...members];
+    t.revoked = (t.revoked || []).filter((n) => n !== agentName);
+    await saveTeamFile(t);
+    admittedCount = t.admitted.length;
+  });
+  if (!agentIdentity.teams.includes(team)) {
+    agentIdentity.teams.push(team);
+    await saveIdentity(agentIdentity);
+  }
+  await loadTeamPolicies();
+  reconcileTeamLeaders();
+  log("info", "team claimed", { team, by: agentName, admitted: admittedCount });
+  return textResult(tpl("team_claimed", { team }));
+}
+
+/**
+ * Leadership is defined ENTIRELY by the team registry (teams.json `leader` fields), which
+ * loadTeamPolicies() refreshes into operatorLeaders every poll. teamLeaders simply mirrors
+ * it — there is no self-declared/heartbeat role. This is inherently sticky (the registry
+ * keeps the leader even while offline) and race-free (it's a file, re-read each poll).
+ */
+function reconcileTeamLeaders() {
+  teamLeaders = new Map(operatorLeaders);
 }
 
 // ─── Stale Mailbox Cleanup ───────────────────────────────────────────────────
@@ -980,6 +2110,7 @@ async function shutdown(signal) {
   clearInterval(pollTimer);
   clearInterval(statusTimer);
   clearInterval(heartbeatTimer);
+  try { daemonClient?.close(); } catch {} // detach from the daemon (daemon keeps running)
 
   try {
     await writeHeartbeat("offline", `shutdown via ${signal}`);
@@ -1005,75 +2136,166 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("exit", () => {
   if (cleanShutdown || !agentName) return;
   try {
+    const hbPath = join(statusDir(), `${agentName}-heartbeat.json`);
     writeFileSync(
-      join(statusDir(), `${agentName}-heartbeat.json`),
+      hbPath,
       JSON.stringify({
         agent: agentName,
         timestamp: new Date().toISOString(),
         session_id: "none",
-        parent_pid: process.ppid,
+        parent_pid: String(process.ppid), // m7: string to match the cleanup comparisons (was numeric)
         status: "offline",
         context: "process exit (unclean)",
       }, null, 2),
     );
+    // SYNC chmod: this exit handler can't use async atomicWrite/chmodQuiet (the event loop is gone),
+    // and writeFileSync's {mode} would be umask-masked (→640 under root's 022). Force group-rw so a
+    // peer running as a different OS user can still read/rewrite it on the shared bridge — same perms
+    // invariant atomicWrite enforces everywhere else. Best-effort (this whole path is skipped on SIGKILL).
+    chmodSync(hbPath, 0o660);
   } catch { /* best effort */ }
 });
 
 // ─── Initialization ─────────────────────────────────────────────────────────
 
-async function init() {
-  // 1. Determine agent name
-  if (process.env.SELF) {
-    agentName = process.env.SELF;
-    log("info", "using SELF env name", { name: agentName });
-  } else {
-    agentName = await generateUniqueName(BRIDGE_DIR);
-    log("info", "generated unique name", { name: agentName });
+/**
+ * activate(candidateName) — JOIN the mesh: create/load identity, write heartbeat, discover
+ * peers, start polling, announce, self-wake. Called automatically when a CC2CC_IDENTITY/SELF
+ * is present at launch, or on-demand from register() when a dormant session opts in.
+ */
+async function activate(candidateName) {
+  if (participating) return; // already joined
+  // 1. Load or create persistent identity (identity.json wins over SELF env)
+  agentIdentity = await ensureIdentity(candidateName);
+  agentName = agentIdentity.display_name;
+  if (candidateName && agentName !== candidateName) {
+    log("info", "identity file overrides requested name", { identity_name: agentName, requested: candidateName });
   }
 
-  // 2. Load notification rules + encryption key
-  await loadRules();
-  await loadEncryptionKey();
-  if (ENCRYPT_ENABLED) {
-    log("info", "encryption enabled", { hasKey: !!encryptionKey });
+  // 4. Precise Read-Back: restore agent status from previous session heartbeat
+  // if the heartbeat file is fresh (≤30s) and has the same parent PID
+  try {
+    const hbPath = join(statusDir(), `${agentName}-heartbeat.json`);
+    const raw = await readFile(hbPath, "utf8");
+    const hb = JSON.parse(raw);
+    const hbAge = (Date.now() - new Date(hb.timestamp || hb.heartbeat).getTime()) / 1000;
+    const sameParent = hb.parent_pid === String(process.ppid);
+    if (hbAge <= 30 && sameParent && hb.status_text) {
+      agentStatus = hb.status_text;
+      log("info", "restored agent status from previous heartbeat", { status: agentStatus, age_s: Math.round(hbAge) });
+    }
+  } catch {
+    // No previous heartbeat — start fresh
   }
 
-  // 3. Clean up stale mailboxes from previous sessions
+  // 5. Clean up stale mailboxes (persistent name — won't delete own mailbox)
   await cleanupStaleMailboxes();
 
-  // 4. Create directories
-  await mkdir(inboxDir(agentName), { recursive: true });
-  await mkdir(doneDir(agentName), { recursive: true });
-  await mkdir(receiptsDir(agentName), { recursive: true });
-  await mkdir(statusDir(), { recursive: true });
+  // 6. Create directories
+  await ensureDir(inboxDir(agentName));
+  await ensureDir(doneDir(agentName));
+  await ensureDir(receiptsDir(agentName));
+  await ensureDir(statusDir());
 
-  // 5. Write initial heartbeat
+  // 7. Write initial heartbeat (includes teams from identity)
   await writeHeartbeat("active", "session started");
 
-  // 6. Initial status poll to discover existing agents
+  // 8. Initial status poll to discover existing agents
   await pollStatus();
 
-  // 7. Start polling loops
+  // 9. Check for name collision with an online agent.
+  // pollStatus() folds our own just-written heartbeat into knownAgents, so exclude
+  // it (same session_id) — otherwise every agent would collide with itself and get
+  // a random suffix, breaking deterministic addressing (e.g. `send` to "alpha-lead").
+  const existingHb = knownAgents.get(agentName);
+  const collidesWithOther =
+    existingHb && existingHb.session_id !== sessionId && isAgentOnline(agentName);
+  if (collidesWithOther) {
+    const suffix = Math.floor(Math.random() * 0x10000).toString(16).padStart(4, "0");
+    const newName = `${agentName}-${suffix}`;
+    log("warn", `⚠️ identity.json name '${agentName}' taken by online agent, adjusted to '${newName}' and persisted`);
+    agentName = newName;
+    agentIdentity.display_name = newName;
+    await saveIdentity(agentIdentity);
+    // Re-create directories and write heartbeat with new name
+    await ensureDir(inboxDir(agentName));
+    await ensureDir(doneDir(agentName));
+    await ensureDir(receiptsDir(agentName));
+    await writeHeartbeat("active", "session started");
+  }
+
+  // 10. Establish team leaders from the team registry (teams.json).
+  await loadTeamPolicies();
+  reconcileTeamLeaders();
+
+  // 11. Relay is owned by the standalone daemon (one per host) — the MCP does NOT poll the
+  //     hub itself (fixes the relay-per-session contention, 0g). Ensure a daemon is running
+  //     and connect for wake pushes; the MCP reads the daemon-maintained remote map read-only.
+  const relayConfig = await relay.loadRelayConfig(BRIDGE_DIR);
+  relayConfigured = !!(relayConfig && relayConfig.enabled !== false);
+  if (relayConfigured) {
+    if (!ENCRYPT_ENABLED || !encryptionKey) {
+      // B6: Encryption is mandatory for relay — refuse without it.
+      log("warn", "relay disabled: encryption is mandatory (set CC2CC_ENCRYPT=1 and configure secret.key)");
+      relayConfigured = false;
+    } else {
+      const teamName = (agentIdentity?.teams || [DEFAULT_TEAM])[0];
+      try {
+        const daemonEnv = { ...process.env, CC2CC_TEAM: teamName, CC2CC_IDENTITY: agentName };
+        // On a managed (global/system) bridge the daemon is owned by systemd as the service user;
+        // this per-user session must only CONNECT — never spawn or auto-heal one, or it would hijack
+        // the shared socket. connectToDaemon keeps retrying until the service is up.
+        const managed = !!readServiceMarker(BRIDGE_DIR);
+        const res = await ensureDaemon({ bridgeDir: BRIDGE_DIR, env: daemonEnv, managed });
+        daemonClient = connectToDaemon({
+          bridgeDir: BRIDGE_DIR,
+          agent: agentName,
+          onWake: () => { pollInbox().catch(() => {}); },
+          onStatus: (s) => log("info", "daemon link", { status: s }),
+          env: daemonEnv, // auto-heal: re-ensure the daemon if it dies (else reconnect-spins forever)
+          managed,        // …but never self-spawn on a managed bridge — systemd owns the lifecycle
+        });
+        daemonMode = true;
+        await relay.refreshRemoteState(BRIDGE_DIR); // read daemon-maintained cross-machine map
+        log("info", "daemon mode active", { launched: res.launched, managed, socket: res.socketPath, team: teamName });
+      } catch (e) {
+        log("warn", "daemon mode unavailable; relay disabled this session", { error: e.message });
+        relayConfigured = false;
+      }
+    }
+  }
+
+  // 12. Start polling loops
   pollTimer = setInterval(pollInbox, POLL_MS);
   statusTimer = setInterval(pollStatus, POLL_MS);
-  heartbeatTimer = setInterval(() => writeHeartbeat("active", "heartbeat"), HEARTBEAT_INTERVAL_MS);
+  // Self-rescheduling heartbeat so the WRITE cadence tracks the (reloaded) staleness window — writer
+  // and isStale reader always derive from the same policy.identities.offline_after_seconds.
+  const scheduleHeartbeat = () => {
+    if (cleanShutdown) return;
+    heartbeatTimer = setTimeout(async () => {
+      if (cleanShutdown) return;
+      try { await writeHeartbeat("active", "heartbeat"); } catch { /* best effort */ }
+      scheduleHeartbeat();
+    }, heartbeatMs());
+  };
+  scheduleHeartbeat();
 
-  // 8. Initial inbox drain
+  // 13. Initial inbox drain
   await pollInbox();
 
-  log("info", "server started", {
+  participating = true;
+  log("info", "joined cc2cc mesh", {
     name: agentName,
+    agent_id: agentIdentity.agent_id,
+    teams: agentIdentity.teams,
+    team_leaders: Object.fromEntries(teamLeaders),
     bridge_dir: BRIDGE_DIR,
     poll_ms: POLL_MS,
     heartbeat_ms: HEARTBEAT_INTERVAL_MS,
     online_agents: onlineAgentNames(),
   });
 
-  // 9. Connect MCP transport
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-
-  // 10. Self-announce via channel notification
+  // Self-announce via channel notification
   try {
     await server.notification({
       method: "notifications/claude/channel",
@@ -1087,7 +2309,7 @@ async function init() {
     log("warn", "self-announce failed", { error: e.message });
   }
 
-  // 11. Self-wake: activate the LLM without user input.
+  // 16. Self-wake: activate the LLM without user input.
   // Strategy: fast direct channel notification + slower inbox fallback.
   // The direct push is fastest but may miss if Claude Code isn't ready yet;
   // the inbox write guarantees delivery via pollInbox on next cycle.
@@ -1138,6 +2360,43 @@ async function init() {
   }, 3000);
 }
 
+/** Server entrypoint. Loads config and connects the MCP transport so tools are available
+ *  either way. JOINS the mesh only if a CC2CC_IDENTITY/SELF was set before launch; otherwise
+ *  stays DORMANT — the session is not considered part of cc2cc and emits/receives nothing
+ *  until it voluntarily calls register() to identify itself. */
+async function init() {
+  await loadRules();
+  await loadEncryptionKey();
+  await loadTemplateOverrides(BRIDGE_DIR);
+  await loadPolicy(BRIDGE_DIR);
+  if (ENCRYPT_ENABLED) log("info", "encryption enabled", { hasKey: !!encryptionKey });
+
+  const transport = new StdioServerTransport();
+
+  // 0f: Gate mesh-join on a real MCP client completing the initialize handshake. A bare
+  // `node server.mjs` (no Claude/LLM attached) must NOT mint a live account — it would
+  // register, heartbeat, and queue inbound it can never read or answer (a phantom peer that
+  // looks online in the roster). The SDK fires oninitialized when the client sends
+  // notifications/initialized (MCP spec), so a client-less launch never joins. Set the hook
+  // BEFORE connect so it's armed when the handshake arrives.
+  if (IDENTITY_NAME) {
+    let joined = false;
+    server.oninitialized = () => {
+      if (joined) return; // guard against a duplicate initialized notification
+      joined = true;
+      log("info", "client initialized — auto-join (CC2CC_IDENTITY/SELF present)", { name: IDENTITY_NAME });
+      activate(IDENTITY_NAME).catch((e) => log("error", "activate failed", { error: e?.message }));
+    };
+  } else if (RAW_IDENTITY_NAME) {
+    // A name WAS provided but rejected by validateName — say so, don't pretend none was set.
+    log("warn", `cc2cc dormant — CC2CC_IDENTITY ${JSON.stringify(RAW_IDENTITY_NAME)} is not a valid name (lowercase letters/digits/hyphens, start alphanumeric, ≤31 chars); not joining. Relaunch with a valid name.`);
+  } else {
+    log("info", "cc2cc dormant — no CC2CC_IDENTITY/SELF set; not joining. register(name) to participate.");
+  }
+
+  await server.connect(transport);
+}
+
 // ─── Global Error Handlers ──────────────────────────────────────────────────
 // Without these, any unhandled error silently kills the Node.js process,
 // dropping the MCP connection with no trace.
@@ -1152,7 +2411,11 @@ process.on("unhandledRejection", (reason) => {
   log("error", "unhandledRejection", { error: msg, stack });
 });
 
-init().catch((err) => {
-  log("error", "init failed", { error: err.message, stack: err.stack });
-  process.exit(1);
-});
+// Only start the server when run directly (not imported for tests).
+// Use realpathSync (with fallback) to handle symlinked bin scripts.
+if ((() => { try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; } })() === fileURLToPath(import.meta.url)) {
+  init().catch((err) => {
+    log("error", "init failed", { error: err.message, stack: err.stack });
+    process.exit(1);
+  });
+}
